@@ -3726,6 +3726,55 @@ fn two_small_neighbours_merge_and_the_emptied_source_is_dropped_with_tokens_conf
 }
 
 #[test]
+fn an_emptied_sources_stopped_removal_doesnt_halt_the_balancer() {
+    // audit120's S2 on #2137: p1, merged into p2 and waiting on its change feed, is fenced
+    // by an operator, so its removal stops (an operator's fence is the operator's to lift).
+    // The pass goes on to decide all the same: `state` is a skip that names the stop.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        balancer_map(&t, None, |m| {
+            for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+                p.pinned = true;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                passes: 1,
+                dwell_ms: 600_000,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        map_until(
+            a,
+            None,
+            Duration::from_secs(120),
+            "p1 emptied into p2",
+            |m| {
+                m.moves.is_empty()
+                    && !super::super::map::placed(m, "p1")
+                    && m.partitions.iter().any(|p| p.id == "p1")
+            },
+        )
+        .await;
+        fence(a, "p1").await.unwrap();
+        balancer_until(a, Duration::from_secs(30), |st| {
+            st.starts_with("skip:") && st.contains("the removal of p1, merged away, stopped")
+        })
+        .await;
+        // Still listed: nothing removed it past the operator's fence.
+        assert!(
+            map_of_as(a, None)
+                .await
+                .partitions
+                .iter()
+                .any(|p| p.id == "p1")
+        );
+    });
+}
+
+#[test]
 fn a_big_partition_splits_at_its_halving_tablet_onto_a_cold_node_with_tokens_configured() {
     use crate::serve::proto::BalancerEventKind;
     // D332 PR 5's design §7.2: every node has tokens, and the writer runs the split with its

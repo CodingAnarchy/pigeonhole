@@ -342,10 +342,12 @@ struct Cut {
 /// split loop's own gates so that one partition that can't split doesn't hold up the rest
 /// (perf2's and ai1249's S1 on #2137): over `partition_max_bytes` or `partition_max_load`;
 /// not pinned, busy or moving only whole; on a node that answered; not resting nor
-/// bouncing; its condition held `passes` passes counting this one, so a survey isn't
-/// wasted on a streak not yet complete; and not set aside in `no_cut` (by partition, until
-/// when, in ms: one whose last survey found no cut, or whose split couldn't start). Of
-/// those, the one furthest over, by the larger of its two ratios.
+/// bouncing; with a node to split onto (one that answered, other than its own, holding
+/// none of its replicas and not resting: the split loop's `coldest`, perf2 on #2137); its
+/// condition held `passes` passes counting this one, so a survey isn't wasted on a streak
+/// not yet complete; and not set aside in `no_cut` (by partition, until when, in ms: one
+/// whose last survey found no cut, or whose split couldn't start). Of those, the one
+/// furthest over, by the larger of its two ratios.
 pub(crate) fn split_candidate(
     nodes: &[NodeView],
     parts: &[PartView],
@@ -362,6 +364,12 @@ pub(crate) fn split_candidate(
                 && !p.busy
                 && !p.whole_only
                 && nodes.iter().any(|n| n.fresh && n.id == p.node)
+                && nodes.iter().any(|n| {
+                    n.fresh
+                        && n.id != p.node
+                        && !p.replicas.contains(&n.id)
+                        && !counters.resting(&n.id, now)
+                })
                 && !counters.resting(&p.id, now)
                 && bounces(p, now, b) < b.max_moves
                 && counters.streak_of(&format!("split:{}", p.id)) + 1 >= b.passes.max(1)
@@ -1480,6 +1488,28 @@ mod tests {
         assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), Some(1));
         // p2's node didn't answer: none.
         nodes[1].fresh = false;
+        assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), None);
+    }
+
+    #[test]
+    fn a_candidate_with_no_node_to_split_onto_isnt_surveyed() {
+        // perf2 on #2137: p1, the furthest over, has its replicas on every other node, so
+        // its split has nowhere to go; p2 is surveyed instead. Then with every other node
+        // resting, neither is.
+        let nodes = [node("a"), node("b"), node("c")];
+        let b = Bounds {
+            partition_max_bytes: 1 << 30,
+            passes: 1,
+            ..bounds()
+        };
+        let mut p1 = part("p1", "a", 0.1, 4 << 30);
+        p1.replicas = vec!["b".into(), "c".into()];
+        let parts = [p1, part("p2", "b", 0.1, 2 << 30)];
+        let no_cut = HashMap::new();
+        let mut c = Counters::default();
+        assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), Some(1));
+        c.rest.insert("a".into(), 10_000);
+        c.rest.insert("c".into(), 10_000);
         assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), None);
     }
 

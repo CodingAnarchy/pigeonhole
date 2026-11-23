@@ -26,7 +26,8 @@
 //!    entry MERGE) that holds nothing but is still listed, through the merge's removal, each
 //!    pass until nothing waits for it (`drop_waits`). The removal reads those before it
 //!    fences, so a pass while S waits costs Status calls only. A paused balancer does it
-//!    too, and while S waits the pass goes on without it.
+//!    too. While S waits, or its removal stopped (named in `state`), the pass goes on
+//!    without it.
 //!
 //! A pass that does nothing changes nothing in the map: the current skip is in this
 //! node's `NodeStatus.balancer` only (simp724's M2, perf287's should-fix 1). The counters
@@ -587,12 +588,14 @@ impl Node {
                     self.set_balancer_state(st);
                     return;
                 }
+                // A stop is named in `state` like a wait, and the pass goes on: a fence it left
+                // (an operator's to lift) mustn't halt every other action (audit120's S2 on
+                // #2137). Each later pass tries the removal again.
                 Err(f) => {
-                    self.set_balancer_state(format!(
+                    waiting.push(format!(
                         "the removal of {s}, merged away, stopped: {}",
                         f.message()
                     ));
-                    return;
                 }
             }
         }
