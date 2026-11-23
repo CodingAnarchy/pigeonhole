@@ -58,7 +58,7 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
   - New map fields: `balancer`, `balance`, `balancer_events`, `Partition.pinned` and `moves_history`, `TablePlacement.pinned_ranges` and `Node.weight`. Also `LocalPartition.file_bytes`, `NodeStatus.balancer` and `StatusRequest.open_only`.
   - It also splits and merges partitions, through the online split and merge (below).
 - **Cluster partitions report their load** (D332 PR 1, #1485).
-  - `phdb cluster status` shows each partition's `load_cpu`, `load_device` and `load`, averaged over the new `--balance-window` (default 300 s), for the coming balancer.
+  - `phdb cluster status` shows each partition's `load_cpu`, `load_device` and `load`, averaged over the new `--balance-window` (default 300 s), which the balancer uses.
   - CPU is the partition's shard time plus sampled request CPU, over the node's cores.
   - Device is the partition's bytes at its files over the node's highest one-second rate in the window. The engine estimates it: reads served from the OS page cache count too.
   - Compare partitions with these, not absolute machine use.
@@ -68,11 +68,10 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
   - `Flush` and `Compact` act on every partition open on the node, or on the one their new `partition` field names. On every partition, they try each one and name every partition that failed.
   - Each node answers for its own partitions.
 - `phdb cluster restore DIR --partition P [--to ID]`: puts one partition back from a cluster backup into the live cluster, even after it moved or was restored since the backup (#1832). Only that partition changes, at a new epoch with a new feed history, through a relocation's checked map change; the other partitions and the tables stay as the live map has them. Its writes since the backup are lost. A table whose key range on the partition changed since the backup refuses it.
-- `phdb serve --cluster` serves agent memory (#1915, ICR 0139). With `--memory NAME` on every node and a `memory` placement in the map (namespace split keys over partitions), each partition holds a whole store for the namespaces in its range, and any node routes a `Memory` call to the partition holding its namespace. `Memory.Watch`, calls whose namespaces or ids are on more than one partition, and `/mcp` still answer `Unsupported` on a cluster node. A partition's forget policy and IVF rebalancing run under its fence. The map's writer adds a memory placement only once every node runs a build that keeps it (`Status`'s new `map_features`), so a 1.2 node can't read as divergent.
+- `phdb serve --cluster` serves agent memory (#1915, ICR 0139). With `--memory NAME` on every node and a `memory` placement in the map (namespace split keys over partitions), each partition holds a whole store for the namespaces in its range, and any node routes a `Memory` call to the partition holding its namespace. `Memory.Recall`, `MarkUsed` and `Forget` across partitions, `Memory.Watch` and `/mcp` on a cluster node follow below. A partition's forget policy and IVF rebalancing run under its fence. The map's writer adds a memory placement only once every node runs a build that keeps it (`Status`'s new `map_features`), so a 1.2 node can't read as divergent.
 - `phdb serve --cluster`: agent memory calls across partitions (#1915, ICR 0139).
   - **`Memory.Recall`** over namespaces on several partitions runs in steps from the node you called. It returns what one store holding every namespace would, except for the keyword signal (each partition's BM25 statistics are its own), while nothing writes to those namespaces.
   - **`Memory.MarkUsed` and `Memory.Forget`** are split by partition, and their counts summed. An error names the partitions that applied, and a part that may have applied answers `OutcomeUnknown`.
-  - `Memory.Watch` on a cluster node is still to come.
 - `pigeonhole-memory`: a recall in steps, for recalls over several stores. `Recall::gather` gives a `RecallPool`, which `merge` and `rank` turn into a `RecallRanking`. `RecallRanking::walk` gives a graph expansion hop by hop (`RecallWalk`, `RecallHop`, `Recall::hop`). `Recall::bodies` and `RecallRanking::finish` produce the hits. Each step has versioned bytes. `Recall::run` runs the same steps in process.
 - `phdb serve --cluster`: `Memory.Watch` across partitions (#1915, ICR 0139). A watch of namespaces on several partitions, or of every namespace, merges each partition's events on the node you called.
   - **Order:** each partition's commits arrive in order, and a commit's memories arrive together.
@@ -93,7 +92,7 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
   - `Insert`/`Delete` and `Put`/`Delete` route to the partition holding the id, and `Schema.DropTable` of the index's name drops it everywhere.
   - A table an index follows can't be dropped while the index is there.
   - The writer adds the first index only once every node runs a build that keeps them (`indexes` in `map_features`).
-  - Searches, `Verify`, `Rebuild` and `BulkLoad` across an index's partitions come in later PRs.
+  - Searches, `Verify`, `Text.Rebuild` and `Vectors.BulkLoad` across an index's partitions follow below.
 - `pigeonhole-text`: `Index::create_unfilled` creates an index with its backfill left as a pending rebuild, for `resume_rebuild_with` to run in steps (#1722).
 - `phdb serve` clusters: a `MultiGet`, `Scan`, `Vectors.Nearest` or `Graph.Traverse` sent with `x-pigeonhole-read-replica-max-lag-ms: N` takes each partition's part from a replica fresh within N ms, then the owner (D328, #1851). A scan checks the bound on every page, and if a replica falls behind partway, the partition's pages continue from the last page's position on the next replica or the owner, with no row skipped or repeated. Each scan page's `served_seqno` is the seqno it was read at.
 - `phdb cluster promote P --to ID [--old-unreachable]`: makes node ID, which holds a replica of partition P, its owner (D328, #1851). The replica's copy becomes a primary at the last commit it applied and takes the next epoch, with a new change-feed history. The report gives the commits lost, or says the loss is unknown when the old owner couldn't be asked. Run it again to finish one that stopped.
@@ -103,7 +102,7 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
   - `nprobe` and `max_probe` are per partition, so recall and cost rise with the partitions. `stats` sums the partitions' lists.
   - A partition that can't be reached fails the search with `PartitionUnavailable`.
   - `Verify` sums every partition's counts, and a partition whose check fails is named in the error.
-  - `Text.Search`, `Text.Rebuild` and `Vectors.BulkLoad` across partitions come in later PRs.
+  - `Text.Search`, `Text.Rebuild` and `Vectors.BulkLoad` across partitions follow below.
 - **`phdb serve --text-pack`** packs the server's text indexes in the background (#1585, ICR 0143): searches of common words read several times less, with no call to `Index::pack`. Off by default, since a packed index can't be opened by a 1.2 build: turn it on only once you won't roll back to 1.2. On a cluster a node packs the partitions it owns. Four counters come with it (`pigeonhole_serve_text_pack_passes_total`, `…_postings_total`, `…_refused_total`, `…_conflicts_total`).
 - **`pigeonhole_text::Index::list`** names a database's text indexes.
 - `pigeonhole-text`: `QueryStats`, a search's ranking statistics as a value, so a collection split across several indexes can score as one index (#1722, ICR 0138). Use `Search::query_stats` (or `query_stats_async`) on each part, `QueryStats::merge` across them, then `Search::stats(merged)` on each part, and merge the hits by score. The merge sums the counts and re-cuts each fuzzy term's expansions, and `cut(clause)` reports a cut. `to_bytes` / `from_bytes` carry the statistics between processes, with a version byte. A single index's search now reads its statistics this way internally; its results are unchanged.
@@ -128,7 +127,7 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
 - **The engine and `pigeonhole` (behind `__unstable-txn-prepare`):**
   - An external prepare with reads and no writes logs its reads and holds them.
   - `Transaction::hold_reads()` holds a read-only transaction's reads in memory until `ReadHold::release()`. `release()` answers whether the hold lasted, and is refused on a thread that drives a shard.
-- **A range move's target copies its range from the source and catches up on its history** (D331, #1499), for the move driver that follows. New `phdb serve` flags:
+- **A range move's target copies its range from the source and catches up on its history** (D331, #1499), for the move driver (below). New `phdb serve` flags:
   - `--move-rate-bytes`: a node's copy bandwidth across its moves, default 64 MiB/s.
   - `--move-retention-cap`: the most change-feed history a move keeps on its source, default 4 GiB.
   - `--max-move-followers`: moves copying from a node at once, default 2.
