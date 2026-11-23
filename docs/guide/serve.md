@@ -1363,7 +1363,7 @@ From 1.3.0 (D331), **`phdb cluster merge S --into T [--skip-fit-check] [--timeou
 
 **When `S` is emptied but stays listed.** `S` keeps serving, holding no range, while something still needs it. The merge then ends with `source: waiting` and says what. So does `phdb cluster status` (`drop_waits` on `S`'s partition on its node). In order:
 - **Its change feed's tail:** a subscriber's token from before a hand-over may still resume from `S`. `S`'s moved-away row for that move is pruned 24 hours after the hand-over, or sooner if `S`'s feed retention passes it. A resume after that answers `FeedExpired`: open the feed again.
-- **Transaction outcomes homed on `S`:** kept until every branch has acknowledged and `--txn-outcome-retention` has passed. A branch node that restarted before it acknowledged leaves the record for ever (#2098). Until `merge --force` (a follow-up, [#FORCE_ISSUE](https://github.com/CodingAnarchy/pigeonhole/issues/FORCE_ISSUE)), such an `S` stays listed.
+- **Transaction outcomes homed on `S`:** kept until every branch has acknowledged and `--txn-outcome-retention` has passed. A branch node that restarted before it acknowledged leaves the record for ever (#2098). Until `merge --force` (a follow-up, [#2132](https://github.com/CodingAnarchy/pigeonhole/issues/2132)), such an `S` stays listed.
 - **Spanning transactions homed on `S` still open:** bounded by `--txn-lifetime-ms`. An emptied `S` refuses a new commit point (`Conflict`, retry-safe).
 - **A share in doubt,** of `S`'s own or on any node with its home at `S`: its resolver settles it through `S`. For a share whose branch never acknowledged and whose node is gone, decide it with `phdb cluster txn decide`.
 
