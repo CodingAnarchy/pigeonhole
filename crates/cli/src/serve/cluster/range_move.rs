@@ -628,8 +628,9 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
             }
             MovePhase::CatchingUp => {
                 let lag = t_lp.as_ref().map_or(u64::MAX, |lp| lp.move_follower_lag_ms);
-                let in_doubt = s_lp.as_ref().map_or(0, |lp| lp.in_doubt);
-                if lag <= CATCH_UP_LAG_MS && in_doubt == 0 {
+                // S not listed is not ready, never "no shares in doubt" (cli692's S4).
+                let clear = s_lp.as_ref().is_some_and(|lp| lp.in_doubt == 0);
+                if lag <= CATCH_UP_LAG_MS && clear {
                     change(args, id, |_, r| {
                         r.set_phase(MovePhase::HandingOver);
                         Ok(())
@@ -638,10 +639,12 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
                     fenced_since = Some(tokio::time::Instant::now());
                     continue;
                 }
-                wait.tick(&format!(
-                    "the catch-up is {lag} ms behind; {in_doubt} shares in doubt on the source"
-                ))
-                .await?;
+                let doubt = s_lp.as_ref().map_or_else(
+                    || "the source unlisted".to_owned(),
+                    |lp| format!("{} shares in doubt on the source", lp.in_doubt),
+                );
+                wait.tick(&format!("the catch-up is {lag} ms behind; {doubt}"))
+                    .await?;
             }
             MovePhase::HandingOver => {
                 let since = *fenced_since.get_or_insert_with(tokio::time::Instant::now);
@@ -818,8 +821,13 @@ async fn abort_record(
         if !m.moves.iter().any(|x| x.id == r.id) {
             return Ok(());
         }
+        // A split's partition closed here was closed by this tail, past its drop: a rerun
+        // after a stop there goes on (audit120's M1 on #2130).
         let dropped = match side(args, &m, &r.to, &r.id).await {
             Ok((_, Some(t))) => t.dropped,
+            Ok((Some(lp), None)) => {
+                split && lp.state() == crate::serve::proto::LocalPartitionState::Closed
+            }
             _ => false,
         };
         if dropped {
@@ -843,7 +851,15 @@ async fn abort_record(
     let m = map_now(args).await?;
     let (node, address) = node_of(&m, &r.to)?;
     let at = At::new(args, node, address).await?;
-    at.call(&r.to, "fence").await?;
+    // A rerun after a stop past the close: a closed partition takes no fence, and needs
+    // none (audit120's M1 on #2130). Close is Ok on a closed one.
+    let closed = at
+        .local(&r.to)
+        .await?
+        .is_some_and(|lp| lp.state() == crate::serve::proto::LocalPartitionState::Closed);
+    if !closed {
+        at.call(&r.to, "fence").await?;
+    }
     at.call(&r.to, "close").await?;
     set_record(args, |now: &ClusterMap| {
         let mut next = now.clone();
@@ -852,16 +868,27 @@ async fn abort_record(
         Ok(next)
     })
     .await?;
-    // The node's reconcile on that map may have moved it aside first: no files is done.
-    match at.call(&r.to, "drop").await {
-        Ok(_) => Ok(()),
-        Err(f)
-            if f.message()
-                .contains(&format!("has no files of partition {}", r.to)) =>
-        {
-            Ok(())
+    // The node's reconcile on that map may have moved it aside first: no files is done. A
+    // node that hasn't installed that map yet refuses the drop while its map still places
+    // the partition: tried again until it has (audit120's S4, cli692's S1 on #2130).
+    let until = tokio::time::Instant::now() + FENCE_BOUND;
+    loop {
+        match at.call(&r.to, "drop").await {
+            Ok(_) => return Ok(()),
+            Err(f)
+                if f.message()
+                    .contains(&format!("has no files of partition {}", r.to)) =>
+            {
+                return Ok(());
+            }
+            Err(f)
+                if f.message().contains("still places partition")
+                    && tokio::time::Instant::now() < until =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(f) => return Err(f),
         }
-        Err(f) => Err(f),
     }
 }
 
@@ -951,6 +978,15 @@ pub(super) async fn resume(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<(), Failure> {
+    // A typo, or a move that ended, isn't "done" (cli692's S3 on #2130).
+    let m = map_now(args).await?;
+    if !m.moves.iter().any(|r| r.id == id && !map::node_move(r)) {
+        return Err(Failure::usage(&format!(
+            "the map (version {}) records no range move {id:?}: it finished, was aborted, or \
+             never started",
+            m.map_version
+        )));
+    }
     drive(args, id, timeout).await
 }
 

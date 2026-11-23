@@ -630,6 +630,16 @@ impl Node {
         Ok(())
     }
 
+    /// Drops `id` from the operator's fences (and `fenced.json`) if it's there: its files are
+    /// gone, so the fence was another partition's of that name. The caller holds `changing`.
+    pub(super) async fn forget_operator_fence(&self, id: &str) -> Result<(), ApiError> {
+        let mut fenced = self.fences.operator().clone();
+        if fenced.remove(id) {
+            self.persist_fences(fenced).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
         let dir = self.dir.clone();
         let written = fenced.clone();

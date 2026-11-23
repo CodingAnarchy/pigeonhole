@@ -2457,54 +2457,63 @@ fn a_split_created_file_whose_map_never_landed_is_moved_aside_past_its_version()
     });
 }
 
+/// An aborted split's state as its CLI's tail leaves it once it fenced and closed the new
+/// partition (the real order): `split-9` ABORTING into p1-1 on c, p1-1 created there,
+/// opened, then fenced and closed.
+async fn aborting_split_closed_on_c(t: &Three) {
+    let c = t.ports[2];
+    create(c, "p1-1", "split-9", 2).await.unwrap();
+    let mut v2 = t.v1.clone();
+    v2.map_version = 2;
+    v2.partitions.push(crate::serve::proto::Partition {
+        id: "p1-1".into(),
+        node: "c".into(),
+        epoch: 1,
+        ..Default::default()
+    });
+    let mut r = RangeMove {
+        id: "split-9".into(),
+        kind: MoveKind::Partition as i32,
+        table: "users".into(),
+        start: Some(super::super::map::canonical_key(b"d")),
+        end: Some(super::super::map::canonical_key(b"m")),
+        from: "p1".into(),
+        to: "p1-1".into(),
+        from_epoch: 1,
+        to_epoch: 1,
+        ..RangeMove::default()
+    };
+    r.set_phase(MovePhase::Aborting);
+    v2.moves.push(r);
+    push(&t.ports, &v2).await;
+    eventually("c opens p1-1", async || {
+        client(c)
+            .await
+            .status(crate::serve::proto::StatusRequest::default())
+            .await
+            .is_ok_and(|s| s.into_inner().partitions.iter().any(|lp| lp.id == "p1-1"))
+    })
+    .await;
+    let req = || PartitionRequest {
+        partition: "p1-1".into(),
+        force: false,
+    };
+    // Fenced once it's open (listed comes first, while it opens).
+    eventually("c fences p1-1", async || {
+        client(c).await.fence(req()).await.is_ok()
+    })
+    .await;
+    client(c).await.close(req()).await.unwrap();
+}
+
 /// D331 PR 5 (cli692's Must 5's test): the CLI stops between the map that drops an aborted
 /// split's record and partition, and its drop-partition. The node's reconcile moves the
 /// marked, empty, unmapped file aside on that map.
 #[test]
 fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
     let t = three();
-    let c = t.ports[2];
     t.rt.block_on(async {
-        create(c, "p1-1", "split-9", 2).await.unwrap();
-        let mut v2 = t.v1.clone();
-        v2.map_version = 2;
-        v2.partitions.push(crate::serve::proto::Partition {
-            id: "p1-1".into(),
-            node: "c".into(),
-            epoch: 1,
-            ..Default::default()
-        });
-        let mut r = RangeMove {
-            id: "split-9".into(),
-            kind: MoveKind::Partition as i32,
-            table: "users".into(),
-            start: Some(super::super::map::canonical_key(b"d")),
-            end: Some(super::super::map::canonical_key(b"m")),
-            from: "p1".into(),
-            to: "p1-1".into(),
-            from_epoch: 1,
-            to_epoch: 1,
-            ..RangeMove::default()
-        };
-        r.set_phase(MovePhase::Aborting);
-        v2.moves.push(r);
-        push(&t.ports, &v2).await;
-        eventually("c opens p1-1", async || {
-            client(c)
-                .await
-                .status(crate::serve::proto::StatusRequest::default())
-                .await
-                .is_ok_and(|s| s.into_inner().partitions.iter().any(|lp| lp.id == "p1-1"))
-        })
-        .await;
-        client(c)
-            .await
-            .close(PartitionRequest {
-                partition: "p1-1".into(),
-                force: false,
-            })
-            .await
-            .unwrap();
+        aborting_split_closed_on_c(&t).await;
         // The removal map; the CLI stops before its drop-partition.
         let mut v3 = t.v1.clone();
         v3.map_version = 3;
@@ -2514,5 +2523,38 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
         })
         .await;
         assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+    });
+}
+
+/// audit120's M1 on #2130: an abort's CLI stopped after it fenced and closed the split's
+/// partition, before the map change. Run again, the abort goes on past the closed partition
+/// (no fence on it, which a closed partition refuses): the map drops the record and p1-1,
+/// p1-1's files are moved aside, and the abort's fence leaves no operator fence on the id.
+#[test]
+fn an_aborted_split_stopped_after_its_close_is_finished_by_a_rerun() {
+    let t = three();
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        aborting_split_closed_on_c(&t).await;
+        super::super::range_move::abort(
+            &super::backup::args(a),
+            "split-9",
+            Some(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(!m.partitions.iter().any(|p| p.id == "p1-1"));
+        assert!(!t.dirs[2].join("p1-1.phdb").exists());
+        assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+        let fenced = std::fs::read_to_string(t.dirs[2].join(super::super::fence::FENCED_FILE))
+            .unwrap_or_default();
+        assert!(!fenced.contains("p1-1"), "{fenced}");
     });
 }
