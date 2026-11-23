@@ -1,0 +1,2 @@
+### Fixed
+- **A merged-away partition's change-feed rows are pruned** (D331): a cluster partition that no longer holds any range, index or memory store takes no writes, so its change-feed retention never passed its range moves' rows, and a merge could never remove it. Such a partition now prunes a move's rows 24 hours after the hand-over (fixed; the serve guide names it). A token that had read the partition up to its move's end still resumes after the prune and reads on from the target; one from before it, or one naming a partition a merge removed, answers `FeedExpired`.
