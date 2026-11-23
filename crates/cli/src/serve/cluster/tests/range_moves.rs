@@ -2184,7 +2184,7 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
 }
 
 /// D331 PR 5 (cli692's Must 5): a split aborted before its commit point takes its new
-/// partition with it: the record (flagged `split`) stays ABORTING until the new partition
+/// partition with it: the record (of kind PARTITION) stays ABORTING until the new partition
 /// p1-<v> dropped what it copied, then the map drops the record and it together, and its
 /// file is moved aside on c. p1 serves
 /// the range as before.
@@ -2230,7 +2230,10 @@ fn an_aborted_split_removes_its_new_partition_and_moves_its_file_aside() {
             .unwrap()
             .into_inner();
         let r = recorded.moves.iter().find(|r| r.id == id).unwrap();
-        assert!(r.split && r.to == new, "{r:?}");
+        assert!(
+            super::super::range_move::is_split(r) && r.to == new,
+            "{r:?}"
+        );
         super::super::range_move::abort(&args, &id, Some(Duration::from_secs(60)))
             .await
             .unwrap();
@@ -2368,7 +2371,7 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
         });
         let mut r = RangeMove {
             id: "split-9".into(),
-            kind: MoveKind::Range as i32,
+            kind: MoveKind::Partition as i32,
             table: "users".into(),
             start: Some(super::super::map::canonical_key(b"d")),
             end: Some(super::super::map::canonical_key(b"m")),
@@ -2376,7 +2379,6 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
             to: "p1-1".into(),
             from_epoch: 1,
             to_epoch: 1,
-            split: true,
             ..RangeMove::default()
         };
         r.set_phase(MovePhase::Aborting);

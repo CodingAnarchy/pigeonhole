@@ -7417,12 +7417,6 @@ pub struct RangeMove {
     /// compared.
     #[prost(uint64, tag = "14")]
     pub to_epoch: u64,
-    /// D331 PR 5 / D332: the move is a split. Its target is a partition the split created
-    /// (phdb cluster split, or a balancer split), which an abort removes with the record.
-    /// Set by the change that first records the move; never inferred from the id or the
-    /// target's shape.
-    #[prost(bool, tag = "15")]
-    pub split: bool,
 }
 /// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

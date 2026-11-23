@@ -365,11 +365,9 @@ message RangeMove {
   // if it changes before the commit point (a failover of the target). 0: unknown, not
   // compared.
   uint64 to_epoch = 14;
-  // D331 PR 5 / D332: the move is a split. Its target is a partition the split created
-  // (phdb cluster split, or a balancer split), which an abort removes with the record.
-  // Set by the change that first records the move; never inferred from the id or the
-  // target's shape.
-  bool split = 15;
+  // 15 was `split`, withdrawn before release: a split is `kind` MOVE_KIND_PARTITION.
+  reserved 15;
+  reserved "split";
 }
 
 // D331: what a range move is for.

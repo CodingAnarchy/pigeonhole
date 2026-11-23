@@ -841,10 +841,11 @@ async fn abort_record(
     }
 }
 
-/// Whether `r` is a split's move, whose target partition it created: the record's own
-/// `split` flag, set by the change that first records it (never the id or T's shape).
+/// Whether `r` is a split's move, whose target partition it created: its kind,
+/// `MOVE_KIND_PARTITION`, set by the change that first records it (never the id or T's
+/// shape). Every RANGE path takes it too: they test `map::node_move` only.
 pub(super) fn is_split(r: &RangeMove) -> bool {
-    r.split
+    r.kind == MoveKind::Partition as i32
 }
 
 /// What to split: `from`'s range of `table` holding `key`, from `key` to that range's end,
@@ -1023,7 +1024,7 @@ fn split_check(m: &ClusterMap, spec: &SplitSpec, new: &str) -> Result<(), Failur
 
 /// Step 1 for a split: N creates the new partition's file, marked with the record's id and
 /// the map version v the change will carry, then one change, landing at exactly v, adds the
-/// partition (on N, at [`SPLIT_EPOCH`]) and the record at COPYING, flagged `split`, with
+/// partition (on N, at [`SPLIT_EPOCH`]) and the record at COPYING, of kind PARTITION, with
 /// `how`'s change. Each attempt names the partition for its own v ([`split_name`]); one the
 /// map moved under records nothing, and N's reconcile moves its file aside once the map is
 /// past v (audit120's point 1: never a file a landed change places). The record's id and
@@ -1088,7 +1089,7 @@ pub(super) async fn begin_split(
             });
             let mut r = RangeMove {
                 id: id.clone(),
-                kind: MoveKind::Range as i32,
+                kind: MoveKind::Partition as i32,
                 table: spec.table.clone(),
                 start: Some(map::canonical_key(&range.0)),
                 end: range.1.as_deref().map(map::canonical_key),
@@ -1096,7 +1097,6 @@ pub(super) async fn begin_split(
                 to: new.to_owned(),
                 from_epoch,
                 to_epoch: SPLIT_EPOCH,
-                split: true,
                 ..RangeMove::default()
             };
             r.set_phase(MovePhase::Copying);
