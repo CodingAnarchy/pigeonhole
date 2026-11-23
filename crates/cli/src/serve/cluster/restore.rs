@@ -503,6 +503,8 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                     promote: false,
                     replica_epoch: 0,
                     create: false,
+                    create_move: String::new(),
+                    create_version: 0,
                 },
                 token.as_deref(),
             )?)

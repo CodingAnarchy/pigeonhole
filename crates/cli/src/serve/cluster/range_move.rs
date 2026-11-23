@@ -139,10 +139,15 @@ fn record_for<'m>(
     if ours {
         return Ok(Some(r));
     }
-    Err(Failure::usage(&format!(
+    Err(in_flight(r, "move"))
+}
+
+/// Move `r` is in flight, so `then` (a move, a split) waits for it: the error naming it.
+fn in_flight(r: &RangeMove, then: &str) -> Failure {
+    Failure::usage(&format!(
         "move {:?} is in flight ({} of table {:?}, {:?} to {:?}, at {:?}): finish it (run it \
          again), or abort it before its commit point (phdb cluster move-range --abort {}), \
-         then move",
+         then {then}",
         r.id,
         if map::node_move(r) {
             "a whole-partition move"
@@ -154,7 +159,7 @@ fn record_for<'m>(
         r.to,
         map::phase(r),
         r.id
-    )))
+    ))
 }
 
 /// The checks before a move starts (step 0), on the map as it is.
@@ -167,22 +172,27 @@ fn check(m: &ClusterMap, spec: &Spec) -> Result<(), Failure> {
     if spec.from == spec.to {
         return Err(Failure::usage("a range moves to another partition"));
     }
+    check_table(m, &spec.table)
+}
+
+/// Whether `table`'s ranges can move: the map places it, in no co-location group, and no
+/// index follows it.
+fn check_table(m: &ClusterMap, table: &str) -> Result<(), Failure> {
     let t = m
         .tables
         .iter()
-        .find(|t| t.name == spec.table)
-        .ok_or_else(|| Failure::usage(&format!("the map places no table {:?}", spec.table)))?;
+        .find(|t| t.name == table)
+        .ok_or_else(|| Failure::usage(&format!("the map places no table {table:?}")))?;
     if !t.group.is_empty() {
         return Err(Failure::usage(&format!(
-            "table {:?} is in co-location group {:?}: its ranges move with the group's, which \
-             range moves don't do",
-            spec.table, t.group
+            "table {table:?} is in co-location group {:?}: its ranges move with the group's, \
+             which range moves don't do",
+            t.group
         )));
     }
-    if m.indexes.iter().any(|i| i.follows == spec.table) {
+    if m.indexes.iter().any(|i| i.follows == table) {
         return Err(Failure::usage(&format!(
-            "an index follows table {:?}: its ranges don't move",
-            spec.table
+            "an index follows table {table:?}: its ranges don't move"
         )));
     }
     Ok(())
@@ -606,22 +616,319 @@ async fn abort_record(
         })
         .await?;
     }
+    let split = is_split(r);
     let mut wait = Waiting::new(
         format!("waiting for {} to drop move {}'s copy", r.to, r.id),
         Some(timeout.unwrap_or(Duration::from_secs(60))),
-        String::new(),
+        format!(
+            "The record stays ABORTING, and the split's partition {} with it, until {} drops \
+             what it copied: run phdb cluster move-range --abort {} again once its node is up",
+            r.to, r.to, r.id
+        ),
     );
     loop {
         let m = map_now(args).await?;
+        if !m.moves.iter().any(|x| x.id == r.id) {
+            return Ok(());
+        }
         let dropped = match side(args, &m, &r.to, &r.id).await {
             Ok((_, Some(t))) => t.dropped,
             _ => false,
         };
-        if dropped || wait.tick("the target drops its copy").await.is_err() {
+        if dropped {
             break;
         }
+        match wait.tick("the target drops its copy").await {
+            Ok(()) => {}
+            // A range move's target drops its copy at its next open if it's down (its
+            // reconcile), so the record goes anyway. A split's partition goes with its
+            // record, and only once it holds nothing (cli692's Must 5): the record stays.
+            Err(e) if split => return Err(e),
+            Err(_) => break,
+        }
     }
-    remove(args, &r.id).await
+    if !split {
+        return remove(args, &r.id).await;
+    }
+    // The split's partition: fenced and closed on its node, then the map drops it with the
+    // record, then its file is moved aside. A stop between the map and the drop leaves a
+    // marked, empty, unmapped file, which the node's reconcile moves aside.
+    let m = map_now(args).await?;
+    let (node, address) = node_of(&m, &r.to)?;
+    let at = At::new(args, node, address).await?;
+    at.call(&r.to, "fence").await?;
+    at.call(&r.to, "close").await?;
+    set_record(args, |now: &ClusterMap| {
+        let mut next = now.clone();
+        next.moves.retain(|x| x.id != r.id);
+        next.partitions.retain(|p| p.id != r.to);
+        Ok(next)
+    })
+    .await?;
+    // The node's reconcile on that map may have moved it aside first: no files is done.
+    match at.call(&r.to, "drop").await {
+        Ok(_) => Ok(()),
+        Err(f)
+            if f.message()
+                .contains(&format!("has no files of partition {}", r.to)) =>
+        {
+            Ok(())
+        }
+        Err(f) => Err(f),
+    }
+}
+
+/// Whether `r` is a split's move, whose target partition it created (record ids
+/// `split-<ms>`).
+fn is_split(r: &RangeMove) -> bool {
+    r.id.starts_with("split-")
+}
+
+/// What to split: `from`'s range of `table` holding `key`, from `key` to that range's end,
+/// into a new partition `id` on node `node`.
+#[derive(Debug, Clone)]
+pub(super) struct SplitSpec {
+    pub table: String,
+    pub from: String,
+    pub key: Vec<u8>,
+    pub node: String,
+    /// The new partition's id: without it, the smallest free `<from>-<n>`, n ≥ 1.
+    pub id: Option<String>,
+}
+
+/// The new partition's epoch: its first.
+const SPLIT_EPOCH: u64 = 1;
+
+/// `phdb cluster split` (D331 PR 5): a range move of `[key, end)` of `from`'s range into a
+/// new, empty partition on `--to`, created there before the map change that adds it. Run
+/// again, it goes on with the split's record.
+pub(super) async fn split(
+    args: &NodeArgs,
+    spec: &SplitSpec,
+    timeout: Option<Duration>,
+) -> Result<Report, Failure> {
+    let m = map_now(args).await?;
+    let (id, new) = match split_record(&m, spec)? {
+        Some(r) => (r.id.clone(), r.to.clone()),
+        None => {
+            let new = split_check(&m, spec)?;
+            (begin_split(args, spec, &new).await?, new)
+        }
+    };
+    drive(args, &id, timeout).await?;
+    Ok(super::cli::report(
+        "cluster split",
+        vec![
+            ("move", id.into()),
+            ("table", spec.table.clone().into()),
+            ("from", spec.from.clone().into()),
+            ("partition", new.into()),
+            ("node", spec.node.clone().into()),
+        ],
+        serde_json::json!({}),
+    ))
+}
+
+/// The smallest free `<from>-<n>`, n ≥ 1, in `m` (the coordinator's naming rule).
+fn split_name(m: &ClusterMap, from: &str) -> Result<String, Failure> {
+    (1..)
+        .map(|n| format!("{from}-{n}"))
+        .take_while(|id| map::id_ok(id))
+        .find(|id| !m.partitions.iter().any(|p| p.id == *id))
+        .ok_or_else(|| {
+            Failure::usage(&format!(
+                "no free id {from}-<n> fits a partition id's 64 characters: give one with --id"
+            ))
+        })
+}
+
+/// The split's own record in `m`, if a run of it started (a rerun goes on with it): a
+/// split of `from`'s `table` from `key`, to a partition on `node`, not aborting.
+fn split_record<'m>(m: &'m ClusterMap, spec: &SplitSpec) -> Result<Option<&'m RangeMove>, Failure> {
+    let key = map::canonical_key(&spec.key);
+    Ok(m.moves.iter().find(|r| {
+        is_split(r)
+            && r.from == spec.from
+            && r.table == spec.table
+            && r.start.as_ref() == Some(&key)
+            && spec.id.as_ref().is_none_or(|id| *id == r.to)
+            && m.partitions
+                .iter()
+                .any(|p| p.id == r.to && p.node == spec.node)
+            && map::phase(r) != MovePhase::Aborting
+    }))
+}
+
+/// Step 0 for a split: S, N and the new id, not T (cli692's nit); the key strictly inside
+/// one of S's ranges (at its start it would be a whole-range move). The new id.
+fn split_check(m: &ClusterMap, spec: &SplitSpec) -> Result<String, Failure> {
+    if !m.partitions.iter().any(|p| p.id == spec.from) {
+        return Err(Failure::usage(&format!(
+            "the map has no partition {:?}",
+            spec.from
+        )));
+    }
+    if !m.nodes.iter().any(|n| n.id == spec.node) {
+        return Err(Failure::usage(&format!(
+            "the map has no node {:?}",
+            spec.node
+        )));
+    }
+    check_table(m, &spec.table)?;
+    if let Some(r) = m
+        .moves
+        .iter()
+        .find(|r| r.from == spec.from || r.to == spec.from)
+    {
+        return Err(in_flight(r, "split"));
+    }
+    let new = match &spec.id {
+        Some(id) => id.clone(),
+        None => split_name(m, &spec.from)?,
+    };
+    if !map::id_ok(&new) {
+        return Err(Failure::usage(&format!(
+            "{new:?} isn't a partition id: 1-64 of [a-z0-9_-], not starting with -"
+        )));
+    }
+    if m.partitions.iter().any(|p| p.id == new) {
+        return Err(Failure::usage(&format!(
+            "the map has a partition {new:?} already: a split makes a new one"
+        )));
+    }
+    let t = m
+        .tables
+        .iter()
+        .find(|t| t.name == spec.table)
+        .ok_or_else(|| Failure::usage(&format!("the map places no table {:?}", spec.table)))?;
+    let holding = map::table_ranges(t).into_iter().find(|(lo, hi, p)| {
+        *p == spec.from
+            && spec.key.as_slice() >= lo.as_slice()
+            && hi.as_deref().is_none_or(|h| spec.key.as_slice() < h)
+    });
+    match holding {
+        None => Err(Failure::usage(&format!(
+            "partition {:?} holds no range of table {:?} at {:?}",
+            spec.from,
+            spec.table,
+            String::from_utf8_lossy(&spec.key)
+        ))),
+        Some((lo, _, _)) if lo == spec.key => Err(Failure::usage(&format!(
+            "{:?} is where {:?}'s range of table {:?} starts: a split there moves the whole \
+             range (phdb cluster move-range)",
+            String::from_utf8_lossy(&spec.key),
+            spec.from,
+            spec.table
+        ))),
+        Some(_) => Ok(new),
+    }
+}
+
+/// Step 1 for a split: N creates the new partition's file, marked with the record's id and
+/// the map version the change will carry, then one change adds the partition (on N, at
+/// [`SPLIT_EPOCH`]) and the record at COPYING. A change that lands at another version
+/// re-runs the create first, refreshing the mark (audit120's point 1), so N's reconcile
+/// never moves aside a file a landed change places.
+pub(super) async fn begin_split(
+    args: &NodeArgs,
+    spec: &SplitSpec,
+    new: &str,
+) -> Result<String, Failure> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let id = format!("split-{ms}");
+    for _ in 0..10 {
+        let m = map_now(args).await?;
+        split_check(
+            &m,
+            &SplitSpec {
+                id: Some(new.to_owned()),
+                ..spec.clone()
+            },
+        )?;
+        let version = m.map_version + 1;
+        let address = m
+            .nodes
+            .iter()
+            .find(|n| n.id == spec.node)
+            .map(|n| n.address.clone())
+            .ok_or_else(|| Failure::usage(&format!("the map has no node {:?}", spec.node)))?;
+        At::new(args, &spec.node, &address)
+            .await?
+            .create(&m.cluster_id, new, SPLIT_EPOCH, &id, version)
+            .await?;
+        let moved = std::sync::atomic::AtomicBool::new(false);
+        let range = {
+            let t = m.tables.iter().find(|t| t.name == spec.table);
+            let end = t.and_then(|t| {
+                map::table_ranges(t)
+                    .into_iter()
+                    .find(|(lo, hi, p)| {
+                        *p == spec.from
+                            && spec.key.as_slice() >= lo.as_slice()
+                            && hi.as_deref().is_none_or(|h| spec.key.as_slice() < h)
+                    })
+                    .and_then(|(_, hi, _)| hi)
+            });
+            (spec.key.clone(), end)
+        };
+        let from_epoch = m
+            .partitions
+            .iter()
+            .find(|p| p.id == spec.from)
+            .map_or(0, |p| p.epoch);
+        let landed = set_record(args, |now: &ClusterMap| {
+            if now.map_version + 1 != version {
+                moved.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(Failure::usage("the map moved under the split's start"));
+            }
+            split_check(
+                now,
+                &SplitSpec {
+                    id: Some(new.to_owned()),
+                    ..spec.clone()
+                },
+            )?;
+            let mut next = now.clone();
+            next.partitions.push(crate::serve::proto::Partition {
+                id: new.to_owned(),
+                node: spec.node.clone(),
+                epoch: SPLIT_EPOCH,
+                ..Default::default()
+            });
+            let mut r = RangeMove {
+                id: id.clone(),
+                kind: MoveKind::Range as i32,
+                table: spec.table.clone(),
+                start: Some(map::canonical_key(&range.0)),
+                end: range.1.as_deref().map(map::canonical_key),
+                from: spec.from.clone(),
+                to: new.to_owned(),
+                from_epoch,
+                to_epoch: SPLIT_EPOCH,
+                ..RangeMove::default()
+            };
+            r.set_phase(MovePhase::Copying);
+            next.moves.push(r);
+            Ok(next)
+        })
+        .await;
+        match landed {
+            Ok(()) => {
+                eprintln!(
+                    "phdb cluster split: move {id}: COPYING, into {new} on {}",
+                    spec.node
+                );
+                return Ok(id);
+            }
+            Err(_) if moved.load(std::sync::atomic::Ordering::Relaxed) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Failure::usage(
+        "the map kept changing under the split's start: run the split again",
+    ))
 }
 
 /// `phdb cluster move-range --abort ID`: move `id` stops before its commit point. Refused

@@ -425,7 +425,7 @@ impl Node {
 }
 
 /// [`Node::drop_partition`]'s move, on a blocking thread.
-fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
+pub(super) fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
     let main = dir.join(format!("{id}.phdb"));
     let mut files = pigeonhole::Pigeonhole::database_files(&main)
         .map_err(|e| ApiError::internal(format!("list {}'s files: {e}", main.display())))?;

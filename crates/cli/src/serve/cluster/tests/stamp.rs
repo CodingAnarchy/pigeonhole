@@ -30,6 +30,8 @@ async fn stamp(
             promote: false,
             replica_epoch: 0,
             create: false,
+            create_move: String::new(),
+            create_version: 0,
         })
         .await
         .map(tonic::Response::into_inner)
@@ -475,6 +477,8 @@ fn a_move_run_again_after_its_stamp_copies_and_checks_the_set_again() {
                 promote: false,
                 replica_epoch: 0,
                 create: false,
+                create_move: String::new(),
+                create_version: 0,
             })
             .await
             .unwrap()

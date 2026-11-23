@@ -503,6 +503,8 @@ pub(crate) async fn run(
                 promote: true,
                 replica_epoch: e_b,
                 create: false,
+                create_move: String::new(),
+                create_version: 0,
             },
         )
         .await?;

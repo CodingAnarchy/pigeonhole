@@ -23,7 +23,7 @@ use pigeonhole::{Family, Pigeonhole};
 use super::identity;
 use super::map;
 use super::range_follow::Followers;
-use crate::serve::proto::{ClusterMap, RangeMove};
+use crate::serve::proto::{ClusterMap, MovePhase, RangeMove};
 
 /// The moved family, where the drop rows sit beside the moved-away, serving and progress
 /// rows, each kind under its own prefix.
@@ -92,6 +92,27 @@ impl Drops {
                     start,
                     end,
                     target: false,
+                },
+            )?;
+        }
+        // The target's, at ABORTING, whatever it copied so far: none yet is a drop with
+        // nothing to drop, which still says `dropped` (a split's record waits for it). The
+        // drop joins the follower first, so a first chunk it commits after this goes too.
+        for m in map.moves.iter().filter(|m| {
+            !map::node_move(m)
+                && m.to == partition
+                && map::phase(m) == MovePhase::Aborting
+                && !self.dropped(&m.id)
+        }) {
+            let (start, end) = map::move_range(m)?;
+            write_pending(
+                db,
+                &Pending {
+                    id: m.id.clone(),
+                    table: m.table.clone(),
+                    start,
+                    end,
+                    target: true,
                 },
             )?;
         }
@@ -195,11 +216,13 @@ impl Drops {
         {
             f.join(&p.id).await;
         }
-        let table = db
-            .table(&p.table)
-            .and_then(|b| b.open())
-            .map_err(|e| format!("open table {:?}: {e}", p.table))?;
-        loop {
+        let table = match db.table(&p.table).and_then(|b| b.open()) {
+            Ok(t) => Some(t),
+            // The copy never created it: nothing to drop.
+            Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => None,
+            Err(e) => return Err(format!("open table {:?}: {e}", p.table)),
+        };
+        while let Some(table) = &table {
             let (db2, table2, p2) = (db.clone(), table.clone(), p.clone());
             let dropped = tokio::task::spawn_blocking(move || {
                 db2.drop_range(&table2, &p2.start, p2.end.as_deref())

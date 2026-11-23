@@ -1316,7 +1316,7 @@ Once a table's ranges hold data, its split keys change only through a range move
 ### Moving and splitting ranges
 From 1.3.0 (D331), a key range of a table moves from one partition to another while both serve:
 - **`phdb cluster move-range TABLE --from S --to T [--start K] [--end K]`** moves `[K_start, K_end)` of `TABLE` from partition `S` to partition `T`. The range must lie inside one of `S`'s ranges of the table; without `--start` or `--end` it runs from that range's start or to its end.
-- **`phdb cluster split TABLE --from S --key K --node N [--id ID]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N`. The new partition's id is `ID`, or by default the smallest free `S.<n>`. `K` can't be the range's start: that's a move of the whole range.
+- **`phdb cluster split TABLE --from S --key K --to N [--id ID]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N` (`--node` is the URL of the node the command talks to, as for every `phdb cluster` command). The new partition's id is `ID`, or by default the smallest free `S-<n>`, n ≥ 1 (`p3-1`, `p3-2`, …). `N` creates its file empty first, then the map adds it. `K` can't be the range's start: that's a move of the whole range.
 
 Both run on the map's writer, through its own map changes, and print each phase as it starts:
 1. **COPYING:** `T` copies the range from snapshots of `S`, at most `--move-rate-bytes` from `S`'s node, while `S` serves it as before.
@@ -1327,7 +1327,7 @@ Both run on the map's writer, through its own map changes, and print each phase 
 
 **Rerun and abort:**
 - **A rerun of the same command goes on** from the phase the map records, after a crash or a timeout. A different move of a partition already moving is refused, naming the move in flight.
-- **`phdb cluster move-range --abort ID`** stops move `ID` (a split's too) before its commit point: `T` drops what it copied, `S` serves the range as before, and a split's new partition is moved aside into `.phdb-dropped/` once it's empty. A node that's down when the abort lands cleans up when it comes back. Past the commit point the abort is refused: rerun the move to finish it.
+- **`phdb cluster move-range --abort ID`** stops move `ID` (a split's too) before its commit point: `T` drops what it copied, `S` serves the range as before, and a split's new partition leaves the map with the record, its file moved aside into `.phdb-dropped/` once it's empty (never deleted). A range move's target that's down when the abort lands cleans up when it comes back. A split's record stays ABORTING until its new partition has dropped what it copied: if its node is down, rerun the abort once it's back. Past the commit point the abort is refused: rerun the move to finish it.
 - **A failover of `S` or `T` before the hand-over aborts the move.** From HANDING_OVER until the move is done, a failover or a promote of either partition is refused.
 
 **Limits:**

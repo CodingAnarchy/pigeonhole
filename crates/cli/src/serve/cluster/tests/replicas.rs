@@ -312,6 +312,8 @@ fn a_stamp_onto_a_node_holding_the_partitions_replica_is_refused() {
                 promote: false,
                 replica_epoch: 0,
                 create: false,
+                create_move: String::new(),
+                create_version: 0,
             })
             .await
             .unwrap_err();

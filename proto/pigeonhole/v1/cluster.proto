@@ -153,6 +153,12 @@ message StampRequest {
   // map change that adds it: create-new (a path that exists is never replaced), idempotent
   // for an empty file with that identity, refused for anything else under the id.
   bool create = 9;
+  // With `create`: the split's move id, which the file's split-created mark names.
+  string create_move = 10;
+  // With `create`: the map version the split's COPYING change will carry. The node moves an
+  // empty, marked, unmapped file aside only once it holds a map past this version that
+  // doesn't place the partition. A rerun of the create refreshes the mark.
+  uint64 create_version = 11;
 }
 
 // A partition's state on its node (D317 ticket 6).

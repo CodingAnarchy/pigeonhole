@@ -17,7 +17,7 @@ use std::sync::Arc;
 use super::upload::{self, INCOMING};
 use super::{Node, identity};
 use crate::serve::errors::ApiError;
-use crate::serve::proto::{PartitionFile, PartitionUploadHeader, StampRequest};
+use crate::serve::proto::{ClusterMap, PartitionFile, PartitionUploadHeader, StampRequest};
 
 /// A fault seam (tests): the next install in each listed cluster directory fails after its
 /// first rename, as a crash there would leave it. Keyed by the directory, one entry each, so
@@ -190,6 +190,9 @@ impl Node {
                 req.to_epoch
             )));
         }
+        if req.create {
+            return self.create(req).await;
+        }
         if self.part_state(&p).is_some() {
             return Err(ApiError::failed_precondition(format!(
                 "partition {p:?} is open here: fence and close it first (phdb cluster close)"
@@ -224,6 +227,281 @@ impl Node {
         self.fences.forget_closed(&p);
         Ok(installed)
     }
+}
+
+impl Node {
+    /// [`Node::stamp`] with `create` (D331 PR 5, audit120's four points): a split's new
+    /// partition, created empty with its identity at `to_epoch` and marked for the split's
+    /// move and map version. Under the partition-open lock, which the open and the reconcile
+    /// of split-created files take too. Refused for anything already under the id here: an
+    /// open or closed partition, a replica copy, a staged upload or install, or a file
+    /// that isn't this split's empty one. Run again on that empty file, it refreshes the
+    /// mark (the driver does before each COPYING attempt).
+    async fn create(self: &Arc<Self>, req: StampRequest) -> Result<Vec<PartitionFile>, ApiError> {
+        let p = req.partition.clone();
+        if req.restore || req.promote || !req.restore_from_cluster_id.is_empty() {
+            return Err(ApiError::invalid(
+                "a create makes a new, empty partition: no restore and no promotion",
+            ));
+        }
+        if req.create_move.is_empty() || req.create_version == 0 {
+            return Err(ApiError::invalid(
+                "a create names its split's move and the map version its change carries",
+            ));
+        }
+        if self.part_state(&p).is_some() {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {p:?} is open or closed here already: a split creates a new one"
+            )));
+        }
+        if self.replica_open(&p) {
+            return Err(ApiError::failed_precondition(format!(
+                "this node holds a replica copy of partition {p:?}: a split creates a new one"
+            )));
+        }
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || create_file(&dir, &req)).await??;
+        Ok(Vec::new())
+    }
+}
+
+impl Node {
+    /// Brings this node's split-created partition files in line with `map` (D331 PR 5,
+    /// cli692's Must 5 and audit120's points 1, 2 and 4), on each map and at the node's
+    /// start:
+    /// - **a finished split:** a partition open here, which the map places here holding a
+    ///   range, whose mark names a move the map no longer has, loses its mark: it's like any
+    ///   other partition from then on;
+    /// - **an unfinished one:** a file here that isn't open, that the map doesn't place, whose
+    ///   mark names a move the map no longer has, from a map past the mark's version, and that
+    ///   holds no row, is moved aside into `.phdb-dropped/` (never deleted), under the
+    ///   partition-open lock: a split whose COPYING change never landed, or an abort whose
+    ///   CLI stopped before its drop-partition.
+    pub(crate) async fn reconcile_split_files(self: &Arc<Self>, map: &ClusterMap) {
+        let _open = self.opening.lock().await;
+        let shared = self.server.get().and_then(|s| s.shared.upgrade());
+        let parts = shared
+            .as_ref()
+            .and_then(|sh| sh.router.cluster.as_ref().map(|c| c.parts.load_full()));
+        let moving = |id: &str| map.moves.iter().any(|r| r.id == id);
+        let past =
+            |mark: &identity::SplitMark| map.map_version > mark.version && !moving(&mark.move_id);
+        if let Some(parts) = &parts {
+            for (id, service) in parts.iter() {
+                if !holds_a_range(map, id, &self.id) {
+                    continue;
+                }
+                let Ok(part) = service.part() else {
+                    continue;
+                };
+                match identity::split_mark(&part.db) {
+                    Ok(Some(mark)) if past(&mark) => match identity::clear_split_mark(&part.db) {
+                        Ok(()) => eprintln!(
+                            "phdb serve: partition {id}: split move {} finished; its \
+                                 split-created mark is cleared",
+                            mark.move_id
+                        ),
+                        Err(e) => eprintln!(
+                            "phdb serve: partition {id}: clearing its split-created mark: {e}"
+                        ),
+                    },
+                    Ok(_) => {}
+                    Err(e) => eprintln!("phdb serve: partition {id}: reading its split mark: {e}"),
+                }
+            }
+        }
+        // The files here nothing has open, and that the map doesn't place.
+        let mut skip: std::collections::BTreeSet<String> =
+            map.partitions.iter().map(|p| p.id.clone()).collect();
+        if let Some(parts) = &parts {
+            skip.extend(parts.keys().cloned());
+        }
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let candidates: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let id = name.strip_suffix(".phdb")?.to_owned();
+                (super::map::id_ok(&id) && !skip.contains(&id)).then_some(id)
+            })
+            .filter(|id| self.part_state(id).is_none() && !self.replica_open(id))
+            .filter(|id| !self.split_unmarked(id))
+            .collect();
+        for id in candidates {
+            let dir = self.dir.clone();
+            let map = map.clone();
+            let part = id.clone();
+            let outcome = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+                let main = main_file(&dir, &part);
+                if marker(&dir, &part).exists() || staged_any(&dir, &part) {
+                    return Ok(None);
+                }
+                let db = pigeonhole::Pigeonhole::open(
+                    &main,
+                    pigeonhole::Options::default().read_only(true),
+                )
+                .map_err(|e| format!("open: {e}"))?;
+                let read =
+                    identity::split_mark(&db).and_then(|m| Ok((m, identity::holds_no_rows(&db)?)));
+                let _ = db.close();
+                let (mark, empty) = read?;
+                let Some(mark) = mark else {
+                    return Ok(Some(String::new()));
+                };
+                let gone = map.map_version > mark.version
+                    && !map.moves.iter().any(|r| r.id == mark.move_id);
+                if !gone || !empty {
+                    return Ok(None);
+                }
+                let lp = super::close::move_aside(&dir, &part).map_err(|e| e.message)?;
+                Ok(Some(format!("{} (split move {})", lp.file, mark.move_id)))
+            })
+            .await;
+            match outcome {
+                // Not split-created: never looked at again while its file stays the same.
+                Ok(Ok(Some(moved))) if moved.is_empty() => self.note_unmarked(&id),
+                Ok(Ok(Some(moved))) => {
+                    self.fences.forget_closed(&id);
+                    eprintln!(
+                        "phdb serve: partition {id}: an empty split-created file the map doesn't \
+                         place, moved to {moved}: delete it once checked"
+                    );
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => eprintln!("phdb serve: partition {id}: checking its file: {e}"),
+                Err(e) => eprintln!("phdb serve: partition {id}: checking its file: {e}"),
+            }
+        }
+    }
+
+    /// Whether `id`'s file was found unmarked and hasn't changed since.
+    fn split_unmarked(&self, id: &str) -> bool {
+        let seen = file_seen(&main_file(&self.dir, id));
+        self.unmarked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .is_some_and(|s| Some(*s) == seen)
+    }
+
+    fn note_unmarked(&self, id: &str) {
+        if let Some(seen) = file_seen(&main_file(&self.dir, id)) {
+            self.unmarked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.to_owned(), seen);
+        }
+    }
+}
+
+/// A file's size and modification time: whether it changed.
+pub(crate) type Seen = (u64, std::time::SystemTime);
+
+fn file_seen(path: &Path) -> Option<Seen> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// Whether `map` places partition `id` on node `node` holding a range of some table.
+fn holds_a_range(map: &ClusterMap, id: &str, node: &str) -> bool {
+    map.partitions.iter().any(|p| p.id == id && p.node == node)
+        && map
+            .tables
+            .iter()
+            .any(|t| super::map::table_ranges(t).iter().any(|(_, _, p)| *p == id))
+}
+
+/// [`Node::create`]'s work on the files, on a blocking thread: create-new, never
+/// truncating; the same empty, marked file again only takes the new mark.
+fn create_file(dir: &Path, req: &StampRequest) -> Result<(), ApiError> {
+    let p = &req.partition;
+    if marker(dir, p).exists() || upload::ready_set(dir, p).is_some() || staged_any(dir, p) {
+        return Err(ApiError::failed_precondition(format!(
+            "this node has files of partition {p} staged or installing: a split creates a new \
+             partition"
+        )));
+    }
+    let main = main_file(dir, p);
+    let files = pigeonhole::Pigeonhole::database_files(&main)
+        .map_err(|e| ApiError::internal(format!("list {}'s files: {e}", main.display())))?;
+    let mark = identity::SplitMark {
+        move_id: req.create_move.clone(),
+        version: req.create_version,
+    };
+    let options = pigeonhole::Options::default()
+        .default_shards(1)
+        .pin_threads(false)
+        .memtable_budget(1 << 20)
+        .block_cache(1 << 20)
+        .row_cache(0);
+    if !files.contains(&main) {
+        if !files.is_empty() {
+            return Err(ApiError::failed_precondition(format!(
+                "this node has files of partition {p} but not its main file: move them aside \
+                 (phdb cluster drop-partition {p} on this node)"
+            )));
+        }
+        let db = pigeonhole::Pigeonhole::open(&main, options.create_if_missing(true))
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", main.display())))?;
+        let made = identity::write(
+            &db,
+            &identity::Identity {
+                cluster_id: req.cluster_id.clone(),
+                partition_id: p.clone(),
+                epoch: req.to_epoch,
+            },
+        )
+        .and_then(|()| identity::set_split_mark(&db, &mark));
+        let closed = db.close();
+        made.map_err(ApiError::internal)?;
+        closed.map_err(|e| ApiError::internal(format!("close {}: {e}", main.display())))?;
+        upload::sync_dir(dir);
+        eprintln!(
+            "phdb serve: partition {p} created empty for split move {}",
+            req.create_move
+        );
+        return Ok(());
+    }
+    // There already: this split's empty file (a rerun), or refused.
+    let db = super::open_retrying(&main, &options)
+        .map_err(|e| ApiError::internal(format!("open {}: {e}", main.display())))?;
+    let checked = (|| {
+        let id = identity::read(&db).map_err(ApiError::internal)?;
+        let same = id.as_ref().is_some_and(|id| {
+            id.cluster_id == req.cluster_id && id.partition_id == *p && id.epoch == req.to_epoch
+        });
+        let marked = identity::split_mark(&db)
+            .map_err(ApiError::internal)?
+            .is_some();
+        let empty = identity::holds_no_rows(&db).map_err(ApiError::internal)?;
+        if !(same && marked && empty) {
+            return Err(ApiError::failed_precondition(format!(
+                "{} exists and isn't an empty partition a split created as {p} of cluster {:?} \
+                 at epoch {}: a split creates a new partition, so pick another id",
+                main.display(),
+                req.cluster_id,
+                req.to_epoch
+            )));
+        }
+        identity::set_split_mark(&db, &mark).map_err(ApiError::internal)
+    })();
+    let closed = db.close();
+    checked?;
+    closed.map_err(|e| ApiError::internal(format!("close {}: {e}", main.display())))?;
+    Ok(())
+}
+
+/// Whether `.phdb-incoming` holds any staged file or header of partition `p`, complete or
+/// not.
+fn staged_any(dir: &Path, p: &str) -> bool {
+    let prefix = format!("{p}.phdb");
+    std::fs::read_dir(dir.join(INCOMING)).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+    })
 }
 
 /// [`Node::stamp`]'s work on the files, on a blocking thread.
@@ -482,6 +760,8 @@ mod tests {
             promote: false,
             replica_epoch: 0,
             create: false,
+            create_move: String::new(),
+            create_version: 0,
         }
     }
 
@@ -579,6 +859,104 @@ mod tests {
             e.message
         );
         assert!(!main_file(&d, "p1").exists());
+    }
+
+    fn create_req(p: &str, move_id: &str, version: u64) -> StampRequest {
+        StampRequest {
+            partition: p.into(),
+            from_epoch: 0,
+            to_epoch: 1,
+            create: true,
+            create_move: move_id.into(),
+            create_version: version,
+            ..req(0)
+        }
+    }
+
+    fn mark_of(dir: &Path, p: &str) -> Option<identity::SplitMark> {
+        let db = pigeonhole::Pigeonhole::open(
+            main_file(dir, p),
+            pigeonhole::Options::default().read_only(true),
+        )
+        .unwrap();
+        let mark = identity::split_mark(&db).unwrap();
+        db.close().unwrap();
+        mark
+    }
+
+    /// D331 PR 5 (audit120's point 3): a create makes the file empty, with its identity at
+    /// `to_epoch` and the split's mark; run again on that empty file it only refreshes the
+    /// mark (the driver's retry at another map version).
+    #[test]
+    fn a_create_makes_an_empty_marked_file_and_a_rerun_refreshes_its_mark() {
+        let d = dir();
+        create_file(&d, &create_req("p1-1", "split-1", 5)).unwrap();
+        let id = identity::read_file(&main_file(&d, "p1-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (id.cluster_id.as_str(), id.partition_id.as_str(), id.epoch),
+            ("c1", "p1-1", 1)
+        );
+        assert_eq!(
+            mark_of(&d, "p1-1"),
+            Some(identity::SplitMark {
+                move_id: "split-1".into(),
+                version: 5
+            })
+        );
+        create_file(&d, &create_req("p1-1", "split-1", 7)).unwrap();
+        assert_eq!(mark_of(&d, "p1-1").map(|m| m.version), Some(7));
+    }
+
+    /// audit120's point 3: create-new. Whatever is already under the id and isn't the
+    /// split's own empty file is refused, and left as it was: a partition's file (no mark),
+    /// one at another epoch, a marked file holding rows, a WAL file without its main file,
+    /// or a staged upload.
+    #[test]
+    fn a_create_refuses_anything_already_under_the_id() {
+        let refused = |d: &Path, r: &StampRequest| {
+            let e = create_file(d, r).unwrap_err();
+            assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+        };
+        // A partition's own file: not split-created.
+        let d = dir();
+        partition(&d, "p1-1", "c1", 1);
+        refused(&d, &create_req("p1-1", "split-1", 5));
+        assert_eq!(mark_of(&d, "p1-1"), None);
+        // Another epoch.
+        let d = dir();
+        create_file(&d, &create_req("p1-1", "split-1", 5)).unwrap();
+        refused(
+            &d,
+            &StampRequest {
+                from_epoch: 1,
+                to_epoch: 2,
+                ..create_req("p1-1", "split-1", 6)
+            },
+        );
+        // Rows in it.
+        let db = pigeonhole::Pigeonhole::open(main_file(&d, "p1-1"), Default::default()).unwrap();
+        let t = db
+            .table("users")
+            .unwrap()
+            .family("f", pigeonhole::Family::default())
+            .create_if_missing()
+            .unwrap();
+        t.mutate(b"d").put("f", b"q", b"v").commit().unwrap();
+        db.close().unwrap();
+        refused(&d, &create_req("p1-1", "split-1", 6));
+        assert_eq!(mark_of(&d, "p1-1").map(|m| m.version), Some(5));
+        // A stray WAL file.
+        let d = dir();
+        std::fs::write(d.join("p1-1.phdb-wal-0"), b"x").unwrap();
+        refused(&d, &create_req("p1-1", "split-1", 5));
+        assert!(!main_file(&d, "p1-1").exists());
+        // A staged upload of it.
+        let d = dir();
+        std::fs::write(d.join(INCOMING).join("p1-1.phdb.part"), b"x").unwrap();
+        refused(&d, &create_req("p1-1", "split-1", 5));
+        assert!(!main_file(&d, "p1-1").exists());
     }
 
     /// An interrupted install whose already-renamed file doesn't match the manifest stops,

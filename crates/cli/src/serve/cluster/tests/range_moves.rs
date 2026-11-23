@@ -2036,3 +2036,276 @@ fn a_straddling_commit_brings_its_in_range_part_and_same_timestamp_increments_bo
     );
     let _ = (t.db_a.close(), t.db_b.close());
 }
+
+/// The entries of `dir/.phdb-dropped/` for partition `p`.
+fn dropped_files(dir: &Path, p: &str) -> Vec<String> {
+    std::fs::read_dir(dir.join(super::super::close::DROPPED))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(&format!("{p}-")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `phdb cluster split`'s create on `port`'s node: `p`, marked for `move_id` at `version`.
+async fn create(port: u16, p: &str, move_id: &str, version: u64) -> Result<(), tonic::Status> {
+    client(port)
+        .await
+        .stamp(crate::serve::proto::StampRequest {
+            cluster_id: "c1".into(),
+            partition: p.into(),
+            from_epoch: 0,
+            to_epoch: 1,
+            create: true,
+            create_move: move_id.into(),
+            create_version: version,
+            ..Default::default()
+        })
+        .await
+        .map(drop)
+}
+
+/// `t`'s map at version 2, with `users`' family `f` in its placement, as a table created
+/// through the cluster has: what a new partition's schema reconcile creates it from.
+async fn with_families(t: &Three) {
+    let mut v2 = t.v1.clone();
+    v2.map_version = 2;
+    v2.tables[0].families = vec![crate::serve::proto::FamilySpec {
+        name: "f".into(),
+        ..Default::default()
+    }];
+    push(&t.ports, &v2).await;
+}
+
+/// D331 PR 5: `phdb cluster split` end to end, under writes. p1's range of `users` splits at
+/// "d" into a new partition p1-1 on node c (the default id): every acknowledged write reads
+/// back, the map places p1-1 on c holding `[d, m)`, p1 dropped its copy, and no record is
+/// left.
+#[test]
+fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    t.rt.block_on(async {
+        with_families(&t).await;
+        for i in 0..50 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (acked, stop) = (std::sync::Arc::clone(&acked), std::sync::Arc::clone(&stop));
+            tokio::spawn(async move {
+                let mut i = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (row, value) = (format!("d{:02}", i % 50), i.to_string());
+                    try_put(c, "a", &value).await.ok();
+                    if try_put(c, &row, &value).await.is_ok() {
+                        acked.lock().unwrap().push((row, value));
+                    }
+                    i += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        super::super::range_move::split(
+            &super::backup::args(a),
+            &spec,
+            Some(Duration::from_secs(120)),
+        )
+        .await
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        let mut last = std::collections::HashMap::new();
+        for (row, value) in acked.lock().unwrap().iter() {
+            last.insert(row.clone(), value.clone());
+        }
+        assert!(!last.is_empty());
+        for (row, value) in &last {
+            assert_eq!(
+                get_row(c, row).await.unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "row {row}"
+            );
+        }
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(
+            m.partitions.iter().any(|p| p.id == "p1-1" && p.node == "c"),
+            "{:?}",
+            m.partitions
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"d",
+            Some(b"m"),
+            "p1-1"
+        ));
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"a",
+            Some(b"d"),
+            "p1"
+        ));
+    });
+    let src = t.db_a.table("users").unwrap().open().unwrap();
+    assert!(
+        src.get(b"d00", "f", b"q").unwrap().is_none(),
+        "p1 dropped its copy"
+    );
+    assert!(src.get(b"a", "f", b"q").unwrap().is_some());
+}
+
+/// D331 PR 5 (cli692's Must 5): a split aborted before its commit point takes its new
+/// partition with it: the record stays ABORTING until p1-1 dropped what it copied, then the
+/// map drops the record and p1-1 together, and p1-1's file is moved aside on c. p1 serves
+/// the range as before.
+#[test]
+fn an_aborted_split_removes_its_new_partition_and_moves_its_file_aside() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        let args = super::backup::args(a);
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        let id = super::super::range_move::begin_split(&args, &spec, "p1-1")
+            .await
+            .unwrap();
+        super::super::range_move::abort(&args, &id, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(
+            !m.partitions.iter().any(|p| p.id == "p1-1"),
+            "{:?}",
+            m.partitions
+        );
+        assert!(!t.dirs[2].join("p1-1.phdb").exists());
+        assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+        try_put(c, "d05", "after").await.unwrap();
+        assert_eq!(get_row(c, "d05").await.unwrap(), Some(b"after".to_vec()));
+    });
+}
+
+/// D331 PR 5 (audit120's point 1, simp724's case): a split's create whose COPYING change
+/// never lands leaves a marked, empty file no map places. The node moves it aside only once
+/// it holds a map past the version the change would have carried; a map at that version
+/// (another change won it) leaves it.
+#[test]
+fn a_split_created_file_whose_map_never_landed_is_moved_aside_past_its_version() {
+    let t = three();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        create(c, "p1-1", "split-9", 2).await.unwrap();
+        assert!(t.dirs[2].join("p1-1.phdb").exists());
+        let passes = super::super::open::missing_passes(&t.dirs[2]);
+        let mut v2 = t.v1.clone();
+        v2.map_version = 2;
+        push(&t.ports, &v2).await;
+        eventually("c's pass on v2", async || {
+            super::super::open::missing_passes(&t.dirs[2]) > passes
+        })
+        .await;
+        assert!(
+            t.dirs[2].join("p1-1.phdb").exists(),
+            "v2 isn't past the mark's version"
+        );
+        let mut v3 = t.v1.clone();
+        v3.map_version = 3;
+        push(&t.ports, &v3).await;
+        eventually("c moves p1-1's file aside", async || {
+            !t.dirs[2].join("p1-1.phdb").exists()
+        })
+        .await;
+        assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+    });
+}
+
+/// D331 PR 5 (cli692's Must 5's test): the CLI stops between the map that drops an aborted
+/// split's record and partition, and its drop-partition. The node's reconcile moves the
+/// marked, empty, unmapped file aside on that map.
+#[test]
+fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
+    let t = three();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        create(c, "p1-1", "split-9", 2).await.unwrap();
+        let mut v2 = t.v1.clone();
+        v2.map_version = 2;
+        v2.partitions.push(crate::serve::proto::Partition {
+            id: "p1-1".into(),
+            node: "c".into(),
+            epoch: 1,
+            ..Default::default()
+        });
+        let mut r = RangeMove {
+            id: "split-9".into(),
+            kind: MoveKind::Range as i32,
+            table: "users".into(),
+            start: Some(super::super::map::canonical_key(b"d")),
+            end: Some(super::super::map::canonical_key(b"m")),
+            from: "p1".into(),
+            to: "p1-1".into(),
+            from_epoch: 1,
+            to_epoch: 1,
+            ..RangeMove::default()
+        };
+        r.set_phase(MovePhase::Aborting);
+        v2.moves.push(r);
+        push(&t.ports, &v2).await;
+        eventually("c opens p1-1", async || {
+            client(c)
+                .await
+                .status(crate::serve::proto::StatusRequest::default())
+                .await
+                .is_ok_and(|s| s.into_inner().partitions.iter().any(|lp| lp.id == "p1-1"))
+        })
+        .await;
+        client(c)
+            .await
+            .close(PartitionRequest {
+                partition: "p1-1".into(),
+                force: false,
+            })
+            .await
+            .unwrap();
+        // The removal map; the CLI stops before its drop-partition.
+        let mut v3 = t.v1.clone();
+        v3.map_version = 3;
+        push(&t.ports, &v3).await;
+        eventually("c moves p1-1's file aside", async || {
+            !t.dirs[2].join("p1-1.phdb").exists()
+        })
+        .await;
+        assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+    });
+}

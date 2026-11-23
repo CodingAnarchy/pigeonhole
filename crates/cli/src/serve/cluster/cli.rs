@@ -357,6 +357,33 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// Split partition `--from`'s range of TABLE at `--key` (D331 PR 5): the keys from
+    /// `--key` to that range's end move into a new, empty partition on node `--to`, as
+    /// `move-range` moves a range, under writes. The new partition is created on `--to`
+    /// first, then the map adds it. Run it again to go on after a stop; `phdb cluster
+    /// move-range --abort ID` ends it before its commit point, and the new partition goes.
+    Split {
+        /// The table whose range splits.
+        table: String,
+        /// The partition holding the range.
+        #[arg(long, value_name = "ID")]
+        from: String,
+        /// The first key (text) the new partition holds: inside `--from`'s range, not at
+        /// its start.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        /// The node id the new partition is created on.
+        #[arg(long, value_name = "ID")]
+        to: String,
+        /// The new partition's id: by default the smallest free `<from>-<n>`, n ≥ 1.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Give up waiting for the split after SECS (at least 1), as `move-range`'s.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
     /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
     /// once the map no longer places it there and it isn't open (close it first). Nothing
     /// is deleted: delete that directory once the move is checked. It frees no space
@@ -520,6 +547,25 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 to: to.clone().unwrap_or_default(),
                 start: start.as_ref().map(|s| s.as_bytes().to_vec()),
                 end: end.as_ref().map(|s| s.as_bytes().to_vec()),
+            },
+            timeout.map(Duration::from_secs),
+        )),
+        ClusterCommand::Split {
+            table,
+            from,
+            key,
+            to,
+            id,
+            node,
+            timeout,
+        } => runtime()?.block_on(super::range_move::split(
+            node,
+            &super::range_move::SplitSpec {
+                table: table.clone(),
+                from: from.clone(),
+                key: key.as_bytes().to_vec(),
+                node: to.clone(),
+                id: id.clone(),
             },
             timeout.map(Duration::from_secs),
         )),
@@ -913,6 +959,8 @@ pub(super) async fn relocate_as(
                 promote: false,
                 replica_epoch: 0,
                 create: false,
+                create_move: String::new(),
+                create_version: 0,
             },
             new_token.as_deref(),
         )?)

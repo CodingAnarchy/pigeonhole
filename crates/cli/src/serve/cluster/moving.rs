@@ -118,8 +118,45 @@ impl At {
         )
     }
 
+    /// A split's new partition `p` here, created empty at `epoch` and marked for move
+    /// `move_id`, whose COPYING change carries map `version` (`StampRequest.create`, D331
+    /// PR 5). Run again on the same empty file, it refreshes the mark.
+    pub(super) async fn create(
+        &self,
+        cluster: &str,
+        p: &str,
+        epoch: u64,
+        move_id: &str,
+        version: u64,
+    ) -> Result<(), Failure> {
+        let (mut c, _) = connect(&self.args, &self.args.node).await?;
+        c.stamp(request(
+            proto::StampRequest {
+                cluster_id: cluster.to_owned(),
+                partition: p.to_owned(),
+                from_epoch: epoch - 1,
+                to_epoch: epoch,
+                restore: false,
+                restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
+                create: true,
+                create_move: move_id.to_owned(),
+                create_version: version,
+            },
+            self.token.as_deref(),
+        )?)
+        .await
+        .map_err(|s| self.failed("create", &s))?;
+        Ok(())
+    }
+
     /// Fence, close or drop partition `p` here.
-    async fn call(&self, p: &str, what: &'static str) -> Result<LocalPartition, Failure> {
+    pub(super) async fn call(
+        &self,
+        p: &str,
+        what: &'static str,
+    ) -> Result<LocalPartition, Failure> {
         let (mut c, _) = connect(&self.args, &self.args.node).await?;
         let req = request(
             PartitionRequest {
@@ -1208,6 +1245,8 @@ async fn stamp(
             promote: false,
             replica_epoch: 0,
             create: false,
+            create_move: String::new(),
+            create_version: 0,
         },
         new.token.as_deref(),
     )?)

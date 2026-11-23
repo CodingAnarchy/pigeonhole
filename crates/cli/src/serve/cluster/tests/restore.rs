@@ -855,6 +855,8 @@ fn a_partition_restore_passes_every_copys_epoch_not_only_the_maps() {
                 promote: false,
                 replica_epoch: 0,
                 create: false,
+                create_move: String::new(),
+                create_version: 0,
             })
             .await
             .unwrap();

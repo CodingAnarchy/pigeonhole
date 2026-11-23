@@ -7205,6 +7205,14 @@ pub struct StampRequest {
     /// for an empty file with that identity, refused for anything else under the id.
     #[prost(bool, tag = "9")]
     pub create: bool,
+    /// With `create`: the split's move id, which the file's split-created mark names.
+    #[prost(string, tag = "10")]
+    pub create_move: ::prost::alloc::string::String,
+    /// With `create`: the map version the split's COPYING change will carry. The node moves an
+    /// empty, marked, unmapped file aside only once it holds a map past this version that
+    /// doesn't place the partition. A rerun of the create refreshes the mark.
+    #[prost(uint64, tag = "11")]
+    pub create_version: u64,
 }
 /// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
 /// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).

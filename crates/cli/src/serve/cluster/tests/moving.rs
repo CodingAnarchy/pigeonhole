@@ -1010,6 +1010,8 @@ fn a_stamp_that_installs_nothing_or_restores_keeps_the_operators_fence() {
                 promote: false,
                 replica_epoch: 0,
                 create: false,
+                create_move: String::new(),
+                create_version: 0,
             })
             .await
             .unwrap()

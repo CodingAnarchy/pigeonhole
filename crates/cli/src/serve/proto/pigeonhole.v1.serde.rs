@@ -27598,6 +27598,12 @@ impl serde::Serialize for StampRequest {
         if self.create {
             len += 1;
         }
+        if !self.create_move.is_empty() {
+            len += 1;
+        }
+        if self.create_version != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.StampRequest", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -27632,6 +27638,14 @@ impl serde::Serialize for StampRequest {
         if self.create {
             struct_ser.serialize_field("create", &self.create)?;
         }
+        if !self.create_move.is_empty() {
+            struct_ser.serialize_field("create_move", &self.create_move)?;
+        }
+        if self.create_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("create_version", ToString::to_string(&self.create_version).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -27656,6 +27670,10 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
             "replica_epoch",
             "replicaEpoch",
             "create",
+            "create_move",
+            "createMove",
+            "create_version",
+            "createVersion",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -27669,6 +27687,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
             Promote,
             ReplicaEpoch,
             Create,
+            CreateMove,
+            CreateVersion,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -27699,6 +27719,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                             "promote" => Ok(GeneratedField::Promote),
                             "replicaEpoch" | "replica_epoch" => Ok(GeneratedField::ReplicaEpoch),
                             "create" => Ok(GeneratedField::Create),
+                            "createMove" | "create_move" => Ok(GeneratedField::CreateMove),
+                            "createVersion" | "create_version" => Ok(GeneratedField::CreateVersion),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -27727,6 +27749,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                 let mut promote__ = None;
                 let mut replica_epoch__ = None;
                 let mut create__ = None;
+                let mut create_move__ = None;
+                let mut create_version__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -27789,6 +27813,20 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                             }
                             create__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::CreateMove => {
+                            if create_move__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createMove"));
+                            }
+                            create_move__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::CreateVersion => {
+                            if create_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createVersion"));
+                            }
+                            create_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(StampRequest {
@@ -27801,6 +27839,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                     promote: promote__.unwrap_or_default(),
                     replica_epoch: replica_epoch__.unwrap_or_default(),
                     create: create__.unwrap_or_default(),
+                    create_move: create_move__.unwrap_or_default(),
+                    create_version: create_version__.unwrap_or_default(),
                 })
             }
         }

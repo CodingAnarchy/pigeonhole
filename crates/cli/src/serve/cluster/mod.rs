@@ -266,6 +266,10 @@ pub(crate) struct Node {
     /// One open or close of a partition at a time (D317 ticket 6): the parts' swaps take
     /// it. Taken after `fences.changing` where both are.
     opening: tokio::sync::Mutex<()>,
+    /// Partition files here that the map doesn't place and that no split created, by id,
+    /// as they were when read ([`Node::reconcile_split_files`]): not opened again on each
+    /// map while they stay the same.
+    unmarked: Mutex<HashMap<String, stamp::Seen>>,
     /// This node, for the tasks an install starts.
     me: std::sync::Weak<Node>,
     /// Its cluster feed hubs (#1798): one merge per subscription key.
@@ -350,6 +354,7 @@ impl Node {
             fences: fence::Fences::default(),
             server: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
+            unmarked: Mutex::new(HashMap::new()),
             feed_hubs: hub::Hubs::default(),
             me: me.clone(),
         })
