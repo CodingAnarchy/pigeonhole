@@ -556,6 +556,17 @@ fn records(db: &pigeonhole::Pigeonhole) -> Option<Vec<u8>> {
         .map(|c| c.value().to_vec())
 }
 
+/// Cell `q` of move `id`'s copy head in `db` (its progress row), if there.
+fn head_cell(db: &pigeonhole::Pigeonhole, id: &str, q: &str) -> Option<Vec<u8>> {
+    db.table(super::super::identity::TABLE)
+        .ok()?
+        .open()
+        .ok()?
+        .get(format!("copy/{id}").as_bytes(), "moved", q.as_bytes())
+        .ok()?
+        .map(|c| c.value().to_vec())
+}
+
 /// Partition `p`'s view of move `id` on the node at `port`, as its `Status` reports it.
 async fn move_status(port: u16, p: &str, id: &str) -> Option<crate::serve::proto::MoveStatus> {
     client(port)
@@ -1720,6 +1731,13 @@ fn a_row_deleted_and_compacted_on_the_source_after_its_copy_is_gone_on_the_targe
 /// simp724 on the M-a fix: a stop that comes inside a row spanning several commits, with
 /// little of it left, waits for the row, so nothing is left half-copied, and the move goes
 /// on once the map gives it back.
+///
+/// The abort's drop of the first record's copy on b is held until the row is checked, and
+/// the move comes back as a new record, as every real restart does (`<prefix>-<ms>`): its
+/// copy waits for the first one's drop. The test used to bring back the first record
+/// itself: its follower read that record's progress before the drop removed it, said
+/// `copy_done`, and the drop then deleted the row under it (the 1.3.0 RC's Windows red on
+/// 06ae4a574). The ids are this test's own, as the drop's hold is by move id.
 #[test]
 fn a_stop_inside_a_small_split_row_finishes_the_row_and_the_move_goes_on() {
     let t = three();
@@ -1729,36 +1747,76 @@ fn a_stop_inside_a_small_split_row_finishes_the_row_and_the_move_goes_on() {
         .lock()
         .unwrap()
         .push(((t.dirs[1].clone(), 1), held));
+    let (first, second) = ("small-row-1", "small-row-2");
+    let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (go, drop_held) = tokio::sync::oneshot::channel();
+    super::super::range_drop::HOLD.lock().unwrap().push((
+        first.into(),
+        std::sync::Arc::clone(&reached),
+        drop_held,
+    ));
+    let users = t.db_b.table("users").unwrap().open().unwrap();
+    let whole = || {
+        ["q0", "q1", "q2"]
+            .iter()
+            .all(|q| users.get(b"d", "f", q.as_bytes()).unwrap().is_some())
+    };
     t.rt.block_on(async {
         // Three cells of 200 KB: three commits, about 600 KB, under the 1 MiB a stop waits for.
         mutate(c, wide_row("d", 3, 200 << 10)).await;
-        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        let mut moved = moving(&t.v1, 2, Some(MovePhase::Copying));
+        moved.moves[0].id = first.into();
+        push(&t.ports, &moved).await;
         eventually_within(
             Duration::from_secs(60),
             "b holds inside the row",
             async || taken(&super::super::range_follow::HOLD_ROW, &t.dirs[1]),
         )
         .await;
+        // The abort. Not released: the held follower goes on only once it sees the stop
+        // (`hold_at` waits for either), so the stop always comes inside the row.
         let mut aborted = t.v1.clone();
         aborted.map_version = 3;
         push(&t.ports, &aborted).await;
-        let _ = release.send(());
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        // The move again: the row was finished, so the copy goes on.
+        tokio::time::timeout(Duration::from_secs(30), reached.notified())
+            .await
+            .expect("b's drop of the first record's copy started, and is held");
+        // The stopped follower finished the row: all of it, and no partial mark (empty once
+        // a commit ends at a row boundary).
+        eventually("b's follower finishes the row", async || whole()).await;
+        assert!(
+            head_cell(&t.db_b, first, "n").is_some(),
+            "the first record's progress, held from its drop"
+        );
+        assert_eq!(
+            head_cell(&t.db_b, first, "partial").unwrap_or_default(),
+            b""
+        );
+        // The move again, a new record: its copy waits for the first one's drop.
         let mut back = t.v1.clone();
         back.map_version = 3;
-        push(&t.ports, &moving(&back, 4, Some(MovePhase::Copying))).await;
+        let mut again = moving(&back, 4, Some(MovePhase::Copying));
+        again.moves[0].id = second.into();
+        push(&t.ports, &again).await;
+        eventually(
+            "the new record's copy waits for the first's drop",
+            async || {
+                move_status(b, "p2", second)
+                    .await
+                    .is_some_and(|s| s.follower_waiting.contains(&format!("{first:?}")))
+            },
+        )
+        .await;
+        let _ = go.send(());
         eventually("b copies the range", async || {
-            move_status(b, "p2", "mv1")
+            move_status(b, "p2", second)
                 .await
                 .is_some_and(|s| s.copy_done && s.follower_error.is_empty())
         })
         .await;
     });
-    let users = t.db_b.table("users").unwrap().open().unwrap();
-    for q in ["q0", "q1", "q2"] {
-        assert!(users.get(b"d", "f", q.as_bytes()).unwrap().is_some(), "{q}");
-    }
+    assert!(whole());
+    drop(release);
     let _ = (t.db_a.close(), t.db_b.close());
 }
 
