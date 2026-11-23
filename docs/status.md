@@ -85,7 +85,7 @@ What the public API does, and the first release with each piece. The [README's l
 | | `phdb cluster merge S --into T`, and the removal of the emptied partition (#2131, #2133) | on `main`, 1.3.0 |
 | | a balancer (D332, #1485): what it measures, per-partition CPU and device load (#2063, ICR 0142); `phdb cluster move` recorded in the map, with `--abort` (#2092) | on `main`, 1.3.0 |
 | | the balancer itself, off by default: the map's writer moves whole partitions between nodes (#2103) | on `main`, 1.3.0 |
-| | the balancer's splits and merges (they wait for D331's driver) | to come, 1.3.0 |
+| | the balancer's splits and merges, through the online split and merge (#2137) | on `main`, 1.3.0 |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
@@ -209,8 +209,7 @@ Everything below shipped in [1.2.0](https://github.com/CodingAnarchy/pigeonhole/
   - **Read replicas:** `--replica-of`, read-your-writes and `phdb promote` (#1583, #1594).
   - **Running it:** `/metrics` with the engine's metrics through `pigeonhole-otel`'s `Collector` ([D323](design/decisions/phase-3.md#d323), #1687); thread placement and `--affinity` (#1697); a default shard count kept across restarts (#1699); WAL rings sized at start-up (#1681, ICR 0130); and jemalloc in the `phdb` binary (#1670, [D322](design/decisions/phase-3.md#d322)).
 - **Clusters** ([D317](design/decisions/phase-3.md#d317), #1482, [ICR 0117](design/icr/0117-static-partitions.md)): one database split across `phdb serve --cluster` nodes by static key-range partitions, with routing, fan-out, transactions, feeds, schema, fencing, moves, backups and `phdb cluster`. [Clusters](guide/serve.md#clusters) has the details.
-  - **Done in 1.3.0:** indexed vector and text search, rebuilds and bulk loads across partitions (#1722); read replicas of a partition, and promoting one (#1851); a partition confirmed by a majority of the map's nodes (#1760), and served only under a majority's lease ([D326](design/decisions/phase-3.md#d326)), which holds through a rolling upgrade from 1.2 (#2047); a lower put p99 at feed saturation, since one subscription's subscribers on a node share one merge (#1798); `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852); transactions across partitions (D329, #1483); automatic failover, off by default (D330, #1484); the cluster balancer's whole-partition moves, off by default (D332, #1485); and online range moves, splits and merges, `phdb cluster move-range`, `split` and `merge` (D331, #1499).
-  - **Still to come in 1.3.0:** the balancer's splits and merges (D332, #1485).
+  - **Done in 1.3.0:** indexed vector and text search, rebuilds and bulk loads across partitions (#1722); read replicas of a partition, and promoting one (#1851); a partition confirmed by a majority of the map's nodes (#1760), and served only under a majority's lease ([D326](design/decisions/phase-3.md#d326)), which holds through a rolling upgrade from 1.2 (#2047); a lower put p99 at feed saturation, since one subscription's subscribers on a node share one merge (#1798); `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852); transactions across partitions (D329, #1483); automatic failover, off by default (D330, #1484); the cluster balancer, off by default, with whole-partition moves, splits and merges (D332, #1485); and online range moves, splits and merges, `phdb cluster move-range`, `split` and `merge` (D331, #1499).
 - **Replication in the library** ([D315](design/decisions/phase-3.md#d315), #1436, ICR 0125):
   - `backup_at` and a replica's bootstrap and promotion (#1578), behind `__unstable-replication`;
   - a feed of every table that delivers catalog changes (#1515, #1539).

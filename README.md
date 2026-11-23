@@ -83,9 +83,7 @@ One line per family of operations, with the calls that do it, a guide page that 
   - **`Admin.Info`, `Flush` and `Compact`** on a cluster node;
 
   - **online range moves, splits and merges** (D331, #1499): `phdb cluster move-range` moves a key range of a table to another partition while both serve, `phdb cluster split` moves the end of a partition's range into a new partition, and `phdb cluster merge S --into T` moves all of `S` into `T` and removes `S`. Each phase is recorded in the map, so a stopped command is run again, resumed by id or aborted before its hand-over. Guide: [Moving and splitting ranges](docs/guide/serve.md#moving-and-splitting-ranges), [Merging partitions](docs/guide/serve.md#merging-partitions);
-  - **the cluster balancer, off by default** (D332, #1485): with it on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, one move at a time. Guide: [The cluster balancer](docs/guide/serve.md#the-cluster-balancer).
-
-  Planned for 1.3.0 and not finished on `main`: the balancer's splits and merges (D332, #1485), which run through these commands' drivers. [`docs/status.md`](docs/status.md#capabilities) has their state.
+  - **the cluster balancer, off by default** (D332, #1485): with it on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, splits partitions too big or too hot, and merges small, cold ones, one action at a time. Guide: [The cluster balancer](docs/guide/serve.md#the-cluster-balancer), [Splits and merges](docs/guide/serve.md#splits-and-merges).
 
   Guide: [Clusters](docs/guide/serve.md#clusters). Reference: [`phdb serve`](docs/guide/agent-reference.md#phdb-serve-120).
 
