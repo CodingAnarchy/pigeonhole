@@ -1236,6 +1236,36 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
     let _ = (db_a.close(), db_b.close());
 }
 
+/// cli692's M1 on #2130: a spanning transaction's branch on S wrote a row of the moving
+/// range while S still served it (CATCHING_UP). Once S fences the range (HANDING_OVER) the
+/// branch's prepare is refused, as a local commit open across the fence is, so its share
+/// can't land above the fence's seqno: the transaction writes nothing anywhere.
+#[test]
+fn a_branch_that_wrote_the_range_before_the_fence_cant_prepare_after_it() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::CatchingUp))).await;
+        // Home p2 (by "zed"); a branch on p1 writes "d05", inside the moving [c, f).
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        txn_write(a, &id, vec![put_row("d05", "1")], None)
+            .await
+            .unwrap();
+        txn_write(c, &id, vec![put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        push(&t.ports, &moving(&t.v1, 3, Some(MovePhase::HandingOver))).await;
+        let refused = super::spanning::commit_parts(c, &id, Vec::new()).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(get_row(c, "zed").await.unwrap(), None, "the home wrote");
+    });
+    let users = t.db_a.table("users").unwrap().open().unwrap();
+    assert!(
+        users.get(b"d05", "f", b"q").unwrap().is_none(),
+        "the branch wrote on the source past its fence"
+    );
+}
+
 /// Three nodes as the PR 4b tests run them: p1 on a, p2 on b, c routing. The databases of a
 /// and b, the map, the ports, the directories and the stop senders.
 struct Three {
