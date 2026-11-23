@@ -3188,13 +3188,12 @@ fn an_old_token_and_xid_naming_a_re_added_source_fail_cleanly() {
         .await
         .unwrap();
         // The old token: never the new p1's history. The new p1's file refuses the old one's
-        // feed token as another database's (its identity check); the cluster feed passes
-        // that on as it is.
+        // feed token as another database's (its identity check), and the cluster feed
+        // expires it (#2135).
         let ended = resume_ends_with(&mut feed, &token).await;
+        assert_eq!(code(&ended), "FeedExpired", "{ended}");
         assert!(
-            code(&ended) == "FeedExpired"
-                || (code(&ended) == "InvalidArgument"
-                    && ended.message().contains("the token is another database's")),
+            ended.message().contains("dropped and created again"),
             "{ended}"
         );
         // The old xid: no read or commit through the new p1.
