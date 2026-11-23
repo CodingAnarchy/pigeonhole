@@ -2712,6 +2712,75 @@ fn merge_moves_every_range_into_the_target_and_leaves_the_emptied_source_waiting
     });
 }
 
+/// D331 PR 6: once p1's moved-away row is pruned (here by the prune's own write, as PR 5's
+/// feed tests do: an emptied partition's feed retention never passes by itself), a rerun of
+/// the merge removes p1 from the map and moves its file aside on its node, and every
+/// acknowledged row still reads back from p2.
+#[test]
+fn a_merge_rerun_removes_the_emptied_source_once_nothing_waits() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        with_families(&t).await;
+        for i in 0..20 {
+            try_put(c, &format!("d{i:02}"), &i.to_string())
+                .await
+                .unwrap();
+        }
+        let merge = async || {
+            super::super::range_merge::run(
+                &super::backup::args(a),
+                "p1",
+                "p2",
+                Some(Duration::from_secs(120)),
+                true,
+            )
+            .await
+            .unwrap()
+        };
+        let first = merge().await;
+        assert_eq!(first.document["source"], serde_json::json!("waiting"));
+        let moved = crate::serve::ranges::read_moved(&t.db_a).unwrap();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        for m in &moved {
+            crate::serve::ranges::prune_row(&t.db_a, crate::serve::ranges::Pruned::Moved, m)
+                .unwrap();
+        }
+        let again = merge().await;
+        assert_eq!(
+            again.document["source"],
+            serde_json::json!("removed"),
+            "{:?}",
+            again.document
+        );
+        assert_eq!(again.document["ranges_moved"], serde_json::json!(0));
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!m.partitions.iter().any(|p| p.id == "p1"), "p1 is removed");
+        assert!(super::super::map::inside(&m.tables[0], b"", None, "p2"));
+        eventually("a moves p1's file aside", async || {
+            !t.dirs[0].join("p1.phdb").exists()
+        })
+        .await;
+        assert_eq!(dropped_files(&t.dirs[0], "p1").len(), 1);
+        for i in 0..20 {
+            let row = format!("d{i:02}");
+            assert_eq!(
+                get_row(c, &row).await.unwrap(),
+                Some(i.to_string().into_bytes()),
+                "row {row}"
+            );
+        }
+        // A third run finds p1 gone and nothing of it on any node.
+        let third = merge().await;
+        assert_eq!(third.document["source"], serde_json::json!("removed"));
+    });
+}
+
 /// audit120's M1 on #2130: an abort's CLI stopped after it fenced and closed the split's
 /// partition, before the map change. Run again, the abort goes on past the closed partition
 /// (no fence on it, which a closed partition refuses): the map drops the record and p1-1,

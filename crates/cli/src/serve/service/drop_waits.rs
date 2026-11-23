@@ -19,19 +19,20 @@ impl Service {
         use super::super::cluster::spanning::{
             DECISION_FAMILY, DECISION_QUALIFIER, DECISIONS, collectable,
         };
-        if let Some(m) = self.gate.as_ref().and_then(|g| {
-            g.ranges()
-                .moved_rows()
-                .into_iter()
-                .max_by_key(|m| m.final_seqno)
-        }) {
-            return Some(format!(
-                "its change feed: move {} took {:?} at seqno {}; its moved-away row is pruned \
-                 once this partition's feed retention passes that",
-                m.id, m.table, m.final_seqno
-            ));
-        }
         let db = &self.part_opt()?.db;
+        // The file's rows, not the gate's copy: a prune reloads the gate only in its own pass.
+        match crate::serve::ranges::read_moved(db) {
+            Ok(rows) => {
+                if let Some(m) = rows.into_iter().max_by_key(|m| m.final_seqno) {
+                    return Some(format!(
+                        "its change feed: move {} took {:?} at seqno {}; its moved-away row is \
+                         pruned once this partition's feed retention passes that",
+                        m.id, m.table, m.final_seqno
+                    ));
+                }
+            }
+            Err(e) => return Some(format!("its moved-away rows couldn't be read: {e}")),
+        }
         if let Ok(table) = db.table(DECISIONS).and_then(|t| t.open()) {
             let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
             let rows = match table.scan_prefix(b"").iter() {
