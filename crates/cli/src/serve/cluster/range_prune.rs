@@ -277,7 +277,7 @@ mod tests {
             |v: Vec<(Pruned, Moved)>| v.into_iter().map(|(k, m)| (k, m.id)).collect::<Vec<_>>();
         let all = |_: &Moved| true;
         assert_eq!(
-            ids(prunable(&none, &[m.clone()], &[], ok, all)),
+            ids(prunable(&none, std::slice::from_ref(&m), &[], ok, all)),
             [(Pruned::Moved, "mv1".to_owned())]
         );
         // The move still in the map.
@@ -288,29 +288,29 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(prunable(&live, &[m.clone()], &[], ok, all).is_empty());
+        assert!(prunable(&live, std::slice::from_ref(&m), &[], ok, all).is_empty());
         // A node below the hand-over's version, or one that didn't answer.
         for every in [Some(6), None] {
             let b = Bounds {
                 every_node_at: every,
                 ..ok
             };
-            assert!(prunable(&none, &[m.clone()], &[], b, all).is_empty());
+            assert!(prunable(&none, std::slice::from_ref(&m), &[], b, all).is_empty());
         }
         // Within the transaction lifetime plus the request timeout.
         let early = Bounds {
             now_ms: 59_999,
             ..ok
         };
-        assert!(prunable(&none, &[m.clone()], &[], early, all).is_empty());
+        assert!(prunable(&none, std::slice::from_ref(&m), &[], early, all).is_empty());
         // Retention not past it.
-        assert!(prunable(&none, &[m.clone()], &[], ok, |_| false).is_empty());
+        assert!(prunable(&none, std::slice::from_ref(&m), &[], ok, |_| false).is_empty());
 
         // A serving row: P1 (its move in the map), retention, and an older moved-away row
         // it overlaps, which it clears.
         let s = row("mv2", "d", Some("m"), 9, 0);
         assert_eq!(
-            ids(prunable(&none, &[], &[s.clone()], ok, all)),
+            ids(prunable(&none, &[], std::slice::from_ref(&s), ok, all)),
             [(Pruned::Serving, "mv2".to_owned())]
         );
         let live2 = ClusterMap {
@@ -320,13 +320,19 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(prunable(&live2, &[], &[s.clone()], ok, all).is_empty());
-        assert!(prunable(&none, &[], &[s.clone()], ok, |_| false).is_empty());
+        assert!(prunable(&live2, &[], std::slice::from_ref(&s), ok, all).is_empty());
+        assert!(prunable(&none, &[], std::slice::from_ref(&s), ok, |_| false).is_empty());
         let older = row("mv0", "k", None, 3, 99_999);
         assert!(
-            ids(prunable(&none, &[older.clone()], &[s.clone()], ok, all))
-                .iter()
-                .all(|(k, _)| *k != Pruned::Serving),
+            ids(prunable(
+                &none,
+                std::slice::from_ref(&older),
+                std::slice::from_ref(&s),
+                ok,
+                all
+            ))
+            .iter()
+            .all(|(k, _)| *k != Pruned::Serving),
             "an older overlapping moved-away row keeps it"
         );
         let apart = row("mv0", "m", None, 3, 99_999);
