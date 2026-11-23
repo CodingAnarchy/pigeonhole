@@ -40,7 +40,7 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
   - On Linux, `phdb serve`'s feed hubs wait one 1 ms tick after a small batch by default (`--feed-hub-coalesce-ticks`): about 40% less CPU per delivered event for a few milliseconds more lag. Set it to 0 for the lowest lag.
   - The data file's freed space is punched back to the filesystem by default (`Options::punch_freed(false)` turns it off): `du` shrinks, `ls -l` doesn't.
   - `Replication.Follow` on a cluster node serves only the partition's map replicas.
-- **Version lines** (D295): the public crates and `phdb` move to 1.3.0, the internal crates to 3.1.0, and `pigeonhole-embed` and `pigeonhole-otel` to 0.1.1. `pigeonhole` pins each internal crate exactly, so depending on `pigeonhole` alone, as recommended, is unaffected. *(Draft: pending the workspace semver check on the RC.)*
+- **Version lines** (D295): the public crates and `phdb` move to 1.3.0, the internal crates to 3.1.0, and `pigeonhole-embed` and `pigeonhole-otel` to 0.1.1. `pigeonhole` pins each internal crate exactly, so depending on `pigeonhole` alone, as recommended, is unaffected.
 
 ### Added
 - **Partition failover in a cluster** (D330 PR 2, #1484).
