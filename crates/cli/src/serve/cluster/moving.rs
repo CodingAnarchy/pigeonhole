@@ -168,6 +168,7 @@ impl At {
         let reply = match what {
             "fence" => c.fence(req).await,
             "close" => c.close(req).await,
+            "unfence" => c.unfence(req).await,
             _ => c.drop_partition(req).await,
         };
         Ok(reply.map_err(|s| self.failed(what, &s))?.into_inner())

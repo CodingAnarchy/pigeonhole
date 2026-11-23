@@ -221,6 +221,17 @@ impl Node {
                     // path the database opened, not one built from the id (CodeQL on
                     // #2103).
                     lp.file_bytes = std::fs::metadata(part.db.path()).map_or(0, |m| m.len());
+                    // D331 PR 6: an owner's partition the map places nothing on (a merge
+                    // emptied it): what still keeps it listed.
+                    if let Some(m) = &map
+                        && m.partitions.iter().any(|p| p.id == id && p.node == self.id)
+                        && !super::map::placed(m, &id)
+                    {
+                        lp.drop_waits = part
+                            .service()
+                            .drop_waits(super::spanning::now_ms())
+                            .unwrap_or_default();
+                    }
                 }
             }
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).

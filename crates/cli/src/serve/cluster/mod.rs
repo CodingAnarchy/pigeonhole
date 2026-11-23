@@ -37,6 +37,7 @@ pub(crate) mod range_drop;
 pub(crate) mod range_feed;
 pub(crate) mod range_fence;
 pub(crate) mod range_follow;
+mod range_merge;
 pub(crate) mod range_move;
 mod restore;
 pub(crate) mod route;

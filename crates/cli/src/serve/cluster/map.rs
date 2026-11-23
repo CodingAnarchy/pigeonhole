@@ -30,6 +30,19 @@ pub(crate) fn split_key_bytes(k: &SplitKey) -> Result<Vec<u8>, Refusal> {
 /// Whether `id` may name a node or a partition: a partition id is also its file's name
 /// (`<id>.phdb`), so ids are `[a-z0-9_-]`, 1 to 64 characters, not starting with `.` (which
 /// the set excludes) or `-`.
+/// Whether `m` places anything on partition `p`: a range of a table, an index or the memory
+/// store (what `validate` keeps a partition for). D331 PR 6: a merge removes a partition
+/// only once it places nothing.
+pub(crate) fn placed(m: &ClusterMap, p: &str) -> bool {
+    m.tables.iter().any(|t| t.partitions.iter().any(|q| q == p))
+        || m.indexes
+            .iter()
+            .any(|i| i.partitions.iter().any(|q| q == p))
+        || m.memory
+            .as_ref()
+            .is_some_and(|s| s.partitions.iter().any(|q| q == p))
+}
+
 pub(crate) fn id_ok(id: &str) -> bool {
     (1..=64).contains(&id.len())
         && !id.starts_with('-')

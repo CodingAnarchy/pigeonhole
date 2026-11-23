@@ -13715,6 +13715,9 @@ impl serde::Serialize for LocalPartition {
         if self.file_bytes != 0 {
             len += 1;
         }
+        if !self.drop_waits.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -13837,6 +13840,9 @@ impl serde::Serialize for LocalPartition {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("file_bytes", ToString::to_string(&self.file_bytes).as_str())?;
         }
+        if !self.drop_waits.is_empty() {
+            struct_ser.serialize_field("drop_waits", &self.drop_waits)?;
+        }
         struct_ser.end()
     }
 }
@@ -13899,6 +13905,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "load",
             "file_bytes",
             "fileBytes",
+            "drop_waits",
+            "dropWaits",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -13934,6 +13942,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             LoadDevice,
             Load,
             FileBytes,
+            DropWaits,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -13986,6 +13995,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "loadDevice" | "load_device" => Ok(GeneratedField::LoadDevice),
                             "load" => Ok(GeneratedField::Load),
                             "fileBytes" | "file_bytes" => Ok(GeneratedField::FileBytes),
+                            "dropWaits" | "drop_waits" => Ok(GeneratedField::DropWaits),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14036,6 +14046,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut load_device__ = None;
                 let mut load__ = None;
                 let mut file_bytes__ = None;
+                let mut drop_waits__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -14252,6 +14263,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::DropWaits => {
+                            if drop_waits__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dropWaits"));
+                            }
+                            drop_waits__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -14286,6 +14303,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     load_device: load_device__.unwrap_or_default(),
                     load: load__.unwrap_or_default(),
                     file_bytes: file_bytes__.unwrap_or_default(),
+                    drop_waits: drop_waits__.unwrap_or_default(),
                 })
             }
         }

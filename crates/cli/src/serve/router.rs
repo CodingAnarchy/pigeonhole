@@ -200,6 +200,11 @@ impl PartRef {
     fn of(service: &Arc<Service>) -> Option<Self> {
         service.part_opt().map(|_| Self(Arc::clone(service)))
     }
+
+    /// The partition's service.
+    pub(crate) fn service(&self) -> &Service {
+        &self.0
+    }
 }
 
 impl std::ops::Deref for PartRef {

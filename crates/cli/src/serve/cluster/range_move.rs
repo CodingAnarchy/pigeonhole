@@ -279,7 +279,7 @@ fn record_for<'m>(
 }
 
 /// Move `r` is in flight, so `then` (a move, a split) waits for it: the error naming it.
-fn in_flight(r: &RangeMove, then: &str) -> Failure {
+pub(super) fn in_flight(r: &RangeMove, then: &str) -> Failure {
     Failure::usage(&format!(
         "move {:?} is in flight ({} of table {:?}, {:?} to {:?}, at {:?}): finish it (run it \
          again), or abort it before its commit point (phdb cluster move-range --abort {}), \
@@ -313,7 +313,7 @@ fn check(m: &ClusterMap, spec: &Spec) -> Result<(), Failure> {
 
 /// Whether `table`'s ranges can move: the map places it, in no co-location group, and no
 /// index follows it.
-fn check_table(m: &ClusterMap, table: &str) -> Result<(), Failure> {
+pub(super) fn check_table(m: &ClusterMap, table: &str) -> Result<(), Failure> {
     let t = m
         .tables
         .iter()
@@ -335,7 +335,7 @@ fn check_table(m: &ClusterMap, table: &str) -> Result<(), Failure> {
 }
 
 /// A partition's node, as `m` gives it.
-fn node_of<'m>(m: &'m ClusterMap, p: &str) -> Result<(&'m str, &'m str), Failure> {
+pub(super) fn node_of<'m>(m: &'m ClusterMap, p: &str) -> Result<(&'m str, &'m str), Failure> {
     let node = m
         .partitions
         .iter()
