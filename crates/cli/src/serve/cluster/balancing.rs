@@ -39,10 +39,6 @@ pub(crate) const PASS: Duration = Duration::from_secs(30);
 pub(crate) static PASS_FOR: std::sync::Mutex<Vec<(std::path::PathBuf, Duration)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// `--move-rate-bytes`' default, per second, for the copy-time check until D331 PR 4b adds
-/// the flag.
-const MOVE_RATE: u64 = 64 << 20;
-
 /// The writer's balancer state: in memory, new with each writer term (S3).
 #[derive(Debug, Default)]
 pub(crate) struct Run {
@@ -539,9 +535,18 @@ impl Node {
             }
         }
         let at = wall_ms();
+        // The copy-time check's rate: this node's `--move-rate-bytes`, as the nodes' figure.
+        // A split's range copy is held to its source's; a whole move's copy isn't held to
+        // one, so for it this is a planning figure (perf287 on the D332 PR 5 design).
+        let rate = self
+            .server
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .and_then(|sh| sh.router.cluster.as_ref().map(|c| c.range_copies.rate()))
+            .unwrap_or(64 << 20);
         let decision = {
             let mut r = self.balancing();
-            let d = balance::decide(&nodes, &parts, &bounds, &mut r.counters, at, MOVE_RATE);
+            let d = balance::decide(&nodes, &parts, &bounds, &mut r.counters, at, rate);
             r.ratios = node_ratios(&nodes, &parts);
             d
         };

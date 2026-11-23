@@ -77,6 +77,12 @@ struct Bucket {
 }
 
 impl Sources {
+    /// `--move-rate-bytes`: this node's copy bandwidth, bytes a second. The balancer's
+    /// copy-time check reads the writer's, as the nodes' figure (D332 PR 5 design §6).
+    pub(crate) fn rate(&self) -> u64 {
+        self.rate
+    }
+
     pub(crate) fn new(rate: u64, cap: u64, max_followers: usize) -> Self {
         Self {
             copies: Mutex::default(),

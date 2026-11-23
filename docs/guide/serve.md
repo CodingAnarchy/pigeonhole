@@ -1158,7 +1158,7 @@ Any node still takes any call, before, during and after.
 - **Lose nothing.** See [What can be lost](#what-can-be-lost).
 
 ### The cluster balancer
-**New in 1.3.0 (D332, ICR 0117). Off by default.** With the balancer on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, one move at a time. It reacts only to imbalance that lasts: a node must stay over its bound for minutes before anything moves, and what a move touched then rests for half an hour.
+**New in 1.3.0 (D332, ICR 0117). Off by default.** With the balancer on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, splits partitions too big or too hot, and merges small, cold ones, one action at a time. It reacts only to imbalance that lasts: a node must stay over its bound for minutes before anything moves, and what a move touched then rests for half an hour.
 
 #### Turning it on
 - **`phdb cluster balancer resume --node URL`** turns it on (the map's `"balancer": "BALANCER_MODE_ON"`), from off or paused. You can also set the field with `phdb cluster set-map`.
@@ -1173,7 +1173,7 @@ Every 30 s, the writer reads each node's open partitions (their size from the fi
 - **The move:** once a node has been over its bound for `passes` passes in a row (default 10, so about 5 minutes), the writer moves one of its partitions to the node that brings both closest to the mean.
   - The move never takes the target over its own bound, and never puts a partition on a node that holds one of its replicas.
   - Ties go to the smaller partition.
-  - A partition whose copy wouldn't finish within the dwell (reckoned at 64 MiB/s) isn't moved. At the defaults that's over about 112 GiB, beyond `partition_max_bytes`, so it matters only with a short dwell.
+  - A partition whose copy wouldn't finish within the dwell, reckoned at the writer's `--move-rate-bytes` (64 MiB/s by default), isn't moved. At the defaults that's over about 112 GiB, beyond `partition_max_bytes`, so it matters only with a short dwell or a low rate.
 - **It keeps going on the same node** while that node stays above `1 + 0.4 × (ratio − 1)` (1.1 at the default ratio), so it doesn't stop just under the bound and start again a pass later.
 - **The rest (`dwell_ms`, default 30 minutes):** the partition moved, and both nodes, aren't moved from or to again until it ends. With the defaults, the cluster changes at most a few times an hour.
 - **One move at a time, cluster-wide.** Nothing starts while any move is in flight, an operator's `phdb cluster move` or range move included.
@@ -1189,14 +1189,23 @@ Every 30 s, the writer reads each node's open partitions (their size from the fi
 
 #### What it leaves alone
 - **A pinned partition.** `phdb cluster balancer pin P --node URL` keeps P on its node; `unpin` lets the balancer act on it again. An operator's pin never expires.
-- **A partition that keeps moving.** One moved `max_moves` times (default 3) within `bounce_window_ms` (default 24 h) is pinned by the balancer, with the reason "bouncing". That pin expires after another bounce window. An operator's `pin` or `unpin` replaces it.
+- **A partition that keeps moving.** One moved whole `max_moves` times (default 3) within `bounce_window_ms` (default 24 h) is pinned by the balancer, with the reason "bouncing". That pin expires after another bounce window. An operator's `pin` or `unpin` replaces it. Splits and merges don't count: a split doesn't add to the partition's count, nor start it again.
 - **A pinned range.** A table's `pinned_ranges` in the map (each a `start` and `end` split key, half-open) keeps those keys where they are. A partition holding one is never moved.
 - **A partition in any move,** or with spanning-transaction shares in doubt.
 
 #### Splits and merges
-The balancer also judges partitions too big (over `partition_max_bytes`, default 32 GiB) or too hot (over `partition_max_load`, default 0.5 of a node), and small, cold ones (under `partition_min_bytes`, default 4 GiB). Splitting and merging them use the online split and merge (D331). Until those land, `status` names the partition and says its split or merge waits.
-- **A split** will cut at a tablet boundary that halves the partition, never inside a pinned range. If the best cut leaves over 80% on one side (a hot key), the partition is reported as unsplittable instead.
-- **A merge** will join a partition only with a neighbour (one holding the next range of one of its tables), and only while the two together stay under **half** of `partition_max_bytes` and `partition_max_load`. So a merge never makes a partition the next pass would split.
+The balancer also judges partitions too big (over `partition_max_bytes`, default 32 GiB) or too hot (over `partition_max_load`, default 0.5 of a node), and small, cold ones (under `partition_min_bytes`, default 4 GiB). It splits and merges them with the online split and merge (D331), as `phdb cluster split` and `merge` do, recorded in the map under an id starting `bal-`. Splits come first in a pass, then whole moves, then merges.
+- **A split** cuts one table of the partition P at a tablet boundary, never inside a pinned range:
+  - **Where:** the boundary that halves P's load, each tablet's load being the larger of its share of P's reads (sampled) and of its writes. With no load measured, it halves P's bytes. If the best cut leaves over 80% on one side (a hot key, or a narrow hot range), P is reported as unsplittable, and a whole move is considered instead.
+  - **What moves:** from the cut to the end of P's range of that table that holds it. P's other ranges, and its other tables, stay.
+  - **Where to:** a new partition on the coldest node holding none of P's replicas. It's named `<P>-<n>`, with `n` the smallest number from 1 whose name isn't taken in the map: `p3-1`, then `p3-2` for P's next split, and `p3-1-1` for a split of `p3-1`. A split whose name would be over 64 characters is skipped, with that reason.
+  - **The copy** runs at the source's `--move-rate-bytes`. One that wouldn't finish within the dwell at that rate isn't started.
+  - **During it:** P serves throughout the copy and catch-up. At the hand-over, writes to the moving range pause briefly (D331's range pause, and a round of P's lease), and then go to the new partition.
+  - **History:** P keeps its own `moves_history`, and gains a SPLIT entry; the new partition starts with none. The SPLIT event names the table and the key.
+- **A merge** of S into T joins S only with a neighbour (one holding a range next to one of S's), and only while the two together stay under **half** of `partition_max_bytes` and `partition_max_load`. So a merge never makes a partition the next pass would split.
+  - **How:** each of S's ranges is a range move into T, and then S is dropped.
+  - **Interrupted part-way** (the writer changed, or a range move aborted), some of S's ranges are in T and S holds the rest. That's a valid layout: the next pass judges S again, and merges the rest. An S emptied but not dropped is dropped.
+  - Neither side of a merge was split within the last four dwells, so a split isn't merged straight back.
 - **Never split or merged:** a table in a co-location group, or one an index follows. Those partitions move only whole.
 
 #### The bounds
@@ -1215,14 +1224,14 @@ Set them in the map's `balance` with `set-map`. Each field left at 0 takes its d
 #### Seeing it
 - **`phdb cluster balancer status --node URL`** shows:
   - the mode and the writer;
-  - `state`: the writer's last decision and why. Examples: "skip: within bounds", "skip: node a is over its bound, but no partition on it can move within the bounds", "moving p3 from a to c (bal-…): node a is at 1.43x the mean size", "paused", "waiting: move … is in flight";
+  - `state`: the writer's last decision and why. Examples: "skip: within bounds", "skip: node a is over its bound, but no partition on it can move within the bounds", "moving p3 from a to c (bal-…): node a is at 1.43x the mean size", "skip: p3's best split leaves 91% on one side: a hot key or a narrow hot range, unsplittable", "paused", "waiting: move … is in flight";
   - the pinned partitions, and whether the balancer or an operator pinned each;
   - the bounds in force;
-  - the last 32 events: each move, the balancer's pins and their expiry, and each abort, with its partition, nodes, reason and time.
+  - the last 32 events: each move, split and merge, the balancer's pins and their expiry, and each abort, with its partition, nodes, reason and time (and a split's table and key).
 - **A pass that does nothing changes nothing in the map.** Its reason is only in `state`, not an event.
-- **Each partition's `moves_history`** in the map keeps its last 8 balancer moves and pins.
+- **Each partition's `moves_history`** in the map keeps its last 8 balancer moves, splits, merges and pins.
 - **`/metrics` on the writer:**
-  - `pigeonhole_cluster_balancer_actions_total{kind}`: `move`, `pin` (a pin or its expiry) and `abort`. It counts from the writer's start;
+  - `pigeonhole_cluster_balancer_actions_total{kind}`: `move`, `split`, `merge`, `pin` (a pin or its expiry) and `abort`. It counts from the writer's start;
   - `pigeonhole_cluster_node_load_ratio{node}`: each node's load per unit of weight over the mean, at the last pass.
 
 #### When the writer changes
@@ -1230,6 +1239,10 @@ A new writer, after an election or a forced map, keeps the mode, bounds and pins
 - **A balancer move the old writer left behind:**
   - **Before its commit point** (the map still gives the partition to its old node), the new writer aborts it: the target's copy goes aside, the partition serves on its old node again, and an ABORT event says so.
   - **Past it,** the new writer finishes the move.
+- **A balancer split, or one range of a merge, the old writer left behind:**
+  - **Before it was handed over,** the new writer aborts it: the range serves from P (or S) again, and a split's new partition, still empty, is removed from the map. An ABORT event says so.
+  - **From the hand-over on,** the new writer finishes it.
+  - The rest of an interrupted merge waits for a later pass (above).
 - **With the balancer off (not paused),** such a move stays recorded. A paused balancer still aborts or finishes it. Run it again with `phdb cluster move`, or end it with `phdb cluster move P --abort`.
 - **The writer's lease bounds the balancer's moves at every term:** a writer cut off from the majority can't advance one.
 
