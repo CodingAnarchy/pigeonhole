@@ -313,6 +313,32 @@ async fn begin(
     Ok(id)
 }
 
+/// Drivers to stop, each by the `--node` URL it runs with and the phase it stops at, once
+/// it reads the record there (a fault seam: each test's nodes have ports of their own).
+#[cfg(test)]
+pub(super) static STOP: std::sync::Mutex<Vec<(String, MovePhase)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The fault seam: in the tests, a driver listed in [`STOP`] ends here, as if killed, with
+/// the record left at `phase` for a later run (or [`resume`]) to go on with.
+fn stop_at(args: &NodeArgs, phase: MovePhase) -> Result<(), Failure> {
+    #[cfg(test)]
+    {
+        let mut stops = STOP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = stops
+            .iter()
+            .position(|(n, p)| *n == args.node && *p == phase)
+        {
+            stops.remove(i);
+            return Err(Failure::usage(&format!("stopped at {phase:?} (test)")));
+        }
+    }
+    let _ = (args, phase);
+    Ok(())
+}
+
 /// Sets record `id` by `f` in the next map: `Err` naming it when the map no longer has it.
 async fn change(
     args: &NodeArgs,
@@ -405,6 +431,7 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
         if phase != said {
             eprintln!("phdb cluster move-range: move {id}: {phase:?}");
             said = phase;
+            stop_at(args, phase)?;
         }
         let (s_lp, s) = wait.ask(side(args, &m, &r.from, id)).await??;
         let (t_lp, t) = wait.ask(side(args, &m, &r.to, id)).await??;
@@ -678,10 +705,10 @@ async fn abort_record(
     }
 }
 
-/// Whether `r` is a split's move, whose target partition it created (record ids
-/// `split-<ms>`).
-fn is_split(r: &RangeMove) -> bool {
-    r.id.starts_with("split-")
+/// Whether `r` is a split's move, whose target partition it created: the record's own
+/// `split` flag, set by the change that first records it (never the id or T's shape).
+pub(super) fn is_split(r: &RangeMove) -> bool {
+    r.split
 }
 
 /// What to split: `from`'s range of `table` holding `key`, from `key` to that range's end,
@@ -692,7 +719,8 @@ pub(super) struct SplitSpec {
     pub from: String,
     pub key: Vec<u8>,
     pub node: String,
-    /// The new partition's id: without it, the smallest free `<from>-<n>`, n ≥ 1.
+    /// The new partition's id: without it, `<from>-<v>`, v the map version of the change
+    /// that first records the split (see [`split_name`]).
     pub id: Option<String>,
 }
 
@@ -701,18 +729,38 @@ const SPLIT_EPOCH: u64 = 1;
 
 /// `phdb cluster split` (D331 PR 5): a range move of `[key, end)` of `from`'s range into a
 /// new, empty partition on `--to`, created there before the map change that adds it. Run
-/// again, it goes on with the split's record.
+/// again, it goes on with the split's record (record ids `split-<ms>`).
 pub(super) async fn split(
     args: &NodeArgs,
     spec: &SplitSpec,
     timeout: Option<Duration>,
 ) -> Result<Report, Failure> {
+    split_as(
+        args,
+        spec,
+        timeout,
+        &Start {
+            prefix: "split",
+            ..Start::default()
+        },
+    )
+    .await
+}
+
+/// [`split`], started as `start` says (the balancer's: `bal-` ids, its event and history in
+/// the change that records the split, `on_started` once it has).
+pub(super) async fn split_as(
+    args: &NodeArgs,
+    spec: &SplitSpec,
+    timeout: Option<Duration>,
+    start: &Start<'_>,
+) -> Result<Report, Failure> {
     let m = map_now(args).await?;
     let (id, new) = match split_record(&m, spec)? {
         Some(r) => (r.id.clone(), r.to.clone()),
         None => {
-            let new = split_check(&m, spec)?;
-            (begin_split(args, spec, &new).await?, new)
+            split_check(&m, spec, &split_name(&m, spec))?;
+            begin_split(args, spec, start).await?
         }
     };
     drive(args, &id, timeout).await?;
@@ -729,17 +777,23 @@ pub(super) async fn split(
     ))
 }
 
-/// The smallest free `<from>-<n>`, n ≥ 1, in `m` (the coordinator's naming rule).
-fn split_name(m: &ClusterMap, from: &str) -> Result<String, Failure> {
-    (1..)
-        .map(|n| format!("{from}-{n}"))
-        .take_while(|id| map::id_ok(id))
-        .find(|id| !m.partitions.iter().any(|p| p.id == *id))
-        .ok_or_else(|| {
-            Failure::usage(&format!(
-                "no free id {from}-<n> fits a partition id's 64 characters: give one with --id"
-            ))
-        })
+/// Runs the recorded range move or split `id` from its record's phase to its end: a new
+/// writer finishing a move it has only the id of.
+pub(super) async fn resume(
+    args: &NodeArgs,
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<(), Failure> {
+    drive(args, id, timeout).await
+}
+
+/// The new partition's id if the change recording the split lands next on `m`: the
+/// command's, else `<from>-<v>` with v = `m`'s version + 1 (the coordinator's rule: fixed
+/// once recorded, never reused, as map versions only grow).
+fn split_name(m: &ClusterMap, spec: &SplitSpec) -> String {
+    spec.id
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", spec.from, m.map_version + 1))
 }
 
 /// The split's own record in `m`, if a run of it started (a rerun goes on with it): a
@@ -759,9 +813,9 @@ fn split_record<'m>(m: &'m ClusterMap, spec: &SplitSpec) -> Result<Option<&'m Ra
     }))
 }
 
-/// Step 0 for a split: S, N and the new id, not T (cli692's nit); the key strictly inside
-/// one of S's ranges (at its start it would be a whole-range move). The new id.
-fn split_check(m: &ClusterMap, spec: &SplitSpec) -> Result<String, Failure> {
+/// Step 0 for a split: S, N and the new id `new`, not T (cli692's nit); the key strictly
+/// inside one of S's ranges (at its start it would be a whole-range move).
+fn split_check(m: &ClusterMap, spec: &SplitSpec, new: &str) -> Result<(), Failure> {
     if !m.partitions.iter().any(|p| p.id == spec.from) {
         return Err(Failure::usage(&format!(
             "the map has no partition {:?}",
@@ -782,18 +836,19 @@ fn split_check(m: &ClusterMap, spec: &SplitSpec) -> Result<String, Failure> {
     {
         return Err(in_flight(r, "split"));
     }
-    let new = match &spec.id {
-        Some(id) => id.clone(),
-        None => split_name(m, &spec.from)?,
+    let named = if spec.id.is_some() {
+        ""
+    } else {
+        ": give the new partition's id with --id"
     };
-    if !map::id_ok(&new) {
+    if !map::id_ok(new) {
         return Err(Failure::usage(&format!(
-            "{new:?} isn't a partition id: 1-64 of [a-z0-9_-], not starting with -"
+            "{new:?} isn't a partition id: 1-64 of [a-z0-9_-], not starting with -{named}"
         )));
     }
     if m.partitions.iter().any(|p| p.id == new) {
         return Err(Failure::usage(&format!(
-            "the map has a partition {new:?} already: a split makes a new one"
+            "the map has a partition {new:?} already: a split makes a new one{named}"
         )));
     }
     let t = m
@@ -820,34 +875,32 @@ fn split_check(m: &ClusterMap, spec: &SplitSpec) -> Result<String, Failure> {
             spec.from,
             spec.table
         ))),
-        Some(_) => Ok(new),
+        Some(_) => Ok(()),
     }
 }
 
 /// Step 1 for a split: N creates the new partition's file, marked with the record's id and
-/// the map version the change will carry, then one change adds the partition (on N, at
-/// [`SPLIT_EPOCH`]) and the record at COPYING. A change that lands at another version
-/// re-runs the create first, refreshing the mark (audit120's point 1), so N's reconcile
-/// never moves aside a file a landed change places.
+/// the map version v the change will carry, then one change, landing at exactly v, adds the
+/// partition (on N, at [`SPLIT_EPOCH`]) and the record at COPYING, flagged `split`, with
+/// `how`'s change. Each attempt names the partition for its own v ([`split_name`]); one the
+/// map moved under records nothing, and N's reconcile moves its file aside once the map is
+/// past v (audit120's point 1: never a file a landed change places). The record's id and
+/// the new partition's.
 pub(super) async fn begin_split(
     args: &NodeArgs,
     spec: &SplitSpec,
-    new: &str,
-) -> Result<String, Failure> {
+    how: &Start<'_>,
+) -> Result<(String, String), Failure> {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let id = format!("split-{ms}");
+    let id = format!("{}-{ms}", how.prefix);
     for _ in 0..10 {
         let m = map_now(args).await?;
-        split_check(
-            &m,
-            &SplitSpec {
-                id: Some(new.to_owned()),
-                ..spec.clone()
-            },
-        )?;
         let version = m.map_version + 1;
+        let new = split_name(&m, spec);
+        let new = new.as_str();
+        split_check(&m, spec, new)?;
         let address = m
             .nodes
             .iter()
@@ -883,13 +936,7 @@ pub(super) async fn begin_split(
                 moved.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(Failure::usage("the map moved under the split's start"));
             }
-            split_check(
-                now,
-                &SplitSpec {
-                    id: Some(new.to_owned()),
-                    ..spec.clone()
-                },
-            )?;
+            split_check(now, spec, new)?;
             let mut next = now.clone();
             next.partitions.push(crate::serve::proto::Partition {
                 id: new.to_owned(),
@@ -907,20 +954,27 @@ pub(super) async fn begin_split(
                 to: new.to_owned(),
                 from_epoch,
                 to_epoch: SPLIT_EPOCH,
+                split: true,
                 ..RangeMove::default()
             };
             r.set_phase(MovePhase::Copying);
             next.moves.push(r);
+            if let Some(with) = how.with {
+                with(&mut next)?;
+            }
             Ok(next)
         })
         .await;
         match landed {
             Ok(()) => {
+                if let Some(on) = how.on_started {
+                    on(&id);
+                }
                 eprintln!(
                     "phdb cluster split: move {id}: COPYING, into {new} on {}",
                     spec.node
                 );
-                return Ok(id);
+                return Ok((id, new.to_owned()));
             }
             Err(_) if moved.load(std::sync::atomic::Ordering::Relaxed) => continue,
             Err(e) => return Err(e),

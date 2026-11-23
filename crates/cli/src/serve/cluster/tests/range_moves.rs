@@ -2081,8 +2081,9 @@ async fn with_families(t: &Three) {
 }
 
 /// D331 PR 5: `phdb cluster split` end to end, under writes. p1's range of `users` splits at
-/// "d" into a new partition p1-1 on node c (the default id): every acknowledged write reads
-/// back, the map places p1-1 on c holding `[d, m)`, p1 dropped its copy, and no record is
+/// "d" into a new partition p1-<v> on node c (the default id, v the version of the change
+/// that recorded the split): every acknowledged write reads back, the map places it on c
+/// holding `[d, m)`, p1 dropped its copy, and no record is
 /// left.
 #[test]
 fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
@@ -2145,16 +2146,25 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
             .unwrap()
             .into_inner();
         assert!(m.moves.is_empty(), "{:?}", m.moves);
+        // `p1-<v>`, v the version of the change that recorded the split.
+        let new = m
+            .partitions
+            .iter()
+            .find(|p| p.node == "c" && p.id.starts_with("p1-"))
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| panic!("{:?}", m.partitions));
         assert!(
-            m.partitions.iter().any(|p| p.id == "p1-1" && p.node == "c"),
-            "{:?}",
-            m.partitions
+            new["p1-".len()..]
+                .parse::<u64>()
+                .is_ok_and(|v| v > 1 && v < m.map_version),
+            "{new}, map version {}",
+            m.map_version
         );
         assert!(super::super::map::inside(
             &m.tables[0],
             b"d",
             Some(b"m"),
-            "p1-1"
+            &new
         ));
         assert!(super::super::map::inside(
             &m.tables[0],
@@ -2172,8 +2182,9 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
 }
 
 /// D331 PR 5 (cli692's Must 5): a split aborted before its commit point takes its new
-/// partition with it: the record stays ABORTING until p1-1 dropped what it copied, then the
-/// map drops the record and p1-1 together, and p1-1's file is moved aside on c. p1 serves
+/// partition with it: the record (flagged `split`) stays ABORTING until the new partition
+/// p1-<v> dropped what it copied, then the map drops the record and it together, and its
+/// file is moved aside on c. p1 serves
 /// the range as before.
 #[test]
 fn an_aborted_split_removes_its_new_partition_and_moves_its_file_aside() {
@@ -2191,9 +2202,33 @@ fn an_aborted_split_removes_its_new_partition_and_moves_its_file_aside() {
             node: "c".into(),
             id: None,
         };
-        let id = super::super::range_move::begin_split(&args, &spec, "p1-1")
+        let before = client(a)
             .await
-            .unwrap();
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .map_version;
+        let (id, new) = super::super::range_move::begin_split(
+            &args,
+            &spec,
+            &super::super::moving::Start {
+                prefix: "split",
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Nothing else changes the map here: the change recording it is the next one.
+        assert_eq!(new, format!("p1-{}", before + 1));
+        let recorded = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let r = recorded.moves.iter().find(|r| r.id == id).unwrap();
+        assert!(r.split && r.to == new, "{r:?}");
         super::super::range_move::abort(&args, &id, Some(Duration::from_secs(60)))
             .await
             .unwrap();
@@ -2205,14 +2240,75 @@ fn an_aborted_split_removes_its_new_partition_and_moves_its_file_aside() {
             .into_inner();
         assert!(m.moves.is_empty(), "{:?}", m.moves);
         assert!(
-            !m.partitions.iter().any(|p| p.id == "p1-1"),
+            !m.partitions.iter().any(|p| p.id == new),
             "{:?}",
             m.partitions
         );
-        assert!(!t.dirs[2].join("p1-1.phdb").exists());
-        assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+        assert!(!t.dirs[2].join(format!("{new}.phdb")).exists());
+        assert_eq!(dropped_files(&t.dirs[2], &new).len(), 1);
         try_put(c, "d05", "after").await.unwrap();
         assert_eq!(get_row(c, "d05").await.unwrap(), Some(b"after".to_vec()));
+    });
+}
+
+/// D331 PR 5 (cli692, D332 §7.3): a split whose driver stopped once the map gave the range
+/// over (HANDED_OVER, past its commit point) is finished by [`resume`] from the record's id
+/// alone, as a new writer finishes one: the new partition holds the range, the record is
+/// gone, and the rows read back through it.
+///
+/// [`resume`]: super::super::range_move::resume
+#[test]
+fn a_split_stopped_at_handed_over_is_finished_by_resume() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        with_families(&t).await;
+        for i in 0..20 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        let args = super::backup::args(a);
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandedOver));
+        let stopped =
+            super::super::range_move::split(&args, &spec, Some(Duration::from_secs(120))).await;
+        assert!(stopped.is_err(), "the split ran past HANDED_OVER");
+        let map = async || {
+            client(a)
+                .await
+                .get_map(crate::serve::proto::GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let m = map().await;
+        let r = m
+            .moves
+            .iter()
+            .find(|r| super::super::range_move::is_split(r))
+            .cloned()
+            .unwrap_or_else(|| panic!("{:?}", m.moves));
+        assert_eq!(super::super::map::phase(&r), MovePhase::HandedOver);
+        super::super::range_move::resume(&args, &r.id, Some(Duration::from_secs(120)))
+            .await
+            .unwrap();
+        let m = map().await;
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"d",
+            Some(b"m"),
+            &r.to
+        ));
+        assert_eq!(get_row(c, "d05").await.unwrap(), Some(b"0".to_vec()));
     });
 }
 
@@ -2277,6 +2373,7 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
             to: "p1-1".into(),
             from_epoch: 1,
             to_epoch: 1,
+            split: true,
             ..RangeMove::default()
         };
         r.set_phase(MovePhase::Aborting);

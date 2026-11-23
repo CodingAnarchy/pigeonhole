@@ -1317,13 +1317,13 @@ Once a table's ranges hold data, its split keys change only through a range move
 ### Moving and splitting ranges
 From 1.3.0 (D331), a key range of a table moves from one partition to another while both serve:
 - **`phdb cluster move-range TABLE --from S --to T [--start K] [--end K]`** moves `[K_start, K_end)` of `TABLE` from partition `S` to partition `T`. The range must lie inside one of `S`'s ranges of the table; without `--start` or `--end` it runs from that range's start or to its end.
-- **`phdb cluster split TABLE --from S --key K --to N [--id ID]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N` (`--node` is the URL of the node the command talks to, as for every `phdb cluster` command). The new partition's id is `ID`, or by default the smallest free `S-<n>`, n ≥ 1 (`p3-1`, `p3-2`, …). `N` creates its file empty first, then the map adds it. `K` can't be the range's start: that's a move of the whole range.
+- **`phdb cluster split TABLE --from S --key K --to N [--id ID]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N` (`--node` is the URL of the node the command talks to, as for every `phdb cluster` command). The new partition's id is `ID`, or by default `S-<v>`, where v is the map version of the change that records the split (`p3-41`, say). It's fixed for the split's life, and never reused. If that id is taken or isn't a valid partition id, the split is refused: give one with `--id`. `N` creates its file empty first, then the map adds it. `K` can't be the range's start: that's a move of the whole range.
 
 Both run on the map's writer, through its own map changes, and print each phase as it starts:
 1. **COPYING:** `T` copies the range from snapshots of `S`, at most `--move-rate-bytes` from `S`'s node, while `S` serves it as before.
 2. **CATCHING_UP:** `T` applies `S`'s writes to the range from its change history, until it's within about a second of `S`.
 3. **HANDING_OVER:** `S` refuses writes to the range (`Fenced`, reason `RANGE_MOVING`, retry-safe; nothing was written) until `T` has applied the last of them, usually well under a second. Reads go on. A transaction prepared on `S` that may touch the range is decided first; if one stays undecided, the move aborts and the range takes writes again.
-4. **HANDED_OVER:** the map gives the range to `T`. This is the commit point: from here the move only goes forward.
+4. **HANDED_OVER:** the map gives the range to `T`. This is the commit point: from here the move only goes forward. `S`'s epoch rises in the same change, so its lease takes a round to come back. Meanwhile `S`'s other writes are refused, and are safe to retry. One in flight may answer `Unknown`.
 5. **CLEANING:** `T` serves the range, and `S` drops its copy. Then the move's record leaves the map.
 
 **Rerun and abort:**
