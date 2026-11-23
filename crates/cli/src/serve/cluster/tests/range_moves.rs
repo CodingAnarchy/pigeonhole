@@ -2318,6 +2318,81 @@ fn a_split_stopped_at_handed_over_is_finished_by_resume() {
     });
 }
 
+/// D331 PR 5 (Must 3, never-both before CLEANING): a move whose source is cut off from its
+/// peers right after the hand-over can't acknowledge it, so the driver sets CLEANING only
+/// once the source's lease ran out on the majority (the lease bound): by then the cut-off
+/// source no longer serves, and the target does. Joined again, it drops its copy and the
+/// move ends. p2's range of `users` ([m, end), on b) moves into p1 (on a, the map's writer,
+/// which stays with the majority).
+#[test]
+fn a_source_cut_off_at_the_hand_over_stops_serving_before_the_target_serves() {
+    let t = three();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, &format!("n{i:02}"), "0").await.unwrap();
+        }
+        let args = super::backup::args(a);
+        let spec = super::super::range_move::Spec {
+            table: "users".into(),
+            from: "p2".into(),
+            to: "p1".into(),
+            start: None,
+            end: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandedOver));
+        let stopped =
+            super::super::range_move::run(&args, &spec, Some(Duration::from_secs(120)), true).await;
+        assert!(stopped.is_err(), "the move ran past HANDED_OVER");
+        let map = async || {
+            client(a)
+                .await
+                .get_map(crate::serve::proto::GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let id = map().await.moves[0].id.clone();
+        let cut = |off: bool| {
+            super::super::cut_node(&t.dirs[1], &format!("127.0.0.1:{b}"), &t.dirs, off);
+        };
+        cut(true);
+        // The driver can't hear b: it waits out b's lease, sets CLEANING, then waits for
+        // b's drop, which can't come while b is cut off.
+        let waited =
+            super::super::range_move::resume(&args, &id, Some(Duration::from_secs(20))).await;
+        assert!(waited.is_err(), "the move ended with its source cut off");
+        let m = map().await;
+        assert_eq!(super::super::map::phase(&m.moves[0]), MovePhase::Cleaning);
+        let p2 = client(b)
+            .await
+            .status(crate::serve::proto::StatusRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == "p2")
+            .unwrap();
+        assert_ne!(
+            p2.state(),
+            crate::serve::proto::LocalPartitionState::Serving,
+            "the cut-off source still serves at CLEANING: {p2:?}"
+        );
+        assert_eq!(get_row(a, "n05").await.unwrap(), Some(b"0".to_vec()));
+        cut(false);
+        super::super::range_move::resume(&args, &id, Some(Duration::from_secs(120)))
+            .await
+            .unwrap();
+        assert!(map().await.moves.is_empty());
+        assert_eq!(get_row(c, "n05").await.unwrap(), Some(b"0".to_vec()));
+    });
+    let _ = (&t.db_a, &t.db_b);
+}
+
 /// D331 PR 5 (audit120's point 1, simp724's case): a split's create whose COPYING change
 /// never lands leaves a marked, empty file no map places. The node moves it aside only once
 /// it holds a map past the version the change would have carried; a map at that version
