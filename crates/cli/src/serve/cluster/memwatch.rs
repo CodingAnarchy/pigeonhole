@@ -71,8 +71,7 @@ pub(crate) async fn watch(
     if !r.resume.is_empty()
         && let Ok(t) = ClusterToken::decode(&r.resume)
     {
-        let parts: Vec<&str> = t.components.iter().map(|c| c.partition.as_str()).collect();
-        super::feed::catch_up(&node, t.map_version, &parts, service.request_timeout()).await?;
+        super::feed::catch_up(&node, &t, service.request_timeout()).await?;
     }
     let guard = node.routes();
     let Some(routes) = guard.as_ref() else {

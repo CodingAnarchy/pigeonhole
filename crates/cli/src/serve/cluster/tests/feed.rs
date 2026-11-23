@@ -2806,90 +2806,107 @@ fn a_token_naming_a_partition_a_merge_removed_expires() {
 }
 
 /// The coordinator's ruling on a resume through a node whose map is behind the token's
-/// (2026-11-23): a token from a newer map naming a partition this node's map doesn't list
-/// (a split's new one, here p9) is refused retry-safe (`PartitionUnavailable`) while no
-/// node has a newer map to pull, not expired. Once one does, the node pulls it before the
-/// resume's checks: the token is no newer than its map then, and an unlisted partition is
-/// lost, as before (`FeedExpired`).
+/// (2026-11-23), with feed1248's and simp724's points on #2135. A token from a newer map
+/// naming a partition this node's map doesn't list (a split's new one, here p9):
+/// - of another cluster: refused at once (`InvalidArgument`), with no pulls;
+/// - while a peer that may hold the token's map doesn't answer: refused retry-safe
+///   (`PartitionUnavailable`), though another peer's newer map short of the token's (and
+///   without p9) was pulled;
+/// - once every peer answered short of the token's map: no node holds it, so the checks
+///   expire it (`FeedExpired`) rather than leave a retry that never ends;
+/// - once a peer holds the token's map: pulled, and p9 is lost, as before (`FeedExpired`).
 #[test]
 fn a_resume_from_a_newer_map_through_a_node_behind_it_is_retried_not_expired() {
     use crate::serve::cluster::token::{At, ClusterToken, Component, TokenCache};
     use crate::serve::proto::{GetMapRequest, PushMapRequest};
-    bounded(Duration::from_secs(180), || {
-        let t = Three::start();
+    bounded(Duration::from_secs(240), || {
+        let mut t = Three::start();
         let ports = t.ports.clone();
-        let (a, c) = (ports[0], ports[2]);
+        let (a, b, c) = (ports[0], ports[1], ports[2]);
         let req = |start| SubscribeRequest {
             tables: vec!["orders".into()],
             checkpoint_every: 1,
             start,
             ..Default::default()
         };
-        t.rt.block_on(async {
+        let real = t.rt.block_on(async {
             orders_on_p1(a).await;
             let mut s = subscribe(c, req(None)).await.unwrap();
             put_order(c, "k1").await;
             let (seen, _) = commits(&mut s, 1).await;
-            drop(s);
-            let real = ClusterToken::decode(&seen[0].token.clone().unwrap()).unwrap();
-            // `real` from map `version`, reading p9 too.
-            let with_p9 = |version: u64| {
-                let mut parts = real.components.clone();
-                parts.push(Component {
-                    partition: "p9".into(),
-                    epoch: 1,
-                    at: At::Now,
-                });
-                parts.sort_by(|x, y| x.partition.cmp(&y.partition));
-                let mut out = Vec::new();
-                TokenCache::default().encode(
-                    &real.cluster_id,
-                    version,
-                    real.subscription,
-                    parts.iter().map(|p| (p.partition.as_str(), p.epoch, &p.at)),
-                    &mut out,
-                );
-                Bytes::from(out)
-            };
-            let map_of = async |port| {
-                client(port)
-                    .await
-                    .get_map(GetMapRequest {})
-                    .await
-                    .unwrap()
-                    .into_inner()
-            };
-            let push_to = async |port, m: &crate::serve::proto::ClusterMap| {
-                client(port)
-                    .await
-                    .push_map(PushMapRequest {
-                        map: Some(m.clone()),
-                    })
-                    .await
-                    .unwrap();
-            };
-            // b alone has a newer map than c's, short of the token's (v + 5), and p9 isn't
-            // in it (feed1248's case): c pulls it, and is still behind, so it refuses
-            // retry-safe, not FeedExpired.
+            ClusterToken::decode(&seen[0].token.clone().unwrap()).unwrap()
+        });
+        // `real` of cluster `cluster` from map `version`, reading p9 too.
+        let with_p9 = |cluster: &str, version: u64| {
+            let mut parts = real.components.clone();
+            parts.push(Component {
+                partition: "p9".into(),
+                epoch: 1,
+                at: At::Now,
+            });
+            parts.sort_by(|x, y| x.partition.cmp(&y.partition));
+            let mut out = Vec::new();
+            TokenCache::default().encode(
+                cluster,
+                version,
+                real.subscription,
+                parts.iter().map(|p| (p.partition.as_str(), p.epoch, &p.at)),
+                &mut out,
+            );
+            Some(Start::Resume(Bytes::from(out)))
+        };
+        let map_of = async |port| {
+            client(port)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let push_to = async |port, m: &crate::serve::proto::ClusterMap| {
+            client(port)
+                .await
+                .push_map(PushMapRequest {
+                    map: Some(m.clone()),
+                })
+                .await
+                .unwrap();
+        };
+        let v = t.rt.block_on(map_of(a)).map_version;
+        let cluster = real.cluster_id.clone();
+        t.rt.block_on(async {
+            let started = tokio::time::Instant::now();
+            let e = subscribe(c, req(with_p9("another-cluster", v + 5)))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&e), "InvalidArgument", "{e}");
+            assert!(started.elapsed() < Duration::from_secs(5), "no pulls");
+        });
+        // b down; a alone has a newer map than c's, short of the token's, without p9.
+        t.stop(1);
+        t.rt.block_on(async {
             let mut m = map_of(a).await;
-            let v = m.map_version;
             m.map_version = v + 2;
-            push_to(ports[1], &m).await;
-            let e = subscribe(c, req(Some(Start::Resume(with_p9(v + 5)))))
+            push_to(a, &m).await;
+            let e = subscribe(c, req(with_p9(&cluster, v + 5)))
                 .await
                 .unwrap_err();
             assert_eq!(code(&e), "PartitionUnavailable", "{e}");
             assert!(e.message().contains("is behind the resume token's"), "{e}");
-            assert!(map_of(c).await.map_version >= v + 2, "c pulled b's map");
-            // A map at the token's version on a: c pulls it, and then p9 is lost, as before.
+            assert!(map_of(c).await.map_version >= v + 2, "c pulled a's map");
+        });
+        // Every node answers now, none with the token's map.
+        t.restart(1);
+        t.rt.block_on(async {
+            let e = resume_ends(c, req(with_p9(&cluster, v + 5))).await;
+            assert_eq!(code(&e), "FeedExpired", "{e}");
+            // b holds the token's map: c pulls it, and p9 is lost, as before.
             let mut m = map_of(a).await;
             m.map_version = v + 3;
-            push_to(a, &m).await;
-            let e = subscribe(c, req(Some(Start::Resume(with_p9(m.map_version)))))
-                .await
-                .unwrap_err();
+            push_to(b, &m).await;
+            let e = resume_ends(c, req(with_p9(&cluster, v + 3))).await;
             assert_eq!(code(&e), "FeedExpired", "{e}");
-            assert!(map_of(c).await.map_version >= m.map_version);
+            assert!(map_of(c).await.map_version >= v + 3);
         });
     });
 }

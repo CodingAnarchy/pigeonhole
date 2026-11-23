@@ -142,8 +142,7 @@ pub(crate) async fn subscribe(
     if let Some(S::Resume(bytes)) = &r.start
         && let Ok(t) = ClusterToken::decode(bytes)
     {
-        let parts: Vec<&str> = t.components.iter().map(|c| c.partition.as_str()).collect();
-        catch_up(&node, t.map_version, &parts, service.request_timeout()).await?;
+        catch_up(&node, &t, service.request_timeout()).await?;
     }
     let guard = node.routes();
     let Some(routes) = guard.as_ref() else {
@@ -597,62 +596,121 @@ fn another_database(e: &ApiError) -> bool {
     e.code == "InvalidArgument" && e.message.contains("the token is another database's")
 }
 
-/// Before a resume's checks (a feed's [`resume_starts`], a memory watch's): a token from a
-/// map newer than this node's that reads a partition this node's map doesn't list, a
-/// split's new partition this node hasn't taken yet, isn't a lost partition but a map
-/// behind. The node pulls the map from each other node of its map in turn, within
-/// `within` in all, until its map is at or past the token's version or lists the
-/// partition: a newer map short of the token's may not list it yet (feed1248). Only then
-/// does an unlisted partition count as lost (`FeedExpired`, the checks'); still behind,
-/// the resume is refused retry-safe (`PartitionUnavailable`). A token from no newer a map,
-/// or whose every partition is listed, goes on to the checks as it is.
+/// Before a resume's checks (a feed's [`resume_starts`], a memory watch's): a token of this
+/// cluster from a map newer than this node's that reads a partition this node's map doesn't
+/// list, a split's new partition this node hasn't taken yet, isn't a lost partition but a
+/// map behind. The node asks the other nodes of the newest map it holds for theirs, each
+/// once, within `within` in all, and takes any newer one, until its map is at or past the
+/// token's version or lists the partition: a newer map short of the token's may not list
+/// it yet (feed1248). A map taken may list nodes this node didn't know, which are asked too
+/// ([`next_to_ask`]: the token's maker may be one). Then [`after_pulls`] decides. Another
+/// cluster's token (feed1248's M1, simp724's (1)), one from no newer a map, or one whose
+/// every partition is listed, goes on to the checks as it is.
 pub(super) async fn catch_up(
     node: &Arc<Node>,
-    token_version: u64,
-    partitions: &[&str],
+    token: &ClusterToken,
     within: Duration,
 ) -> Result<(), ApiError> {
-    // This node's map version and a partition it doesn't list, while behind the token's.
+    // This node's map version and a partition it doesn't list, while behind this cluster's
+    // token.
     let behind = || {
         let guard = node.routes();
         let routes = guard.as_ref()?;
         let here = routes.map_version();
-        if here >= token_version {
+        if routes.cluster_id() != token.cluster_id || here >= token.map_version {
             return None;
         }
-        let unlisted = partitions.iter().find(|p| routes.owner(p).is_none())?;
-        Some((here, (*unlisted).to_owned()))
+        let unlisted = token
+            .components
+            .iter()
+            .find(|c| routes.owner(&c.partition).is_none())?;
+        Some((here, unlisted.partition.clone()))
     };
     if behind().is_none() {
         return Ok(());
     }
-    let peers: Vec<(String, String)> = node.get_map().map_or_else(
-        |_| Vec::new(),
-        |m| {
-            m.nodes
-                .iter()
-                .filter(|n| n.id != node.id())
-                .map(|n| (n.id.clone(), n.address.clone()))
-                .collect()
-        },
-    );
+    // The other nodes of the newest map this node holds: id and address.
+    let peers = || -> Vec<(String, String)> {
+        node.get_map().map_or_else(
+            |_| Vec::new(),
+            |m| {
+                m.nodes
+                    .iter()
+                    .filter(|n| n.id != node.id())
+                    .map(|n| (n.id.clone(), n.address.clone()))
+                    .collect()
+            },
+        )
+    };
+    let mut answers: HashMap<String, Option<u64>> = HashMap::new();
     let _ = tokio::time::timeout(within, async {
-        for (id, address) in &peers {
-            let Some((here, _)) = behind() else {
+        while let Some((here, _)) = behind() {
+            let Some((id, address)) = next_to_ask(&peers(), &answers) else {
                 return;
             };
-            let _ = node.pull_now(id, address, here).await;
+            let answer = match node.fetch_map(&address).await {
+                Ok(map) => {
+                    let theirs = map.map_version;
+                    (theirs <= here || node.push_map_async(map, Some(id.clone())).await.is_ok())
+                        .then_some(theirs)
+                }
+                Err(_) => None,
+            };
+            answers.insert(id, answer);
         }
     })
     .await;
     match behind() {
         None => Ok(()),
-        Some((here, unlisted)) => Err(ApiError::partition_unavailable(format!(
-            "this node's cluster map (version {here}) is behind the resume token's (version \
-             {token_version}), which reads partition {unlisted:?} this map doesn't list: \
-             retry once this node has a later map"
-        ))),
+        Some((here, unlisted)) => {
+            after_pulls(token.map_version, here, &unlisted, &peers(), &answers)
+        }
     }
+}
+
+/// The next node of `peers` (the newest map's, but this one) for [`catch_up`] to ask: the
+/// first not asked yet. A node a map taken since added comes up here too (feed1248).
+fn next_to_ask(
+    peers: &[(String, String)],
+    answers: &HashMap<String, Option<u64>>,
+) -> Option<(String, String)> {
+    peers
+        .iter()
+        .find(|(id, _)| !answers.contains_key(id))
+        .cloned()
+}
+
+/// [`catch_up`]'s answer for a node still behind the token's map, with `unlisted` not in
+/// its map, after asking: `answers` holds each node's map version as it answered (`None`:
+/// it didn't, or its newer map didn't install here). While a node of the newest map this
+/// node holds (`peers`) may still hold the token's map, unasked or unanswered, the resume
+/// is refused retry-safe (`PartitionUnavailable`). Once every one of them answered with a
+/// map short of the token's, no node holds it (maps only rise: a restored map, or another
+/// history), and a retry would never end (simp724's (2)): the resume goes on to its checks,
+/// which expire it. The node that made the token held its map, so a split's new partition
+/// stays retry-safe while that node is down.
+fn after_pulls(
+    token_version: u64,
+    here: u64,
+    unlisted: &str,
+    peers: &[(String, String)],
+    answers: &HashMap<String, Option<u64>>,
+) -> Result<(), ApiError> {
+    let short = |id: &String| {
+        answers
+            .get(id)
+            .copied()
+            .flatten()
+            .is_some_and(|v| v < token_version)
+    };
+    if peers.iter().all(|(id, _)| short(id)) {
+        return Ok(());
+    }
+    Err(ApiError::partition_unavailable(format!(
+        "this node's cluster map (version {here}) is behind the resume token's (version \
+         {token_version}), which reads partition {unlisted:?} this map doesn't list, and a \
+         node that may hold it didn't answer: retry once this node has a later map"
+    )))
 }
 
 /// A subscription's merge: its hub's (#1798), or a member's own.
@@ -2011,6 +2069,50 @@ pub(super) mod tests {
     /// D331 PR 3b: a resume starts each partition the map gave the subscription's tables
     /// since the token at its hand-over (cli692's F1), and expires on one the token reads
     /// that the subscription no longer covers.
+    /// simp724's (2) on #2135, with feed1248's condition: a node still behind a resume
+    /// token's map refuses it retry-safe while a node of the newest map it holds may hold
+    /// that map (not asked yet, didn't answer, or its newer map didn't install), asks a node
+    /// a pulled map added, and lets the checks expire the resume only once every node of
+    /// that map answered short of the token's.
+    #[test]
+    fn a_resume_behind_its_tokens_map_is_retried_only_while_a_peer_may_hold_it() {
+        let nodes = |ids: &[&str]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|id| ((*id).to_owned(), format!("{id}:1")))
+                .collect()
+        };
+        let answered = |a: &[(&str, Option<u64>)]| -> HashMap<String, Option<u64>> {
+            a.iter().map(|(id, v)| ((*id).to_owned(), *v)).collect()
+        };
+        let verdict = |peers: &[(String, String)], answers: &HashMap<String, Option<u64>>| {
+            after_pulls(9, 5, "p9", peers, answers).map_or_else(|e| e.code, |()| "checks".into())
+        };
+        let (ab, abd) = (nodes(&["a", "b"]), nodes(&["a", "b", "d"]));
+        // A node that didn't answer, or whose newer map didn't install; or one not asked.
+        let a_short = answered(&[("a", Some(6)), ("b", None)]);
+        assert_eq!(verdict(&ab, &a_short), "PartitionUnavailable");
+        assert_eq!(
+            verdict(&ab, &answered(&[("a", Some(6))])),
+            "PartitionUnavailable"
+        );
+        // Every node answered, none at the token's map: no node holds it.
+        let both_short = answered(&[("a", Some(6)), ("b", Some(8))]);
+        assert_eq!(verdict(&ab, &both_short), "checks");
+        assert_eq!(verdict(&[], &HashMap::new()), "checks");
+        // b's map (8) added d, perhaps the token's maker: d is asked next, and until it
+        // answers short, the resume is retried, not expired.
+        assert_eq!(
+            next_to_ask(&abd, &both_short).map(|(id, _)| id),
+            Some("d".into())
+        );
+        assert_eq!(next_to_ask(&ab, &both_short), None);
+        assert_eq!(verdict(&abd, &both_short), "PartitionUnavailable");
+        let d_down = answered(&[("a", Some(6)), ("b", Some(8)), ("d", None)]);
+        assert_eq!(verdict(&abd, &d_down), "PartitionUnavailable");
+        let d_short = answered(&[("a", Some(6)), ("b", Some(8)), ("d", Some(8))]);
+        assert_eq!(verdict(&abd, &d_short), "checks");
+    }
+
     #[test]
     fn a_resume_starts_a_gained_partition_at_its_hand_over() {
         let token = ClusterToken {
