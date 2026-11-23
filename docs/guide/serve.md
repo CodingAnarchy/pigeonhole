@@ -1374,10 +1374,13 @@ Run the merge again later; it removes `S` once the list is empty.
 - **Fence, then remove:** the merge fences `S` and checks again. The map change that removes `S` applies only if the map hasn't changed since the first read, so a failover between the two never removes a live `S`. On a changed map, the merge lifts its fence and starts again, up to 5 times.
 - **Then drop:** it closes `S` and drops its files on its node and each replica node.
 - **A stop that leaves `S` fenced** says so, naming the node and `phdb cluster unfence S --node URL`. The merge never lifts a fence it didn't just set: lift it, then run merge again.
-- **A stop after `S` left the map** leaves files the map doesn't have. `phdb cluster status` shows each as "the map has no such partition", on every node that holds one. A rerun of the merge finds and drops only those files, of this cluster and named `S`, never a split's new file, and prints each node and file.
+- **A stop after `S` left the map** leaves files the map doesn't have. `phdb cluster status` shows each as "the map has no such partition", on every node that holds one. A rerun of the merge finds and drops only those files, of this cluster and named `S`, and prints each node and file. A split's new file, created before the change that records it, shows as "the map has no such partition yet" and is left alone. A node that doesn't answer, or a copy still open or still listed there, is left too: the merge's `detail` says what's not done, and a later rerun goes on with it.
 - **`drop-partition` is refused on a node the map lists as one of the partition's replicas.** The exception is the copy an unfinished promote left there, which failover's message tells you to drop.
 
-**Partition ids:** `S`'s id can be used again by a later partition. An old transaction id or feed token naming `S` gets a clean refusal from it, and never reads or decides the new partition's data.
+**After the removal:**
+- **A feed token naming `S`** answers `FeedExpired`, even one that had read `S` to its end: subscribe again. A token taken after the subscription passed the merge doesn't name `S`.
+- **A share in doubt homed at `S`** can't appear from a live node, since the removal waits for every one. A restore of a branch partition from a backup taken before the merge can bring one back. Its resolver keeps asking, and `phdb cluster status` lists the share with the reason "the cluster map here (version …) doesn't list the transaction's home partition": decide it with `phdb cluster txn decide`.
+- **`S`'s id can be used again** by a later partition. An old transaction id or feed token naming `S` gets a clean refusal from it, and never reads or decides the new partition's data.
 
 ## Performance
 These numbers are for `phdb serve` on one machine, serving a single database file and also as a one-node cluster. All rows use a fixed offered write rate. They show latency and feed delivery at that rate, not peak throughput.
