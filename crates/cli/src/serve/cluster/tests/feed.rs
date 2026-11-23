@@ -2385,6 +2385,19 @@ async fn move_orders_to(
     final_seqno: u64,
     last: crate::serve::proto::MovePhase,
 ) {
+    move_range_to(ports, "orders", "mvo", start, None, final_seqno, last).await;
+}
+
+/// [`move_orders_to`] for `[start, end)` of `table`, as move `id`, from p1 to p2.
+async fn move_range_to(
+    ports: &[u16],
+    table: &str,
+    id: &str,
+    start: &str,
+    end: Option<&str>,
+    final_seqno: u64,
+    last: crate::serve::proto::MovePhase,
+) {
     use crate::serve::proto::{GetMapRequest, MoveKind, MovePhase, PushMapRequest, RangeMove};
     let base = client(ports[0])
         .await
@@ -2408,8 +2421,8 @@ async fn move_orders_to(
         m.map_version = version;
         let handed = super::super::map::committed(phase);
         if handed {
-            let t = m.tables.iter_mut().find(|t| t.name == "orders").unwrap();
-            *t = super::super::map::handed_over(t, start.as_bytes(), None, "p2");
+            let t = m.tables.iter_mut().find(|t| t.name == table).unwrap();
+            *t = super::super::map::handed_over(t, start.as_bytes(), end.map(str::as_bytes), "p2");
             m.partitions
                 .iter_mut()
                 .find(|p| p.id == "p1")
@@ -2417,11 +2430,11 @@ async fn move_orders_to(
                 .epoch += 1;
         }
         m.moves = vec![RangeMove {
-            id: "mvo".into(),
+            id: id.into(),
             kind: MoveKind::Range as i32,
-            table: "orders".into(),
+            table: table.into(),
             start: (!start.is_empty()).then(|| text(start)),
-            end: None,
+            end: end.map(text),
             from: "p1".into(),
             to: "p2".into(),
             phase: phase as i32,
@@ -2771,6 +2784,87 @@ fn a_resume_gaining_a_target_with_a_pruned_move_into_it_expires() {
             assert_eq!(code(&ended), "FeedExpired", "{ended}");
             assert!(
                 ended.message().contains("hand-over start is gone"),
+                "{ended}"
+            );
+        });
+    });
+}
+
+/// feed1248's T1 (#2130): the target's own resume check, not `from_hand_over`. A
+/// subscription of `users` holds a component on p2. Then a move of `users` [c, f) from p1
+/// into p2 reaches CLEANING (move 2: p2's serving row is live in its gate), and p2 holds an
+/// earlier move's pruned watermark of `users` (move 1), past the token's p2 position. The
+/// token's resume of p2 is below it: `FeedExpired`, though move 2's live row is there.
+#[test]
+fn a_targets_resume_below_a_pruned_move_in_expires_beside_a_live_one() {
+    use crate::serve::proto::MovePhase;
+    use crate::serve::ranges::{self, Moved, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let c = ports[2];
+        let db = t.dbs[1].clone().unwrap();
+        t.rt.block_on(async {
+            let mut s = subscribe(
+                c,
+                SubscribeRequest {
+                    tables: vec!["users".into()],
+                    checkpoint_every: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            put(c, "zed", "1").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            assert_eq!(seen[0].partition, "p2");
+            let token = seen[0].token.clone().unwrap();
+            drop(s);
+            let last = put_in(c, "users", "d01").await;
+            move_range_to(
+                &ports,
+                "users",
+                "mv2",
+                "c",
+                Some("f"),
+                last,
+                MovePhase::Cleaning,
+            )
+            .await;
+            eventually("p2's serving row of move 2", async || {
+                ranges::read_serving(&db)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.id == "mv2")
+            })
+            .await;
+            for i in 0..3 {
+                put(c, &format!("zz{i}"), "2").await;
+            }
+            // Move 1's pruned serving row: its `t_from` past the token's p2 position.
+            ranges::prune_row(
+                &db,
+                Pruned::Serving,
+                &Moved {
+                    id: "mv1".into(),
+                    table: "users".into(),
+                    start: b"n".to_vec(),
+                    end: Some(b"p".to_vec()),
+                    seqno: db.visible_seqno(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let req = SubscribeRequest {
+                tables: vec!["users".into()],
+                checkpoint_every: 1,
+                start: Some(Start::Resume(token)),
+                ..Default::default()
+            };
+            let ended = resume_ends(c, req).await;
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+            assert!(
+                ended.message().contains("moved to this partition past"),
                 "{ended}"
             );
         });
