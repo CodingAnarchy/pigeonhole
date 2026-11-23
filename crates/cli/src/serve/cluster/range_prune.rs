@@ -199,16 +199,17 @@ impl Node {
             if pruned.is_empty() {
                 continue;
             }
-            if let Err(e) = leased {
-                eprintln!(
-                    "phdb serve: partition {id}: the range rows' prune: {}",
-                    e.message
-                );
-            }
+            // The rows are gone from the file either way; a lapsed lease leaves the outcome on
+            // the cluster unknown (feed1248's nit).
             eprintln!(
-                "phdb serve: partition {id}: pruned the range rows of move{} {}",
+                "phdb serve: partition {id}: pruned the range rows of move{} {}{}",
                 if pruned.len() > 1 { "s" } else { "" },
-                pruned.join(", ")
+                pruned.join(", "),
+                if leased.is_err() {
+                    " (its lease lapsed meanwhile: the outcome on the cluster is unknown)"
+                } else {
+                    ""
+                }
             );
             // The gate takes the file's rows again, then its state from them.
             match (ranges::read_moved(&db), ranges::read_serving(&db)) {

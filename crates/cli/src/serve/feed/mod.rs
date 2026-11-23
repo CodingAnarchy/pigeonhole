@@ -150,6 +150,10 @@ pub(crate) struct Spec {
     /// start up to this seqno are passed over, as already handled, at most [`SKIP_LIMIT`] of
     /// them that would have been sent; 0: none.
     pub skip: u64,
+    /// Commits at or below this seqno are passed over as if before the start, however many
+    /// (D331 PR 5: a cluster component from the oldest position starts no lower than its
+    /// partition's pruned range-move watermarks); 0: none.
+    pub floor: u64,
     /// Send the start's position as a first progress event, before any commit: a cluster
     /// subscription's part (D317 ticket 7) then knows where it is from the start, so it can
     /// resume after a break that came before any event, with nothing skipped.
@@ -624,7 +628,8 @@ impl Feeds {
             Start::Now if spec.visible => self.db.snapshot()?.seqno(),
             Start::Now => self.db.durable_snapshot()?.seqno(),
             _ => 0,
-        };
+        }
+        .max(spec.floor);
         let spec_announce = spec.announce;
         let (sink, events, end_tx) = Sink::new(&self.limits);
         let tracker = Arc::new(Tracker::default());

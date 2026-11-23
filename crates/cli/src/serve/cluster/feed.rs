@@ -1691,13 +1691,9 @@ fn moved_end(
         let here = routes
             .partitions_of_table(t, b"")
             .is_some_and(|ps| ps.contains(&partition));
-        if here {
-            kept.push(t.clone());
-        } else if let Some(f) = service.moved_away(t) {
-            kept.push(t.clone());
-            gone += 1;
-            last = last.max(f);
-        } else if let (Some(from), Some(part)) = (resumed, service.part_opt()) {
+        // Below the table's pruned watermark: expired, whatever rows of it are live (another
+        // move's row doesn't cover the pruned one: simp724 on feed1248's M1 on #2130).
+        if let (Some(from), Some(part)) = (resumed, service.part_opt()) {
             let mark =
                 crate::serve::ranges::watermark(&part.db, crate::serve::ranges::Pruned::Moved, t)
                     .map_err(ApiError::internal)?;
@@ -1705,11 +1701,19 @@ fn moved_end(
                 return Err(ApiError::from_code(
                     pigeonhole::ErrorCode::FeedExpired,
                     &format!(
-                        "table {t:?} moved off partition {partition:?} past this resume's \
-                         position, and that move's record here is pruned: subscribe again"
+                        "a range of table {t:?} moved off partition {partition:?} past this \
+                         resume's position, and that move's record here is pruned: subscribe \
+                         again"
                     ),
                 ));
             }
+        }
+        if here {
+            kept.push(t.clone());
+        } else if let Some(f) = service.moved_away(t) {
+            kept.push(t.clone());
+            gone += 1;
+            last = last.max(f);
         }
     }
     if kept.is_empty() {

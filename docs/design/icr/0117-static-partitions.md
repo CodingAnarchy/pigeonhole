@@ -1103,9 +1103,11 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
 - It is one logged write: the row's delete, and its table's watermark raised to the row's `final_seqno` (moved-away) or `t_from` (serving), `pruned/moved/<table>` or `pruned/serving/<table>` in `__phdb_cluster`.
 - The watermark only rises (feed1248's W2), and outlives the table (W1).
 
-**What the watermark answers.**
-- A cluster component's resume below a table's watermark, with no live row of the table covering it, is `FeedExpired`, on the source and on the target alike. This holds on every copy, whatever its retention (P2).
-- A component starting from now, or from the oldest retained position, isn't checked. On the owner, the oldest retained position is already past the watermark, since the prune needed retention to pass it.
+**What the watermark answers** (amended on #2130's review: simp724's and feed1248's musts):
+- **A resume below the watermark** of a component's table is `FeedExpired`, on the source and on the target alike, whatever rows of the table are live: another move's row doesn't cover the pruned range. This holds on every copy, whatever its retention (P2).
+- **A resume that gains a target through a move** (`from_hand_over`) starts at the earliest live serving row's hand-over. If the table has a served watermark there, an earlier move into the target was pruned, and that start would skip it. The target's seqnos can't be compared with the resume's position elsewhere, so it fails closed: `FeedExpired`.
+- **A component from the oldest position starts no lower than its tables' watermarks** on that partition, moved and served (`feed::Spec::floor`). Without it, a promoted copy with longer retention would replay a range's history from before a pruned partial move, whose barrier is gone, out of per-key order.
+- **A start from now** isn't checked: nothing before it is read.
 
 **The source's table.** Once the last moved-away row of a table moved off whole goes, the schema reconcile drops the table there at the next map install.
 

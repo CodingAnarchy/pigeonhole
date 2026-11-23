@@ -2638,6 +2638,217 @@ fn a_token_from_before_a_pruned_whole_table_move_expires() {
     });
 }
 
+/// How a resume of `req` through `port` ends, once its partitions answer: the first error
+/// that isn't a retry-safe wait. Panics if it reads on.
+async fn resume_ends(port: u16, req: SubscribeRequest) -> tonic::Status {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let e = match subscribe(port, req.clone()).await {
+            Err(e) => e,
+            Ok(mut s) => match s.message().await {
+                Err(e) => e,
+                Ok(m) => panic!("the resume read on: {m:?}"),
+            },
+        };
+        let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+        if !again || tokio::time::Instant::now() >= deadline {
+            return e;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `orders` on p1 alone, a subscription's token after "k1", then "k2", and `orders` moved to
+/// p2 from `start` to CLEANING: the token, from before the move.
+async fn token_before_an_orders_move(ports: &[u16], start: &str) -> Bytes {
+    let (a, c) = (ports[0], ports[2]);
+    orders_on_p1(a).await;
+    let mut s = subscribe(
+        c,
+        SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    put_order(c, "k1").await;
+    let (first, _) = commits(&mut s, 1).await;
+    let token = first[0].token.clone().unwrap();
+    let last = put_order(c, "k2").await;
+    drop(s);
+    move_orders(ports, start, last).await;
+    token
+}
+
+fn orders_from(start: Option<Start>) -> SubscribeRequest {
+    SubscribeRequest {
+        tables: vec!["orders".into()],
+        checkpoint_every: 1,
+        start,
+        ..Default::default()
+    }
+}
+
+/// simp724 on feed1248's M1 (#2130), the source's side: a table's moved watermark answers
+/// a resume below it whatever moved-away rows of the table are live. p1 holds another
+/// move's live row of `orders` beside the pruned one; the resume still expires.
+#[test]
+fn a_live_moved_away_row_of_another_range_doesnt_cover_a_pruned_one() {
+    use crate::serve::ranges::{self, Moved, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let token = t.rt.block_on(token_before_an_orders_move(&ports, ""));
+        let db = t.dbs[0].clone().unwrap();
+        let row = ranges::read_moved(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .unwrap();
+        ranges::write_moved(
+            &db,
+            &Moved {
+                id: "mvx".into(),
+                start: b"zz".to_vec(),
+                ..row.clone()
+            },
+        )
+        .unwrap();
+        ranges::prune_row(&db, Pruned::Moved, &row).unwrap();
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            let ended = resume_ends(ports[2], orders_from(Some(Start::Resume(token)))).await;
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+        });
+    });
+}
+
+/// feed1248's M1 (#2130), the target's side: a resume that gains p2 through a move starts at
+/// its earliest live serving row; with an earlier move of the table into p2 pruned, that
+/// start would skip it, so it fails closed. p2 holds another move's live row of `orders`.
+#[test]
+fn a_resume_gaining_a_target_with_a_pruned_move_into_it_expires() {
+    use crate::serve::ranges::{self, Moved, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let token = t.rt.block_on(token_before_an_orders_move(&ports, ""));
+        let db = t.dbs[1].clone().unwrap();
+        let row = ranges::read_serving(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .expect("p2's serving row");
+        // A later move's live row: its hand-over past the pruned one's, so only the
+        // fail-closed rule, not the watermark against its start, expires the resume.
+        let later = db
+            .table("orders")
+            .and_then(|b| b.open())
+            .and_then(|o| o.feed().open())
+            .unwrap()
+            .token()
+            .as_bytes()
+            .to_vec();
+        ranges::write_serving(
+            &db,
+            &Moved {
+                id: "mvy".into(),
+                start: b"zz".to_vec(),
+                seqno: db.visible_seqno(),
+                token: later,
+                ..row.clone()
+            },
+        )
+        .unwrap();
+        ranges::prune_row(&db, Pruned::Serving, &row).unwrap();
+        t.stop(1);
+        t.restart(1);
+        t.rt.block_on(async {
+            let ended = resume_ends(ports[2], orders_from(Some(Start::Resume(token)))).await;
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+            assert!(
+                ended.message().contains("hand-over start is gone"),
+                "{ended}"
+            );
+        });
+    });
+}
+
+/// simp724's and feed1248's must (#2130): a partial move ([m, end) of `orders` from p1 to
+/// p2), both rows pruned. A subscription from the oldest position reads each partition
+/// from no lower than its watermarks: p1's history of the moved range from before the
+/// move ("n1"'s first write) isn't replayed beside p2's later write of it.
+#[test]
+fn a_subscription_from_the_oldest_starts_past_a_pruned_partial_move() {
+    use crate::serve::ranges::{self, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let c = ports[2];
+        t.rt.block_on(async {
+            orders_on_p1(ports[0]).await;
+            put_order(c, "n1").await;
+            let last = put_order(c, "a1").await;
+            move_orders(&ports, "m", last).await;
+        });
+        for (i, kind) in [(0, Pruned::Moved), (1, Pruned::Serving)] {
+            let db = t.dbs[i].clone().unwrap();
+            let rows = match kind {
+                Pruned::Moved => ranges::read_moved(&db),
+                Pruned::Serving => ranges::read_serving(&db),
+            }
+            .unwrap();
+            let row = rows.into_iter().find(|m| m.table == "orders").unwrap();
+            ranges::prune_row(&db, kind, &row).unwrap();
+            t.stop(i);
+            t.restart(i);
+        }
+        t.rt.block_on(async {
+            // p2 serves [m, end) now: "n1" again, there.
+            eventually("p2 takes n1", async || {
+                data(c)
+                    .await
+                    .mutate(MutateRequest {
+                        writes: Some({
+                            let mut w = put_row("n1", "after");
+                            w.row.as_mut().unwrap().table = "orders".into();
+                            w
+                        }),
+                        durability: 0,
+                    })
+                    .await
+                    .is_ok()
+            })
+            .await;
+            let mut s = subscribe_when_leased(c, orders_from(Some(Start::FromOldest(true)))).await;
+            let mut seen = Vec::new();
+            while let Ok(Ok(Some(e))) =
+                tokio::time::timeout(Duration::from_secs(3), s.message()).await
+            {
+                if let Some(Event::Commit(ch)) = &e.event {
+                    for change in &ch.changes {
+                        seen.push((
+                            e.partition.clone(),
+                            String::from_utf8(change.row.to_vec()).unwrap(),
+                        ));
+                    }
+                }
+            }
+            assert!(
+                seen.contains(&("p2".to_owned(), "n1".to_owned())),
+                "p2's write of n1: {seen:?}"
+            );
+            assert!(
+                !seen.contains(&("p1".to_owned(), "n1".to_owned())),
+                "p1 replayed n1 from before the pruned move: {seen:?}"
+            );
+        });
+    });
+}
+
 /// D331 PR 3b (cli692's M1): between a move's HANDED_OVER and CLEANING the target serves none
 /// of the range yet and has no hand-over position: a subscription isn't rerouted then, and a
 /// resume that would gain the target is refused retry-safe (`PartitionUnavailable`), not
