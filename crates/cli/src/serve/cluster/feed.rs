@@ -139,6 +139,11 @@ pub(crate) async fn subscribe(
     let mut tables = r.tables.clone();
     tables.sort();
     tables.dedup();
+    if let Some(S::Resume(bytes)) = &r.start
+        && let Ok(t) = ClusterToken::decode(bytes)
+    {
+        catch_up(&node, &t, service.request_timeout()).await?;
+    }
     let guard = node.routes();
     let Some(routes) = guard.as_ref() else {
         return Err(ApiError::partition_unavailable(
@@ -160,9 +165,10 @@ pub(crate) async fn subscribe(
     // though it no longer places these tables there: a range move took them, and the
     // partition serves them up to the move's last seqno while it holds the moved-away row,
     // or refuses (and the resume expires). This node can't read the row: its node decides.
-    // A partition the map dropped altogether (a merge emptied it) isn't kept: PR 6 serves a
-    // dropped partition's feed read-only for `--merge-feed-retention` (D331 amendment 3,
-    // simp724's should 2); until it lands, a resume across such a drop expires.
+    // A partition the map dropped altogether (a merge removed it) isn't kept, so a resume
+    // whose token reads it is `FeedExpired` ([`resume_starts`]), terminal, not the
+    // retry-safe `PartitionUnavailable` (the coordinator's ruling of 2026-11-23): its
+    // watermark went with it.
     if let Some(S::Resume(bytes)) = &r.start
         && let Ok(t) = ClusterToken::decode(bytes)
     {
@@ -583,6 +589,130 @@ fn expired(message: String) -> ApiError {
     ApiError::from_code(pigeonhole::ErrorCode::FeedExpired, &message)
 }
 
+/// Whether `e` is the engine's refusal of a component's position as another database's
+/// (`InvalidArgument`, which has no code of its own): the only refusal of that code whose
+/// message says so.
+fn another_database(e: &ApiError) -> bool {
+    e.code == "InvalidArgument" && e.message.contains("the token is another database's")
+}
+
+/// Before a resume's checks (a feed's [`resume_starts`], a memory watch's): a token of this
+/// cluster from a map newer than this node's that reads a partition this node's map doesn't
+/// list, a split's new partition this node hasn't taken yet, isn't a lost partition but a
+/// map behind. The node asks the other nodes of the newest map it holds for theirs, each
+/// once, within `within` in all, and takes any newer one, until its map is at or past the
+/// token's version or lists the partition: a newer map short of the token's may not list
+/// it yet (feed1248). A map taken may list nodes this node didn't know, which are asked too
+/// ([`next_to_ask`]: the token's maker may be one). Then [`after_pulls`] decides. Another
+/// cluster's token (feed1248's M1, simp724's (1)), one from no newer a map, or one whose
+/// every partition is listed, goes on to the checks as it is.
+pub(super) async fn catch_up(
+    node: &Arc<Node>,
+    token: &ClusterToken,
+    within: Duration,
+) -> Result<(), ApiError> {
+    // This node's map version and a partition it doesn't list, while behind this cluster's
+    // token.
+    let behind = || {
+        let guard = node.routes();
+        let routes = guard.as_ref()?;
+        let here = routes.map_version();
+        if routes.cluster_id() != token.cluster_id || here >= token.map_version {
+            return None;
+        }
+        let unlisted = token
+            .components
+            .iter()
+            .find(|c| routes.owner(&c.partition).is_none())?;
+        Some((here, unlisted.partition.clone()))
+    };
+    if behind().is_none() {
+        return Ok(());
+    }
+    // The other nodes of the newest map this node holds: id and address.
+    let peers = || -> Vec<(String, String)> {
+        node.get_map().map_or_else(
+            |_| Vec::new(),
+            |m| {
+                m.nodes
+                    .iter()
+                    .filter(|n| n.id != node.id())
+                    .map(|n| (n.id.clone(), n.address.clone()))
+                    .collect()
+            },
+        )
+    };
+    let mut answers: HashMap<String, Option<u64>> = HashMap::new();
+    let _ = tokio::time::timeout(within, async {
+        while let Some((here, _)) = behind() {
+            let Some((id, address)) = next_to_ask(&peers(), &answers) else {
+                return;
+            };
+            let answer = match node.fetch_map(&address).await {
+                Ok(map) => {
+                    let theirs = map.map_version;
+                    (theirs <= here || node.push_map_async(map, Some(id.clone())).await.is_ok())
+                        .then_some(theirs)
+                }
+                Err(_) => None,
+            };
+            answers.insert(id, answer);
+        }
+    })
+    .await;
+    match behind() {
+        None => Ok(()),
+        Some((here, unlisted)) => {
+            after_pulls(token.map_version, here, &unlisted, &peers(), &answers)
+        }
+    }
+}
+
+/// The next node of `peers` (the newest map's, but this one) for [`catch_up`] to ask: the
+/// first not asked yet. A node a map taken since added comes up here too (feed1248).
+fn next_to_ask(
+    peers: &[(String, String)],
+    answers: &HashMap<String, Option<u64>>,
+) -> Option<(String, String)> {
+    peers
+        .iter()
+        .find(|(id, _)| !answers.contains_key(id))
+        .cloned()
+}
+
+/// [`catch_up`]'s answer for a node still behind the token's map, with `unlisted` not in
+/// its map, after asking: `answers` holds each node's map version as it answered (`None`:
+/// it didn't, or its newer map didn't install here). While a node of the newest map this
+/// node holds (`peers`) may still hold the token's map, unasked or unanswered, the resume
+/// is refused retry-safe (`PartitionUnavailable`). Once every one of them answered with a
+/// map short of the token's, no node holds it (maps only rise: a restored map, or another
+/// history), and a retry would never end (simp724's (2)): the resume goes on to its checks,
+/// which expire it. The node that made the token held its map, so a split's new partition
+/// stays retry-safe while that node is down.
+fn after_pulls(
+    token_version: u64,
+    here: u64,
+    unlisted: &str,
+    peers: &[(String, String)],
+    answers: &HashMap<String, Option<u64>>,
+) -> Result<(), ApiError> {
+    let short = |id: &String| {
+        answers
+            .get(id)
+            .copied()
+            .flatten()
+            .is_some_and(|v| v < token_version)
+    };
+    if peers.iter().all(|(id, _)| short(id)) {
+        return Ok(());
+    }
+    Err(ApiError::partition_unavailable(format!(
+        "this node's cluster map (version {here}) is behind the resume token's (version \
+         {token_version}), which reads partition {unlisted:?} this map doesn't list, and a \
+         node that may hold it didn't answer: retry once this node has a later map"
+    )))
+}
+
 /// A subscription's merge: its hub's (#1798), or a member's own.
 pub(super) struct Merge {
     ctx: Arc<Ctx>,
@@ -659,14 +789,7 @@ impl Merge {
         // serves none of the range before, and only then has the hand-over position a
         // resume starts it at (cli692's M1 on PR 3b). Read once a map version.
         let moves = self.ctx.node.get_map().map(|m| m.moves).unwrap_or_default();
-        let handing = |table: &str, p: &str| {
-            moves.iter().any(|m| {
-                !super::map::node_move(m)
-                    && m.table == table
-                    && m.to == p
-                    && super::map::phase(m) < crate::serve::proto::MovePhase::Cleaning
-            })
-        };
+        let handing = |table: &str, p: &str| handing(&moves, table, p);
         let prefix = &self.ctx.prefix;
         let (t, p) = gained(
             &self.parts,
@@ -777,6 +900,24 @@ impl Merge {
                 }
                 Ok(())
             }
+            // Its resume is past an emptied source's pruned moves (`moved_end`, C1).
+            Err(e) if e.code == "MovedAway" => {
+                self.retire(i);
+                Ok(())
+            }
+            // The partition's file is another database than the one its position was read
+            // from: dropped and created again under the same id (a merge's source added back,
+            // cli692's S3 on #2131). Its position is gone for good: `FeedExpired`, so the
+            // client subscribes again, not the engine's `InvalidArgument` (the coordinator's
+            // ruling of 2026-11-23).
+            Err(e) if another_database(&e) => Err(in_partition(
+                &self.parts[i].partition,
+                expired(format!(
+                    "its file is another database than the one this position was read from (the \
+                     partition was dropped and created again): subscribe again ({})",
+                    e.message
+                )),
+            )),
             Err(e) if self.allow_partial && retryable(&e) => {
                 self.unavailable(i, &e);
                 Ok(())
@@ -819,17 +960,23 @@ impl Merge {
             },
             // D331 PR 3b: a source's component of tables moved away whole is done.
             Some(Err(e)) if e.code == "MovedAway" => {
-                let p = &mut self.parts[i];
-                p.retired = true;
-                p.events = None;
-                p.retry = None;
-                self.moved = true;
+                self.retire(i);
                 return Ok(None);
             }
             Some(Err(e)) => e,
             None => ApiError::partition_unavailable("its stream ended"),
         };
         self.failed(i, ended).map(|()| None)
+    }
+
+    /// Part `i`'s component is done (`MovedAway`): its tables moved to other partitions, and
+    /// it read up to their moves' last seqno. Later checkpoints leave it out.
+    fn retire(&mut self, i: usize) {
+        let p = &mut self.parts[i];
+        p.retired = true;
+        p.events = None;
+        p.retry = None;
+        self.moved = true;
     }
 
     /// Takes part `i`'s event: its position, and what to send for it, if anything.
@@ -1001,6 +1148,17 @@ fn poll_parts(
         }
     }
     Poll::Pending
+}
+
+/// Whether one of `moves` still hands `table`'s range to partition `p`: a range move to it
+/// before CLEANING, or aborting (D331 PR 5), whose target never serves the range.
+fn handing(moves: &[crate::serve::proto::RangeMove], table: &str, p: &str) -> bool {
+    moves.iter().any(|m| {
+        !super::map::node_move(m)
+            && m.table == table
+            && m.to == p
+            && !super::map::target_serves(super::map::phase(m))
+    })
 }
 
 /// The first of `tables` with a partition (`partitions_of`) that no live part of `parts`
@@ -1411,7 +1569,13 @@ impl Ctx {
                 let routes = routes
                     .as_ref()
                     .ok_or_else(|| ApiError::partition_unavailable("this node has no map"))?;
-                let (kept, ends_at) = moved_end(&here, routes, &open.partition, &request.tables)?;
+                let (kept, ends_at) = moved_end(
+                    &here,
+                    routes,
+                    &open.partition,
+                    &request.tables,
+                    request.start.as_ref(),
+                )?;
                 request.tables = kept;
                 ends_at
             };
@@ -1617,7 +1781,13 @@ pub(crate) async fn serve(
                 req.partition
             )));
         };
-        let (kept, ends_at) = moved_end(&service, routes, &req.partition, &r.tables)?;
+        let (kept, ends_at) = moved_end(
+            &service,
+            routes,
+            &req.partition,
+            &r.tables,
+            r.start.as_ref(),
+        )?;
         r.tables = kept;
         (service, ends_at)
     };
@@ -1645,34 +1815,78 @@ pub(crate) async fn serve(
 /// D331 PR 3b: which of `tables` a component on `partition` (served by `service`) reads,
 /// and where it ends. A table the map places here is read. One it doesn't that a range move
 /// took from it whole is still its own to serve, up to the move's last seqno, while it holds
-/// the moved-away row. Any other is left out (feed1248's M1): it was never here, or PR 5
-/// pruned its row. Leaving a pruned one out is safe only by PR 5's rule that it prunes a row
-/// once this partition's feed retention has passed the move's last seqno, so a position
-/// below that fails on retention here anyway (cli692; ICR 0117's D331 PR 3b section). None left: `WrongPartition` (a resume of it expires). When every
+/// the moved-away row. Any other is left out (feed1248's M1): it was never here, or its row
+/// was pruned, when a resume below the table's pruned watermark is `FeedExpired` instead
+/// (below). None left: `WrongPartition` (a resume of it expires). When every
 /// table kept is a moved one, the component ends past the latest of their last seqnos
 /// (`Some`); else it reads on (`None`: the moved tables' later events here are only
 /// feed-silent cleanup). A running component finds the same end when a move takes its last
 /// table here ([`crate::serve::feed`]'s barriers' watch).
+///
+/// D331 PR 5 (simp724's P2 form): a resume below a table's pruned watermark, which no live
+/// moved-away row covers, is `FeedExpired`, not left out, on every copy of the partition:
+/// a promoted replica with longer retention can't take the "neither" branch below a pruned
+/// move.
+///
+/// The 24 h emptied-partition grace (`range_prune::EMPTIED_GRACE`, feed1248's C1): a
+/// token taken after this partition's part read up to a move's last seqno, but before the
+/// part retired, outlives the pruned row. Its resume is at or past the watermark and
+/// nothing here is kept. That's `MovedAway` at the open, so the merge retires the part as
+/// if it had read on to the move's end, not `WrongPartition`, which would reopen it here
+/// again.
 fn moved_end(
     service: &Service,
     routes: &super::route::Routes,
     partition: &str,
     tables: &[String],
+    start: Option<&S>,
 ) -> Result<(Vec<String>, Option<u64>), ApiError> {
+    let resumed = match start {
+        Some(S::Resume(t)) => Some(super::token::token_seqno(t).unwrap_or(0)),
+        _ => None,
+    };
     let mut kept = Vec::with_capacity(tables.len());
     let mut gone = 0;
     let mut last = 0;
+    // A table left out at or past its pruned watermark (C1).
+    let mut past_pruned = false;
     for t in tables {
         let here = routes
             .partitions_of_table(t, b"")
             .is_some_and(|ps| ps.contains(&partition));
+        // Below the table's pruned watermark: expired, whatever rows of it are live (another
+        // move's row doesn't cover the pruned one: simp724 on feed1248's M1 on #2130).
+        let mut mark = 0;
+        if let (Some(from), Some(part)) = (resumed, service.part_opt()) {
+            mark =
+                crate::serve::ranges::watermark(&part.db, crate::serve::ranges::Pruned::Moved, t)
+                    .map_err(ApiError::internal)?;
+            if from < mark {
+                return Err(ApiError::from_code(
+                    pigeonhole::ErrorCode::FeedExpired,
+                    &format!(
+                        "a range of table {t:?} moved off partition {partition:?} past this \
+                         resume's position, and that move's record here is pruned: subscribe \
+                         again"
+                    ),
+                ));
+            }
+        }
         if here {
             kept.push(t.clone());
         } else if let Some(f) = service.moved_away(t) {
             kept.push(t.clone());
             gone += 1;
             last = last.max(f);
+        } else if mark > 0 {
+            past_pruned = true;
         }
+    }
+    if kept.is_empty() && past_pruned {
+        return Err(ApiError::moved_away(format!(
+            "this component's tables moved off partition {partition:?}, and the resume is \
+             past their moves' last seqno"
+        )));
     }
     if kept.is_empty() {
         return Err(ApiError::wrong_partition(
@@ -1852,6 +2066,50 @@ pub(super) mod tests {
         assert!(e.message.contains("\"p2\" has another history"), "{e:?}");
     }
 
+    /// simp724's (2) on #2135, with feed1248's condition: a node still behind a resume
+    /// token's map refuses it retry-safe while a node of the newest map it holds may hold
+    /// that map (not asked yet, didn't answer, or its newer map didn't install), asks a node
+    /// a pulled map added, and lets the checks expire the resume only once every node of
+    /// that map answered short of the token's.
+    #[test]
+    fn a_resume_behind_its_tokens_map_is_retried_only_while_a_peer_may_hold_it() {
+        let nodes = |ids: &[&str]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|id| ((*id).to_owned(), format!("{id}:1")))
+                .collect()
+        };
+        let answered = |a: &[(&str, Option<u64>)]| -> HashMap<String, Option<u64>> {
+            a.iter().map(|(id, v)| ((*id).to_owned(), *v)).collect()
+        };
+        let verdict = |peers: &[(String, String)], answers: &HashMap<String, Option<u64>>| {
+            after_pulls(9, 5, "p9", peers, answers).map_or_else(|e| e.code, |()| "checks".into())
+        };
+        let (ab, abd) = (nodes(&["a", "b"]), nodes(&["a", "b", "d"]));
+        // A node that didn't answer, or whose newer map didn't install; or one not asked.
+        let a_short = answered(&[("a", Some(6)), ("b", None)]);
+        assert_eq!(verdict(&ab, &a_short), "PartitionUnavailable");
+        assert_eq!(
+            verdict(&ab, &answered(&[("a", Some(6))])),
+            "PartitionUnavailable"
+        );
+        // Every node answered, none at the token's map: no node holds it.
+        let both_short = answered(&[("a", Some(6)), ("b", Some(8))]);
+        assert_eq!(verdict(&ab, &both_short), "checks");
+        assert_eq!(verdict(&[], &HashMap::new()), "checks");
+        // b's map (8) added d, perhaps the token's maker: d is asked next, and until it
+        // answers short, the resume is retried, not expired.
+        assert_eq!(
+            next_to_ask(&abd, &both_short).map(|(id, _)| id),
+            Some("d".into())
+        );
+        assert_eq!(next_to_ask(&ab, &both_short), None);
+        assert_eq!(verdict(&abd, &both_short), "PartitionUnavailable");
+        let d_down = answered(&[("a", Some(6)), ("b", Some(8)), ("d", None)]);
+        assert_eq!(verdict(&abd, &d_down), "PartitionUnavailable");
+        let d_short = answered(&[("a", Some(6)), ("b", Some(8)), ("d", Some(8))]);
+        assert_eq!(verdict(&abd, &d_short), "checks");
+    }
+
     /// D331 PR 3b: a resume starts each partition the map gave the subscription's tables
     /// since the token at its hand-over (cli692's F1), and expires on one the token reads
     /// that the subscription no longer covers.
@@ -1980,6 +2238,29 @@ pub(super) mod tests {
             Some(("users", "p1".to_owned()))
         );
         assert_eq!(gained(&parts, &["users"], on, |_, p| p == "p1"), None);
+    }
+
+    // D331 PR 5: a move's target counts only from CLEANING on; an aborting move's never does
+    // (ABORTING is above CLEANING in number, out of the phases' order).
+    #[test]
+    fn an_aborting_moves_target_is_still_handed_and_never_gains_the_range() {
+        use crate::serve::proto::{MoveKind, MovePhase, RangeMove};
+        let at = |phase: MovePhase| {
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "users".into(),
+                from: "p1".into(),
+                to: "p2".into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            vec![r]
+        };
+        assert!(handing(&at(MovePhase::HandedOver), "users", "p2"));
+        assert!(!handing(&at(MovePhase::Cleaning), "users", "p2"));
+        assert!(handing(&at(MovePhase::Aborting), "users", "p2"));
+        assert!(!handing(&at(MovePhase::Aborting), "orders", "p2"));
     }
 
     #[test]

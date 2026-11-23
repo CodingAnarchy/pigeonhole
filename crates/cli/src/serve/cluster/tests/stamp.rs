@@ -29,6 +29,9 @@ async fn stamp(
             restore_from_cluster_id: String::new(),
             promote: false,
             replica_epoch: 0,
+            create: false,
+            create_move: String::new(),
+            create_version: 0,
         })
         .await
         .map(tonic::Response::into_inner)
@@ -473,6 +476,9 @@ fn a_move_run_again_after_its_stamp_copies_and_checks_the_set_again() {
                 restore_from_cluster_id: String::new(),
                 promote: false,
                 replica_epoch: 0,
+                create: false,
+                create_move: String::new(),
+                create_version: 0,
             })
             .await
             .unwrap()

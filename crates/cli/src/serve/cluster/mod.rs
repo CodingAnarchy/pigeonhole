@@ -33,8 +33,13 @@ pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod promote;
 pub(crate) mod range_copy;
+pub(crate) mod range_drop;
 pub(crate) mod range_feed;
+pub(crate) mod range_fence;
 pub(crate) mod range_follow;
+mod range_merge;
+pub(crate) mod range_move;
+pub(crate) mod range_prune;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -210,6 +215,9 @@ struct Peers {
     /// How often a partition's load averages take a reading ([`load::INTERVAL`]; shorter in
     /// tests).
     load_interval: Duration,
+    /// How often the node prunes its partitions' range-move rows ([`range_prune::INTERVAL`];
+    /// shorter in tests).
+    prune_interval: Duration,
 }
 
 /// A cluster node.
@@ -263,6 +271,10 @@ pub(crate) struct Node {
     /// One open or close of a partition at a time (D317 ticket 6): the parts' swaps take
     /// it. Taken after `fences.changing` where both are.
     opening: tokio::sync::Mutex<()>,
+    /// Partition files here that the map doesn't place and that no split created, by id,
+    /// as they were when read ([`Node::reconcile_split_files`]): not opened again on each
+    /// map while they stay the same.
+    unmarked: Mutex<HashMap<String, stamp::Seen>>,
     /// This node, for the tasks an install starts.
     me: std::sync::Weak<Node>,
     /// Its cluster feed hubs (#1798): one merge per subscription key.
@@ -300,6 +312,8 @@ pub(crate) struct Node {
     device_ceiling: load::DeviceCeiling,
     /// Whether [`Node::watch_device`]'s loop runs.
     watching_device: std::sync::atomic::AtomicBool,
+    /// The range rows' pruning timer runs ([`Node::watch_range_prunes`]).
+    pruning: std::sync::atomic::AtomicBool,
 }
 
 impl Node {
@@ -321,6 +335,7 @@ impl Node {
         Arc::new_cyclic(|me| Self {
             device_ceiling,
             watching_device: std::sync::atomic::AtomicBool::new(false),
+            pruning: std::sync::atomic::AtomicBool::new(false),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),
@@ -347,6 +362,7 @@ impl Node {
             fences: fence::Fences::default(),
             server: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
+            unmarked: Mutex::new(HashMap::new()),
             feed_hubs: hub::Hubs::default(),
             me: me.clone(),
         })

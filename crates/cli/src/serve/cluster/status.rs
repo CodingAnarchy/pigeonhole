@@ -136,7 +136,30 @@ impl Node {
                                 "the map has it at epoch {}, the file at {}",
                                 p.epoch, id.epoch
                             ),
-                            None if map.is_some() => "the map has no such partition".into(),
+                            // A split's new partition is created before the change that
+                            // records it: its own line, so a merge's rerun (which drops only
+                            // files with exactly the line above) never takes it (audit120's
+                            // S-a on #2131).
+                            None if map.is_some() => match open.get(&named) {
+                                Some(part) => identity::split_mark(&part.db),
+                                None => identity::split_mark_file(&path),
+                            }
+                            .map_or_else(
+                                |e| {
+                                    format!(
+                                        "the map has no such partition (its split mark \
+                                         couldn't be read: {e})"
+                                    )
+                                },
+                                |mark| match mark {
+                                    Some(mark) => format!(
+                                        "the map has no such partition yet: split {:?} \
+                                         created it",
+                                        mark.move_id
+                                    ),
+                                    None => "the map has no such partition".into(),
+                                },
+                            ),
                             _ => String::new(),
                         }
                     };
@@ -217,10 +240,23 @@ impl Node {
                 if let Some(part) = open.get(&id) {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
+                    // D331 PR 5's plan: absent until the first interval ends.
+                    lp.write_bytes_rate = l.write_rate.map(|r| r as u64);
                     // Its size from the file system, no read of the file (perf287): the
                     // path the database opened, not one built from the id (CodeQL on
                     // #2103).
                     lp.file_bytes = std::fs::metadata(part.db.path()).map_or(0, |m| m.len());
+                    // D331 PR 6: an owner's partition the map places nothing on (a merge
+                    // emptied it): what still keeps it listed.
+                    if let Some(m) = &map
+                        && m.partitions.iter().any(|p| p.id == id && p.node == self.id)
+                        && !super::map::placed(m, &id)
+                    {
+                        lp.drop_waits = part
+                            .service()
+                            .drop_waits(super::spanning::now_ms())
+                            .unwrap_or_default();
+                    }
                 }
             }
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).
@@ -230,6 +266,17 @@ impl Node {
                 if let Some(copies) = self.range_copies() {
                     for s in lp.moves.iter_mut().filter(|s| s.source) {
                         s.retention_lapsed = copies.lapsed(&s.id);
+                    }
+                }
+                // PR 5: a source's fence seqno, once its fence drained; either side's drop.
+                if let Some(fences) = self.range_fences() {
+                    for s in lp.moves.iter_mut().filter(|s| s.source) {
+                        s.fence_seqno = fences.seqno(&s.id);
+                    }
+                }
+                if let Some(drops) = self.range_drops() {
+                    for s in &mut lp.moves {
+                        s.dropped = drops.dropped(&s.id);
                     }
                 }
                 if let Some(follows) = self.range_follows() {
@@ -246,6 +293,11 @@ impl Node {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .clone()
                                 .unwrap_or_default();
+                            s.follower_waiting = p
+                                .waiting
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
                         }
                     }
                 }
@@ -261,7 +313,15 @@ impl Node {
                 )
             },
         );
+        let (move_rate_bytes, move_retention_cap, max_move_followers) =
+            self.range_copies().map_or((0, 0, 0), |s| {
+                let (rate, cap, followers) = s.limits();
+                (rate, cap, u32::try_from(followers).unwrap_or(u32::MAX))
+            });
         NodeStatus {
+            move_rate_bytes,
+            move_retention_cap,
+            max_move_followers,
             balancer: self.balancer_state(),
             writer,
             writer_term,

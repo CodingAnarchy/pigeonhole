@@ -3145,18 +3145,32 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
     use crate::serve::proto::BalancerEventKind;
     // simp724's S2 and audit120's M1 on #2103: every node has tokens, and the writer runs
     // its move with its cluster token alone, its map changes set in process. Node c weighs
-    // ten, so a is over its size bound: the balancer moves a's p1 to c. One MOVE event, p1's
-    // history, the record gone, p1 serving on c; nothing else moves within the dwell.
+    // ten, so a and b are over their size bounds: the balancer moves one of their
+    // partitions (p1 from a or p2 from b, whichever measures bigger) to c. One MOVE event,
+    // the partition's history, the record gone, it serving on c; nothing else moves within
+    // the dwell.
     let mut t = Rig::start_with(&balancer_tokens());
     let tok = Some(BALANCER_ADMIN);
     writer_leased_as(&mut t, tok);
     let [a, _, c] = t.ports;
     t.rt.block_on(async {
         balance_skewed(&t, tok).await;
-        let m = map_until(a, tok, Duration::from_secs(30), "p1 moved to c", |m| {
-            m.moves.is_empty() && m.partitions.iter().any(|p| p.id == "p1" && p.node == "c")
-        })
+        let on_c = |m: &crate::serve::proto::ClusterMap| {
+            m.partitions
+                .iter()
+                .find(|p| ["p1", "p2"].contains(&p.id.as_str()) && p.node == "c")
+                .map(|p| p.id.clone())
+        };
+        let m = map_until(
+            a,
+            tok,
+            Duration::from_secs(30),
+            "p1 or p2 moved to c",
+            |m| m.moves.is_empty() && on_c(m).is_some(),
+        )
         .await;
+        let moved = on_c(&m).unwrap();
+        let from = if moved == "p1" { "a" } else { "b" };
         let moves: Vec<_> = m
             .balancer_events
             .iter()
@@ -3169,12 +3183,12 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
                 moves[0].from.as_str(),
                 moves[0].to.as_str()
             ),
-            ("p1", "a", "c")
+            (moved.as_str(), from, "c")
         );
-        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
-        assert_eq!(p1.moves_history.len(), 1, "{p1:?}");
-        eventually_within(Duration::from_secs(10), "p1 to serve on c", async || {
-            local_as(c, "p1", tok).await.state() == LocalPartitionState::Serving
+        let p = m.partitions.iter().find(|p| p.id == moved).unwrap();
+        assert_eq!(p.moves_history.len(), 1, "{p:?}");
+        eventually_within(Duration::from_secs(10), "it to serve on c", async || {
+            local_as(c, &moved, tok).await.state() == LocalPartitionState::Serving
         })
         .await;
         // Within the dwell: no second move.
@@ -3321,10 +3335,12 @@ fn a_balancer_move_an_earlier_writer_left_past_its_commit_point_is_finished() {
 fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
     use crate::serve::proto::{BalancerEventKind, MovePhase};
     // simp724's M1 on #2103 (the plan's Amendment 2): the writer's lease bounds its
-    // balancer moves at every term, term 0 included. The balancer's move of p1 to c is held
-    // just before its stamp; a is cut off and its writer lease runs out; released, the move
-    // stamps c's copy but can't set its next map, so the record stays at COPYING and p1 on
-    // a. Joined again, the writer aborts it (it's before its commit point).
+    // balancer moves at every term, term 0 included. The balancer's move to c (of p1 from a
+    // or p2 from b: both are over their bound, and which goes first depends on their
+    // measured sizes) is held just before its stamp; the writer a is cut off and its writer
+    // lease runs out; released, the move stamps c's copy but can't set its next map, so the
+    // record stays at COPYING and the partition where it was. Joined again, the writer
+    // aborts it (it's before its commit point).
     use crate::serve::cluster::moving::HOLD_BEFORE_STAMP;
     let mut t = Rig::start();
     writer_leased(&mut t);
@@ -3354,8 +3370,16 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         )
         .await;
     });
-    let (id, from) = t.rt.block_on(async {
-        let (id, from, _) = bal_record(&map_of(a).await).expect("recorded");
+    let (id, from, home) = t.rt.block_on(async {
+        let m = map_of(a).await;
+        let (id, from, _) = bal_record(&m).expect("recorded");
+        // Where the moved partition was when the move was recorded.
+        let home = m
+            .partitions
+            .iter()
+            .find(|p| p.id == from)
+            .map(|p| p.node.clone())
+            .expect("the moved partition is listed");
         release_tx.send(()).expect("the move waits");
         // Passes enough for the move to try its next map, and the writer to try an abort.
         tokio::time::sleep(Duration::from_millis(2_000)).await;
@@ -3363,11 +3387,11 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         let (still, _, phase) = bal_record(&m).expect("still recorded");
         assert_eq!((still.as_str(), phase), (id.as_str(), MovePhase::Copying));
         assert!(
-            m.partitions.iter().any(|p| p.id == from && p.node == "a"),
+            m.partitions.iter().any(|p| p.id == from && p.node == home),
             "{:?}",
             m.partitions
         );
-        (id, from)
+        (id, from, home)
     });
     cut(&t, 0, false);
     t.rt.block_on(async {
@@ -3378,11 +3402,176 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
                     .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
         })
         .await;
+        let port = t.ports[["a", "b", "c"]
+            .iter()
+            .position(|n| *n == home)
+            .expect("a node of the rig")];
         eventually_within(
             Duration::from_secs(10),
-            "the partition to serve on a",
-            async || state(a, &from).await == LocalPartitionState::Serving,
+            "the partition to serve where it was",
+            async || state(port, &from).await == LocalPartitionState::Serving,
         )
         .await;
+    });
+}
+
+#[test]
+fn a_partition_with_a_share_in_doubt_isnt_moved_by_the_balancer_with_failover_off() {
+    // audit120's M1 on 1.3.0: the balancer never moves a partition with spanning shares in
+    // doubt. It reads the count from the owner's lease renewals, which carried it only with
+    // failover on. With failover off, p1's share is prepared and in doubt: a commit homed on
+    // c is held at its commit point, so the resolver leaves it, since its home has it in
+    // progress. b and c weigh ten, so only a is over its bound, and p1 is its one candidate.
+    // The balancer says so and moves nothing.
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    use crate::serve::proto::BalancerEventKind;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        assert!(!map_of(a).await.failover, "failover is off");
+        // c's p3 (the transaction's home) under its lease, as writer_leased waits only for a.
+        eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+            state(c, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        super::txn_write(
+            c,
+            &id,
+            vec![super::put_row("alice", "1"), super::put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let p = pause(&id, Step::CommitPoint);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move { super::spanning::commit_parts(c, &id, Vec::new()).await })
+        };
+        p.reached.notified().await;
+        // A renewal or two, so the writer holds p1's count before the balancer turns on.
+        tokio::time::sleep(super::TEST_LEASE * 2).await;
+        balancer_map(&t, None, |m| {
+            for n in m.nodes.iter_mut().filter(|n| n.id != "a") {
+                n.weight = 10;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                size_ratio: 1.2,
+                passes: 1,
+                dwell_ms: 600_000,
+                // No partition counts as small, so no merge decision takes the reason.
+                partition_min_bytes: 1,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        balancer_until(a, Duration::from_secs(20), |s| {
+            s.starts_with("skip: node a is over its bound, but no partition on it can move")
+        })
+        .await;
+        // Passes more, and still nothing moved.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of(a).await;
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Move),
+            "{:?}",
+            m.balancer_events
+        );
+        assert!(
+            m.partitions.iter().any(|q| q.id == "p1" && q.node == "a"),
+            "{:?}",
+            m.partitions
+        );
+        // The commit goes on.
+        p.go.send(false).unwrap();
+        let _ = commit.await;
+    });
+}
+
+#[test]
+fn a_grant_from_before_the_balancer_was_on_still_says_a_share_is_in_doubt() {
+    // simp724 on #2127: the balancer reads a partition's in-doubt count from the writer's
+    // last grant of it, ended or not. A grant renewed before the balancer was switched on
+    // must say so too, or the first pass after the switch, with an operator's passes 1,
+    // could move the partition. p2's share is held in doubt (a commit homed on c, held at
+    // its commit point). A few renewals later b's renewals to a are cut, so a's last grant
+    // of p2 is one from before the switch. Then the balancer comes on with only b over its
+    // bound: it reports that b can't move anything, and p2 stays on b.
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    use crate::serve::proto::BalancerEventKind;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        assert!(!map_of(a).await.failover, "failover is off");
+        for (port, p) in [(b, "p2"), (c, "p3")] {
+            eventually_within(Duration::from_secs(10), "p2 and p3 to serve", async || {
+                state(port, p).await == LocalPartitionState::Serving
+            })
+            .await;
+        }
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        super::txn_write(
+            c,
+            &id,
+            vec![super::put_row("hank", "1"), super::put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let p = pause(&id, Step::CommitPoint);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move { super::spanning::commit_parts(c, &id, Vec::new()).await })
+        };
+        p.reached.notified().await;
+        // A renewal or two with the share in doubt, while the balancer is still off; then
+        // b's renewals to a stop, so a's last grant of p2 is one of those.
+        tokio::time::sleep(super::TEST_LEASE * 2).await;
+        let cut = (t.dirs[1].clone(), format!("127.0.0.1:{a}"));
+        super::super::CUT_BETWEEN.lock().unwrap().push(cut.clone());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        balancer_map(&t, None, |m| {
+            for n in m.nodes.iter_mut().filter(|n| n.id != "b") {
+                n.weight = 10;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                size_ratio: 1.2,
+                passes: 1,
+                dwell_ms: 600_000,
+                partition_min_bytes: 1,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        balancer_until(a, Duration::from_secs(20), |s| {
+            s.starts_with("skip: node b is over its bound, but no partition on it can move")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of(a).await;
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Move),
+            "{:?}",
+            m.balancer_events
+        );
+        assert!(
+            m.partitions.iter().any(|q| q.id == "p2" && q.node == "b"),
+            "{:?}",
+            m.partitions
+        );
+        super::super::CUT_BETWEEN
+            .lock()
+            .unwrap()
+            .retain(|e| *e != cut);
+        p.go.send(false).unwrap();
+        let _ = commit.await;
     });
 }

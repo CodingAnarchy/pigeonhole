@@ -148,6 +148,17 @@ message StampRequest {
   // With `promote`: the epoch the CLI found in the copy's identity row, which the file must
   // still record, so the stamp acts on the copy that was checked.
   uint64 replica_epoch = 8;
+  // D331 PR 5: a split's new partition, which has no file yet. The node creates it empty,
+  // with its identity at `to_epoch` and marked split-created for `create_move`, before the
+  // map change that adds it: create-new (a path that exists is never replaced), idempotent
+  // for an empty file with that identity, refused for anything else under the id.
+  bool create = 9;
+  // With `create`: the split's move id, which the file's split-created mark names.
+  string create_move = 10;
+  // With `create`: the map version the split's COPYING change will carry. The node moves an
+  // empty, marked, unmapped file aside only once it holds a map past this version that
+  // doesn't place the partition. A rerun of the create refreshes the mark.
+  uint64 create_version = 11;
 }
 
 // A partition's state on its node (D317 ticket 6).
@@ -350,6 +361,13 @@ message RangeMove {
   // move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
   // promoted it mid-move). 0 on a record from before this field.
   uint64 from_epoch = 13;
+  // D331 PR 5: the target partition's epoch when the move entered COPYING. The move aborts
+  // if it changes before the commit point (a failover of the target). 0: unknown, not
+  // compared.
+  uint64 to_epoch = 14;
+  // 15 was `split`, withdrawn before release: a split is `kind` MOVE_KIND_PARTITION.
+  reserved 15;
+  reserved "split";
 }
 
 // D331: what a range move is for.
@@ -362,7 +380,11 @@ enum MoveKind {
   // D332: a whole partition relocated to another node (no table or range; `to` names the
   // node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
   MOVE_KIND_NODE = 3;
-  // PR 6 (merge) adds MOVE_KIND_MERGE = 4.
+  // 4 was MOVE_KIND_MERGE, withdrawn before release (the coordinator, 2026-11-22): a merge
+  // (D331 PR 6) is a sequence of MOVE_KIND_RANGE records, one per range, then the source's
+  // removal. Never reassigned.
+  reserved 4;
+  reserved "MOVE_KIND_MERGE";
 }
 
 // D331: where a range move is. A move goes forward one phase per map; before HANDED_OVER it
@@ -381,9 +403,18 @@ enum MovePhase {
   // T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
   // ended); S deletes its copy.
   MOVE_PHASE_CLEANING = 5;
-  // PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
-  // the merged-away source waits for its transaction outcomes before it's dropped. The
-  // phases stay in order, so "from HANDED_OVER on" includes it.
+  // 6 was MOVE_PHASE_AWAITING_OUTCOMES, withdrawn before release (the coordinator,
+  // 2026-11-22): a merged-away source waits, listed and holding no range, until its node's
+  // `LocalPartition.drop_waits` is empty. Never reassigned.
+  reserved 6;
+  reserved "MOVE_PHASE_AWAITING_OUTCOMES";
+  // D331 PR 5: an abort under way, from COPYING, CATCHING_UP or HANDING_OVER: before the
+  // commit point and inactive. S serves the range as if no move named it (no fence), T
+  // serves none of it and drops what it copied, and a split's new partition goes once its
+  // node reports it empty; then the record goes. It is OUT OF the phases' order: every
+  // comparison of phases excludes it explicitly (`map::past_commit`, `map::active`), never
+  // by number.
+  MOVE_PHASE_ABORTING = 7;
 }
 
 // D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
@@ -409,6 +440,16 @@ message MoveStatus {
   // a range drop of the range, a row left partly copied, the source failed over); empty
   // while it runs or once it's done. PR 5's driver aborts the move on it.
   string follower_error = 11;
+  // D331 PR 5, on the source: its visible seqno once the range's fence drained and no share
+  // was in doubt (from HANDING_OVER); 0 until then. The driver records it as `final_seqno`.
+  uint64 fence_seqno = 12;
+  // D331 PR 5, on the source (CLEANING) or a split's new partition (ABORTING): the range's
+  // drop finished.
+  bool dropped = 13;
+  // D331 PR 5, on the target: what its follower waits for before copying (an earlier move's
+  // drop of an overlapping range here); empty when it waits for nothing. For people and the
+  // driver's timeout, never an error.
+  string follower_waiting = 14;
 }
 
 // D330: one failover of a partition to a replica, or one writer election, as the writer
@@ -668,6 +709,12 @@ message NodeStatus {
   // none, and how many passes the next action has waited. For people to read, not a format
   // to parse. Empty on any other node, or with the balancer off.
   string balancer = 14;
+  // D331 PR 5: this node's range-move limits, as a move's plan reads them for a source on
+  // it: `--move-rate-bytes`, `--move-retention-cap` and `--max-move-followers`. 0: unknown
+  // (an older node).
+  uint64 move_rate_bytes = 15;
+  uint64 move_retention_cap = 16;
+  uint32 max_move_followers = 17;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -748,6 +795,17 @@ message LocalPartition {
   // D332: the partition file's size here, from the file system (the database is one file,
   // WAL included), for the balancer. Open partitions only; 0 when closed.
   uint64 file_bytes = 32;
+  // D331 PR 6: on a partition the map places no range on (a merge emptied it), what still
+  // holds it in the map, the first of: a moved-away row not yet pruned (its feed tail), a
+  // decision row not yet collectable (its transaction outcomes), a live spanning session
+  // homed on it, an in-doubt share of it. Empty when it may be removed, and on every
+  // partition that holds a range. Free text, not a parsing contract.
+  string drop_waits = 33;
+  // D331 PR 5: its device bytes written per second, the same average as `load_device`
+  // (writes only, flushes and compactions included: an over-estimate of what a range move's
+  // change-feed hold keeps), for a move's plan. Absent until the first interval ends (or
+  // from an older node): unknown. 0 is an idle partition.
+  optional uint64 write_bytes_rate = 34;
 }
 
 // A share held in doubt (D329).

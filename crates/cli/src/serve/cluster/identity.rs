@@ -108,6 +108,112 @@ fn put(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
     Ok(())
 }
 
+/// A split's mark on the partition file it created (D331 PR 5, audit120's four points):
+/// the move that created it, and the map version that move's COPYING change carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitMark {
+    pub move_id: String,
+    pub version: u64,
+}
+
+const MARK_MOVE: &[u8] = b"split_move";
+const MARK_VERSION: &[u8] = b"split_version";
+
+/// `db`'s split mark, if a split's create made it and the mark wasn't cleared.
+pub(crate) fn split_mark(db: &Pigeonhole) -> Result<Option<SplitMark>, String> {
+    let table = match db.table(TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(None),
+        Err(e) => return Err(format!("read {TABLE}: {e}")),
+    };
+    let cell = |q: &[u8]| -> Result<Option<String>, String> {
+        table
+            .get(ROW, FAMILY, q)
+            .map_err(|e| format!("read {TABLE}: {e}"))?
+            .map(|c| {
+                String::from_utf8(c.value().to_vec())
+                    .map_err(|_| format!("{TABLE}'s split mark isn't UTF-8"))
+            })
+            .transpose()
+    };
+    let (Some(move_id), Some(version)) = (cell(MARK_MOVE)?, cell(MARK_VERSION)?) else {
+        return Ok(None);
+    };
+    Ok(Some(SplitMark {
+        move_id,
+        version: version
+            .parse()
+            .map_err(|_| format!("{TABLE}'s split version {version:?} isn't a number"))?,
+    }))
+}
+
+/// Writes `mark` on `db`, whose identity row is there.
+pub(crate) fn set_split_mark(db: &Pigeonhole, mark: &SplitMark) -> Result<(), String> {
+    let table = db
+        .table(TABLE)
+        .and_then(|t| t.open())
+        .map_err(|e| format!("{TABLE}: {e}"))?;
+    let version = mark.version.to_string();
+    table
+        .mutate(ROW)
+        .put(FAMILY, MARK_MOVE, mark.move_id.as_bytes())
+        .put(FAMILY, MARK_VERSION, version.as_bytes())
+        .commit()
+        .map(drop)
+        .map_err(|e| format!("write {TABLE}: {e}"))
+}
+
+/// Clears `db`'s split mark: its split finished, and the partition is like any other.
+pub(crate) fn clear_split_mark(db: &Pigeonhole) -> Result<(), String> {
+    let table = db
+        .table(TABLE)
+        .and_then(|t| t.open())
+        .map_err(|e| format!("{TABLE}: {e}"))?;
+    table
+        .mutate(ROW)
+        .delete_column(FAMILY, MARK_MOVE)
+        .delete_column(FAMILY, MARK_VERSION)
+        .commit()
+        .map(drop)
+        .map_err(|e| format!("write {TABLE}: {e}"))
+}
+
+/// Whether `db` holds no row outside the reserved tables (`__phdb_*`): what a split's
+/// create made, or what its abort's drop left.
+pub(crate) fn holds_no_rows(db: &Pigeonhole) -> Result<bool, String> {
+    for name in db.tables() {
+        if name.starts_with("__phdb") {
+            continue;
+        }
+        let table = db
+            .table(&name)
+            .and_then(|t| t.open())
+            .map_err(|e| format!("open {name}: {e}"))?;
+        let mut rows = table
+            .scan_prefix(b"")
+            .iter()
+            .map_err(|e| format!("scan {name}: {e}"))?;
+        if rows
+            .next_ref()
+            .map_err(|e| format!("scan {name}: {e}"))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The split mark of the closed partition file at `path` (D331 PR 6: Status's line for a
+/// file the map doesn't list).
+pub(crate) fn split_mark_file(path: &Path) -> Result<Option<SplitMark>, String> {
+    let db = Pigeonhole::open(path, Options::default().read_only(true))
+        .map_err(|e| format!("open: {e}"))?;
+    let mark = split_mark(&db);
+    let _ = db.close();
+    mark
+}
+
 /// The identity of the partition file at `path`, read through a read-only open: no partition
 /// is open while ticket 1's node runs. Once ticket 2's node holds its partitions open for
 /// writing, `Status` reads the identity from the open handle ([`read`]) instead, rather than

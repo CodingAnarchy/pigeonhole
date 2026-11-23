@@ -34,9 +34,9 @@ use crate::serve::ranges::{self, Moved};
 
 /// The move `map` hands `partition` over in as its source, from HANDED_OVER on, if any.
 pub(super) fn handing_over<'m>(map: &'m ClusterMap, partition: &str) -> Option<&'m RangeMove> {
-    map.moves.iter().find(|m| {
-        !map::node_move(m) && m.from == partition && map::phase(m) >= MovePhase::HandedOver
-    })
+    map.moves
+        .iter()
+        .find(|m| !map::node_move(m) && m.from == partition && map::committed(map::phase(m)))
 }
 
 /// `db`'s D310 feed token now for a feed of `table` (D331 PR 3b's `t_from`), `None` when
@@ -92,6 +92,12 @@ pub(super) fn finish_hand_over(
             at_ms: now_ms(),
             // PR 3b: a cluster component of a table moved away whole reads up to here.
             final_seqno: m.final_seqno,
+            // PR 5: the prune's retention test resumes from it (past `final_seqno`). A table
+            // not in the file has no history here to keep: none.
+            token: match db.table(&m.table).and_then(|b| b.open()) {
+                Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => Vec::new(),
+                _ => hand_over_token(db, &m.table)?.unwrap_or_default(),
+            },
             ..Default::default()
         };
         ranges::write_moved(db, &row)?;
@@ -133,7 +139,13 @@ impl Node {
         gate.ranges()
             .load_rows(ranges::read_moved(db)?, ranges::read_serving(db)?);
         let raised = match self.get_map() {
-            Ok(map) => self.settle(gate, id, db, &map)?,
+            Ok(map) => {
+                // D331 PR 5: its drop rows (an abort's reconcile, a cleanup) before it serves.
+                if let Some(drops) = self.range_drops() {
+                    drops.write_rows(&map, id, db)?;
+                }
+                self.settle(gate, id, db, &map)?
+            }
             Err(_) => false,
         };
         join();
@@ -141,7 +153,43 @@ impl Node {
         if raised {
             self.ask_after_raise();
         }
+        // D331 PR 5: a fence it holds as a move's source reports its seqno, and its drops
+        // run (their rows written above, before it served).
+        if let (Some(shared), Ok(map), Some((gate, _))) = (
+            self.server.get().and_then(|o| o.shared.upgrade()),
+            self.get_map(),
+            self.fences.gate(id),
+        ) && let Some(cluster) = shared.router.cluster.as_ref()
+        {
+            cluster
+                .range_fences
+                .sync(&self.me, &map, id, &gate, db, shared.limits.request_timeout);
+            cluster
+                .range_drops
+                .start(db, Some(&cluster.range_follows))?;
+        }
         Ok(())
+    }
+
+    /// The range moves' drops this node's partitions run (D331 PR 5), once it serves.
+    pub(super) fn range_drops(&self) -> Option<std::sync::Arc<super::range_drop::Drops>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        shared
+            .router
+            .cluster
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.range_drops))
+    }
+
+    /// The range moves' fences this node's partitions hold as their source (D331 PR 5), once
+    /// it serves.
+    pub(super) fn range_fences(&self) -> Option<std::sync::Arc<super::range_fence::Fences>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        shared
+            .router
+            .cluster
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.range_fences))
     }
 
     /// The range copies this node serves as a source (D331 PR 4b), once it serves.
@@ -164,7 +212,25 @@ impl Node {
         let (Some(cluster), Ok(map)) = (shared.router.cluster.as_ref(), self.get_map()) else {
             return;
         };
+        // D331 PR 5: the drops a restart owes (a target down when its move aborted, a
+        // cleanup cut short), their rows before the followers start (cli692's Must 4).
+        let parts: Vec<_> = cluster
+            .parts
+            .load()
+            .iter()
+            .filter_map(|(id, service)| Some((id.clone(), service.part().ok()?.db.clone())))
+            .collect();
+        for (id, db) in &parts {
+            if let Err(e) = cluster.range_drops.write_rows(&map, id, db) {
+                eprintln!("phdb serve: partition {id} couldn't record its range drops: {e}");
+            }
+        }
         cluster.range_follows.sync(&map, &self.id, &shared);
+        for (id, db) in &parts {
+            if let Err(e) = cluster.range_drops.start(db, Some(&cluster.range_follows)) {
+                eprintln!("phdb serve: partition {id} couldn't start its range drops: {e}");
+            }
+        }
     }
 
     /// The range moves this node follows as a target (D331 PR 4b), once it serves.
@@ -189,13 +255,45 @@ impl Node {
         // D331 PR 4b: copies this node no longer serves as their source let go, and the
         // moves it follows as their target start or stop (M2).
         cluster.range_copies.release_gone(map, &self.id);
+        // D331 PR 5: the drop rows the map calls for, before the followers take it (a new
+        // move's follower sees an overlapping drop's row: cli692's Must 4).
+        for (id, service) in cluster.parts.load().iter() {
+            let Ok(part) = service.part() else {
+                continue;
+            };
+            if let Err(e) = cluster.range_drops.write_rows(map, id, &part.db) {
+                eprintln!(
+                    "phdb serve: partition {id} couldn't record map version {}'s range drops: \
+                     {e}; the next map or its next open does",
+                    map.map_version
+                );
+            }
+        }
         cluster.range_follows.sync(map, &self.id, &shared);
+        cluster.range_fences.forget_gone(map);
         let mut raised = false;
         for (id, service) in cluster.parts.load().iter() {
             let (Some((gate, _)), Ok(part)) = (self.fences.gate(id), service.part()) else {
                 continue;
             };
-            match self.settle(&gate, id, &part.db, map) {
+            let settled = self.settle(&gate, id, &part.db, map);
+            // D331 PR 5: its fences as a move's source report their seqnos.
+            cluster.range_fences.sync(
+                &self.me,
+                map,
+                id,
+                &gate,
+                &part.db,
+                shared.limits.request_timeout,
+            );
+            // And its drops run, after the followers stopped (a target's joins its own).
+            if let Err(e) = cluster
+                .range_drops
+                .start(&part.db, Some(&cluster.range_follows))
+            {
+                eprintln!("phdb serve: partition {id} couldn't start its range drops: {e}");
+            }
+            match settled {
                 Ok(up) => raised |= up,
                 Err(e) => eprintln!(
                     "phdb serve: partition {id} couldn't take map version {}'s range moves: \
@@ -273,7 +371,7 @@ impl Node {
         for m in map.moves.iter().filter(|m| {
             !map::node_move(m)
                 && m.to == id
-                && map::phase(m) >= MovePhase::Cleaning
+                && map::target_serves(map::phase(m))
                 && !gate.ranges().has_serving(&m.id)
         }) {
             let (start, end) = map::move_range(m)?;
@@ -527,5 +625,36 @@ fn delete_silently(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::proto::MoveKind;
+
+    // D331 PR 5: an aborting move is before its commit point, so its source never runs its
+    // hand-over (ABORTING is above HANDED_OVER in number, out of the phases' order).
+    #[test]
+    fn an_aborting_moves_source_hands_nothing_over() {
+        let at = |phase: MovePhase| {
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "users".into(),
+                from: "p1".into(),
+                to: "p2".into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            ClusterMap {
+                moves: vec![r],
+                ..Default::default()
+            }
+        };
+        assert!(handing_over(&at(MovePhase::Aborting), "p1").is_none());
+        assert!(handing_over(&at(MovePhase::HandingOver), "p1").is_none());
+        assert!(handing_over(&at(MovePhase::HandedOver), "p1").is_some());
+        assert!(handing_over(&at(MovePhase::Cleaning), "p1").is_some());
     }
 }

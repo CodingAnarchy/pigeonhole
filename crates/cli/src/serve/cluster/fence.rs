@@ -630,6 +630,16 @@ impl Node {
         Ok(())
     }
 
+    /// Drops `id` from the operator's fences (and `fenced.json`) if it's there: its files are
+    /// gone, so the fence was another partition's of that name. The caller holds `changing`.
+    pub(super) async fn forget_operator_fence(&self, id: &str) -> Result<(), ApiError> {
+        let mut fenced = self.fences.operator().clone();
+        if fenced.remove(id) {
+            self.persist_fences(fenced).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
         let dir = self.dir.clone();
         let written = fenced.clone();
@@ -826,11 +836,16 @@ impl Node {
     /// the push timeout. Counts each partition's grants into `round`.
     async fn ask_leases(self: &Arc<Self>, round: &mut Round, holding: &[(String, String)]) {
         let mut parts = self.fences.askable(&round.map, &self.id);
-        // With failover on, each part carries the partition's in-doubt shares, so a writer
-        // that fails it over can name them (D330 PR 2's F7).
-        if round.map.failover {
-            for p in &mut parts {
-                (p.in_doubt_xids, p.in_doubt_count) = self.in_doubt_of(&p.partition);
+        // Every part carries the partition's in-doubt count: the balancer never moves a
+        // partition with shares in doubt (D332) and reads the count from these renewals, so
+        // a grant from before it was switched on must have it too (audit120's M1 on 1.3.0,
+        // simp724 on #2127). With failover on, the shares' ids too, so a writer that fails
+        // it over can name them (D330 PR 2's F7).
+        for p in &mut parts {
+            let (xids, count) = self.in_doubt_of(&p.partition);
+            p.in_doubt_count = count;
+            if round.map.failover {
+                p.in_doubt_xids = xids;
             }
         }
         // The writer lease (D330): the map's writer asks for it at the map's term; a
@@ -1195,8 +1210,10 @@ impl Node {
     /// One loop per node, started once its partitions are open; it holds the node only
     /// while a round runs, and ends once the node is gone.
     pub(crate) fn renew_leases(self: &Arc<Self>) {
-        // The node's device ceiling's readings start with its lease renewals (D332).
+        // The node's device ceiling's readings start with its lease renewals (D332), and so
+        // does its range rows' pruning (D331 PR 5).
         self.watch_device();
+        self.watch_range_prunes();
         if self
             .fences
             .retrying

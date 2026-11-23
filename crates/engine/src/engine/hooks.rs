@@ -275,6 +275,11 @@ pub(crate) struct Hooks {
     /// `Engine::park_finished_flushes`), and their wakers.
     pub flush_done_park: AtomicBool,
     pub flush_done_parked: Mutex<Vec<TaskWaker>>,
+    /// Holds each flush task after its SSTs and barrier, before it submits its manifest
+    /// commit (`flush::FlushTask`'s `run_stages`, `Engine::hold_flush_commits`), and the held
+    /// tasks' wakers.
+    pub flush_commit_hold: AtomicBool,
+    pub flush_commit_held: Mutex<Vec<TaskWaker>>,
     /// Holds each compaction job before its first slice (`Engine::hold_compactions`), and
     /// the held jobs' ids and wakers, oldest first (`Engine::release_held_compaction` takes
     /// one to let it run; clearing the hold takes them all).
@@ -1627,6 +1632,39 @@ impl Engine {
             .shared
             .hooks
             .flush_done_parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// While `hold` is set, a flush task that wrote its SSTs and passed its barrier waits
+    /// before it submits its manifest commit; clearing it lets them all commit (test hook,
+    /// D331: a range drop between a flush's memtable and its commit).
+    #[doc(hidden)]
+    pub fn hold_flush_commits(&self, hold: bool) {
+        let hooks = &self.inner.shared.hooks;
+        hooks.flush_commit_hold.store(hold, Ordering::Release);
+        if !hold {
+            let held = std::mem::take(
+                &mut *hooks
+                    .flush_commit_held
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            for w in held {
+                w.wake();
+            }
+        }
+    }
+
+    /// How many flush tasks [`hold_flush_commits`](Self::hold_flush_commits) holds (test
+    /// hook).
+    #[doc(hidden)]
+    pub fn held_flush_commits(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .flush_commit_held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()

@@ -26,22 +26,12 @@
 //!   The server compares tokens only for equality (has the position moved), never orders
 //!   them.
 
-mod events;
-pub(crate) use events::*;
-mod client;
-pub(crate) use client::*;
-mod hub;
-pub(crate) use hub::*;
-mod entry;
-pub(crate) use entry::*;
-mod tracker;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-pub(crate) use tracker::*;
 
 use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;
@@ -54,6 +44,18 @@ use super::lease::DeliveryLease;
 use super::convert;
 use super::errors::ApiError;
 use super::proto;
+
+mod client;
+mod entry;
+mod events;
+mod hub;
+mod tracker;
+
+pub(crate) use client::*;
+pub(crate) use entry::*;
+pub(crate) use events::*;
+pub(crate) use hub::*;
+pub(crate) use tracker::*;
 
 /// The feed fan-out's limits.
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +150,10 @@ pub(crate) struct Spec {
     /// start up to this seqno are passed over, as already handled, at most [`SKIP_LIMIT`] of
     /// them that would have been sent; 0: none.
     pub skip: u64,
+    /// Commits at or below this seqno are passed over as if before the start, however many
+    /// (D331 PR 5: a cluster component from the oldest position starts no lower than its
+    /// partition's pruned range-move watermarks); 0: none.
+    pub floor: u64,
     /// Send the start's position as a first progress event, before any commit: a cluster
     /// subscription's part (D317 ticket 7) then knows where it is from the start, so it can
     /// resume after a break that came before any event, with nothing skipped.
@@ -622,7 +628,8 @@ impl Feeds {
             Start::Now if spec.visible => self.db.snapshot()?.seqno(),
             Start::Now => self.db.durable_snapshot()?.seqno(),
             _ => 0,
-        };
+        }
+        .max(spec.floor);
         let spec_announce = spec.announce;
         let (sink, events, end_tx) = Sink::new(&self.limits);
         let tracker = Arc::new(Tracker::default());

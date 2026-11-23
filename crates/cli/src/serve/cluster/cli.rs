@@ -219,10 +219,10 @@ pub(crate) enum ClusterCommand {
         partition: String,
         #[command(flatten)]
         node: NodeArgs,
-        /// Lift a fence the peers don't confirm (a majority of the map's nodes must hold the
-        /// newest map, naming this node): only when they can't answer and you know the
-        /// partition hasn't moved. A newer map may have given it to another node, and then
-        /// both would take writes.
+        /// Lift the operator's fence without asking the peers (a majority of the map's nodes
+        /// must otherwise hold the newest map, naming this node): only when they can't
+        /// answer and you know the partition hasn't moved. It never makes the partition
+        /// serve without a lease, which still takes a majority of the map's nodes (D326).
         #[arg(long)]
         force: bool,
     },
@@ -310,11 +310,118 @@ pub(crate) enum ClusterCommand {
         /// files aside there (`drop-partition`: nothing is deleted).
         #[arg(long)]
         drop_source: bool,
-        /// Give up a wait for a node after SECS (at least 1): OLD hashing the closed files, or `--to`
-        /// serving the partition once the map gives it to it. The error names the step and
+        /// Give up a wait after SECS (at least 1): OLD hashing the closed files, a majority
+        /// of the nodes taking the new map, or `--to` serving the partition once the map
+        /// gives it to it. The error names the step and
         /// the node's last `status` line for the partition. It bounds each wait, not the
         /// copy, which takes as long as the files do. A wait asks the node every 200 ms.
         /// Without it, a wait goes on as long as it takes, saying every 10 s what it waits for.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
+    /// Move a key range of a table from partition `--from` to partition `--to` while both
+    /// serve (D331): the target copies the range, catches up on the source's writes, then the
+    /// source fences the range's writes for about as long as the target needs to apply the
+    /// last of them, and the map gives the range to the target. Prints each phase. Run it
+    /// again to go on after a stop; `--abort ID` ends a move before its commit point. The
+    /// range must lie inside one range of the table that `--from` holds.
+    MoveRange {
+        /// The table whose range moves.
+        #[arg(required_unless_present_any = ["abort", "resume"])]
+        table: Option<String>,
+        /// The partition holding the range.
+        #[arg(long, value_name = "ID", required_unless_present_any = ["abort", "resume"])]
+        from: Option<String>,
+        /// The partition it moves to.
+        #[arg(long, value_name = "ID", required_unless_present_any = ["abort", "resume"])]
+        to: Option<String>,
+        /// The range's first key (text); without it, the start of `--from`'s range.
+        #[arg(long, value_name = "KEY")]
+        start: Option<String>,
+        /// The key just past the range (text); without it, the end of `--from`'s range.
+        #[arg(long, value_name = "KEY")]
+        end: Option<String>,
+        /// End move ID (a split's too) before its commit point: the target drops what it
+        /// copied, and the source serves the range as before. Refused once the map gives the
+        /// range to the target: run the move again to finish it.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["table", "from", "to", "start", "end"]
+        )]
+        abort: Option<String>,
+        /// Go on with move ID (a split's too, or the balancer's) from the phase the map
+        /// records it at, to its end: for a move whose command stopped, by its id alone.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["table", "from", "to", "start", "end", "abort"]
+        )]
+        resume: Option<String>,
+        /// Start the move though its plan says the copy would outrun the source's
+        /// `--move-retention-cap`. The plan reckons with the source's whole file, since
+        /// nothing reports one range's bytes: a small range in a big partition fits anyway.
+        #[arg(long, conflicts_with_all = ["abort", "resume"])]
+        skip_fit_check: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Give up waiting for the move after SECS (at least 1): the error names the phase
+        /// and what it waited for. The move stays where the map records it: run it again, or
+        /// abort it. Without it, the move runs to its end, saying every 10 s what it waits for.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
+    /// Split partition `--from`'s range of TABLE at `--key` (D331 PR 5): the keys from
+    /// `--key` to that range's end move into a new, empty partition on node `--to`, as
+    /// `move-range` moves a range, under writes. The new partition is created on `--to`
+    /// first, then the map adds it. Run it again to go on after a stop; `phdb cluster
+    /// move-range --abort ID` ends it before its commit point, and the new partition goes.
+    Split {
+        /// The table whose range splits.
+        table: String,
+        /// The partition holding the range.
+        #[arg(long, value_name = "ID")]
+        from: String,
+        /// The first key (text) the new partition holds: inside `--from`'s range, not at
+        /// its start.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        /// The node id the new partition is created on.
+        #[arg(long, value_name = "ID")]
+        to: String,
+        /// The new partition's id: by default `<from>-<v>`, v the map version of the change
+        /// that records the split. Refused if taken or not a partition id: give one here.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+        /// Start the split though its plan says the copy would outrun the source's
+        /// `--move-retention-cap`, as `move-range`'s.
+        #[arg(long)]
+        skip_fit_check: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Give up waiting for the split after SECS (at least 1), as `move-range`'s.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
+    /// Merge partition S into partition `--into` (D331 PR 6): each of S's ranges moves into
+    /// it as `move-range` moves a range, under writes, one after another; then S leaves the
+    /// map and its files move aside on its nodes. An emptied S stays listed while it still
+    /// serves its change feed's tail or its transaction outcomes (its node's status says
+    /// what it waits for): the merge then ends saying so, and a later run removes it. Run it
+    /// again to go on after a stop, from whatever the map holds.
+    Merge {
+        /// The partition merged away.
+        partition: String,
+        /// The partition its ranges move into.
+        #[arg(long, value_name = "ID")]
+        into: String,
+        /// Start though the plan says the copy would outrun S's `--move-retention-cap`, as
+        /// `move-range`'s (S's whole file is the merge's exact size).
+        #[arg(long)]
+        skip_fit_check: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Give up waiting for a range move after SECS (at least 1), as `move-range`'s.
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
@@ -454,6 +561,85 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             *drop_source,
             timeout.map(Duration::from_secs),
         )),
+        ClusterCommand::MoveRange {
+            abort: Some(id),
+            node,
+            timeout,
+            ..
+        } => runtime()?.block_on(super::range_move::abort(
+            node,
+            id,
+            timeout.map(Duration::from_secs),
+        )),
+        ClusterCommand::MoveRange {
+            resume: Some(id),
+            node,
+            timeout,
+            ..
+        } => runtime()?.block_on(async {
+            super::range_move::resume(node, id, timeout.map(Duration::from_secs)).await?;
+            Ok(report(
+                "cluster move-range",
+                vec![("move", id.clone().into())],
+                serde_json::json!({}),
+            ))
+        }),
+        ClusterCommand::MoveRange {
+            table,
+            from,
+            to,
+            start,
+            end,
+            skip_fit_check,
+            node,
+            timeout,
+            ..
+        } => runtime()?.block_on(super::range_move::run(
+            node,
+            &super::range_move::Spec {
+                table: table.clone().unwrap_or_default(),
+                from: from.clone().unwrap_or_default(),
+                to: to.clone().unwrap_or_default(),
+                start: start.as_ref().map(|s| s.as_bytes().to_vec()),
+                end: end.as_ref().map(|s| s.as_bytes().to_vec()),
+            },
+            timeout.map(Duration::from_secs),
+            !skip_fit_check,
+        )),
+        ClusterCommand::Split {
+            table,
+            from,
+            key,
+            to,
+            id,
+            skip_fit_check,
+            node,
+            timeout,
+        } => runtime()?.block_on(super::range_move::split(
+            node,
+            &super::range_move::SplitSpec {
+                table: table.clone(),
+                from: from.clone(),
+                key: key.as_bytes().to_vec(),
+                node: to.clone(),
+                id: id.clone(),
+            },
+            timeout.map(Duration::from_secs),
+            !skip_fit_check,
+        )),
+        ClusterCommand::Merge {
+            partition,
+            into,
+            skip_fit_check,
+            node,
+            timeout,
+        } => runtime()?.block_on(super::range_merge::run(
+            node,
+            partition,
+            into,
+            timeout.map(Duration::from_secs),
+            !skip_fit_check,
+        )),
         ClusterCommand::DropPartition { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Drop))
         }
@@ -487,7 +673,8 @@ pub(crate) enum TxnCommand {
     /// Decide a transaction's share held in doubt on partition `--partition`, on the node
     /// that serves it (`--node`), for a transaction whose home will never settle it. Refused
     /// while the home can (it answers committed, aborted or in progress) unless `--force`,
-    /// which can break the transaction's atomicity; a home that answers unknown can't.
+    /// which can break the transaction's atomicity; a home that answers unknown or not
+    /// found (its record's retention has passed) can't.
     /// Answers the partition's line.
     Decide {
         /// The transaction's id (as `phdb cluster status` lists it).
@@ -843,6 +1030,9 @@ pub(super) async fn relocate_as(
                 restore_from_cluster_id: String::new(),
                 promote: false,
                 replica_epoch: 0,
+                create: false,
+                create_move: String::new(),
+                create_version: 0,
             },
             new_token.as_deref(),
         )?)
