@@ -3763,6 +3763,12 @@ fn an_emptied_sources_stopped_removal_doesnt_halt_the_balancer() {
             st.starts_with("skip:") && st.contains("the removal of p1, merged away, stopped")
         })
         .await;
+        // Paused, `state` still names the stop (audit120's nit on #2137).
+        balancer_mode(&t, crate::serve::proto::BalancerMode::Paused).await;
+        balancer_until(a, Duration::from_secs(30), |st| {
+            st.starts_with("paused; ") && st.contains("the removal of p1, merged away, stopped")
+        })
+        .await;
         // Still listed: nothing removed it past the operator's fence.
         assert!(
             map_of_as(a, None)

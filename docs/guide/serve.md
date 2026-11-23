@@ -1227,7 +1227,7 @@ Set them in the map's `balance` with `set-map`. Each field left at 0 takes its d
 #### Seeing it
 - **`phdb cluster balancer status --node URL`** shows:
   - the mode and the writer;
-  - `state`: the writer's last decision and why. Examples: "skip: within bounds", "skip: node a is over its bound, but no partition on it can move within the bounds", "moving p3 from a to c (bal-…): node a is at 1.43x the mean size", "skip: p3's best split leaves 91% on one side: a hot key or a narrow hot range, unsplittable", "paused", "waiting: move … is in flight";
+  - `state`: the writer's last decision and why. Examples: "skip: within bounds", "skip: node a is over its bound, but no partition on it can move within the bounds", "moving p3 from a to c (bal-…): node a is at 1.43x the mean size", "skip: p3's best split leaves 91% on one side: a hot key or a narrow hot range, unsplittable", "paused" (followed, like a skip, by any emptied partition's removal that waits or stopped), "waiting: move … is in flight";
   - the pinned partitions, and whether the balancer or an operator pinned each;
   - the bounds in force;
   - the last 32 events: each move, split and merge, the balancer's pins and their expiry, and each abort, with its partition, nodes, reason and time (and a split's table and key).
