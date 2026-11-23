@@ -706,11 +706,15 @@ pub(crate) fn handed_over(
             cuts.push((pt, key, if moved { to.to_owned() } else { p.to_owned() }));
         }
     }
-    // Neighbours left on one partition are one range (D331 Amendment 3, PR 6): a range moved
-    // next to its target's own, as each range of a merge is, drops the split key between
-    // them, so merges don't leave the table layer longer. Nothing keys on those split keys:
-    // a move's gates and moved-away rows use its record's `[start, end)` (ai1249).
-    cuts.dedup_by(|later, earlier| later.2 == earlier.2);
+    // Neighbours left on one partition at the moved range's ends are one range (D331
+    // Amendment 3, PR 6): a range moved next to its target's own, as each range of a merge
+    // is, drops the split key between them, so merges don't leave the table layer longer.
+    // Only at `start` and `end`: a same-partition pre-split elsewhere in the table stays
+    // (ai1249's S3 on #2131). Nothing keys on those split keys: a move's gates and
+    // moved-away rows use its record's `[start, end)` (ai1249).
+    cuts.dedup_by(|later, earlier| {
+        later.2 == earlier.2 && (later.0 == start || end.is_some_and(|e| later.0 == e))
+    });
     let mut out = t.clone();
     out.splits = cuts
         .iter()
@@ -2146,6 +2150,18 @@ mod tests {
         let h = handed_over(t, b"m", None, "p1");
         assert!(keys(&h).is_empty(), "{:?}", keys(&h));
         assert_eq!(h.partitions, ["p1"]);
+        // Only at the moved range's ends (ai1249's S3 on #2131): p1's own pre-split at c
+        // stays, though both its sides are p1's.
+        let mut pre = t.clone();
+        pre.splits = vec![
+            canonical_key(b"c"),
+            canonical_key(b"m"),
+            canonical_key(b"t"),
+        ];
+        pre.partitions = ["p1", "p1", "p2", "p3"].map(String::from).to_vec();
+        let h = handed_over(&pre, b"t", None, "p2");
+        assert_eq!(keys(&h), [b"c".to_vec(), b"m".to_vec()]);
+        assert_eq!(h.partitions, ["p1", "p1", "p2"]);
         // The table's own keys keep their form; new ones are canonical (cli692's N3).
         let mut raw_m = t.clone();
         raw_m.splits = vec![raw(b"m")];
