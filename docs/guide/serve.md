@@ -1352,6 +1352,33 @@ Both run on the map's writer, through its own map changes, and print each phase 
 **Change feeds:** a subscription to the table goes on across the move, in per-key order: it reads the range from `S` until the hand-over, then from `T`. A token from before a move's hand-over still resumes while the move's rows are kept. Once they're pruned, such a token answers `FeedExpired` on any copy of `S` or `T`: open the feed again. A subscription from the oldest position starts, on each of `S` and `T`, past a pruned move's history of the table there, so it never replays a range out of order.
 - **When a move's rows are pruned:** each node prunes its own partitions' rows, about once a minute. It prunes once the move has left the map, every node holds a map from after the hand-over, the transaction lifetime plus the request timeout have passed, and the partition's change-feed retention has passed the hand-over.
 
+### Merging partitions
+From 1.3.0 (D331), **`phdb cluster merge S --into T [--skip-fit-check] [--timeout SECS]`** merges partition `S` into partition `T` under writes, then removes `S`:
+1. **Each of `S`'s ranges moves into `T`,** one after another, as `move-range` moves a range: same phases, same fit check (here `S`'s whole file is the exact size), same refusals. A hand-over that leaves `T` with two neighbouring ranges of a table joins them into one.
+2. **Then `S` leaves the map** once nothing still needs it, and its files are moved aside into `.phdb-dropped/` on its node and on each replica node (never deleted).
+
+**Refused:** a partition that holds an index's placement or the agent memory store's (move it whole with `phdb cluster move`), and a table in a co-location group or one an index follows.
+
+**Run it again to go on.** There's no merge record: the map's ranges are the state. A rerun after a stop, a timeout or a crash resumes or aborts the range move it left (by its id), then moves whatever `S` still holds. A half-done merge is a valid map, so you can also leave it.
+
+**When `S` is emptied but stays listed.** `S` keeps serving, holding no range, while something still needs it. The merge then ends with `source: waiting` and says what. So does `phdb cluster status` (`drop_waits` on `S`'s partition on its node). In order:
+- **Its change feed's tail:** a subscriber's token from before a hand-over may still resume from `S`. `S`'s moved-away row for that move is pruned 24 hours after the hand-over, or sooner if `S`'s feed retention passes it. A resume after that answers `FeedExpired`: open the feed again.
+- **Transaction outcomes homed on `S`:** kept until every branch has acknowledged and `--txn-outcome-retention` has passed. A branch node that restarted before it acknowledged leaves the record for ever (#2098). Until `merge --force` (a follow-up, [#FORCE_ISSUE](https://github.com/CodingAnarchy/pigeonhole/issues/FORCE_ISSUE)), such an `S` stays listed.
+- **Spanning transactions homed on `S` still open:** bounded by `--txn-lifetime-ms`. An emptied `S` refuses a new commit point (`Conflict`, retry-safe).
+- **A share in doubt,** of `S`'s own or on any node with its home at `S`: its resolver settles it through `S`. For a share whose branch never acknowledged and whose node is gone, decide it with `phdb cluster txn decide`.
+
+Run the merge again later; it removes `S` once the list is empty.
+
+**The removal,** each step re-checked:
+- **Checks:** `S`'s owner copy must be serving under its lease at the map's epoch, with nothing waiting.
+- **Fence, then remove:** the merge fences `S` and checks again. The map change that removes `S` applies only if the map hasn't changed since the first read, so a failover between the two never removes a live `S`. On a changed map, the merge lifts its fence and starts again, up to 5 times.
+- **Then drop:** it closes `S` and drops its files on its node and each replica node.
+- **A stop that leaves `S` fenced** says so, naming the node and `phdb cluster unfence S --node URL`. The merge never lifts a fence it didn't just set: lift it, then run merge again.
+- **A stop after `S` left the map** leaves files the map doesn't have. `phdb cluster status` shows each as "the map has no such partition", on every node that holds one. A rerun of the merge finds and drops only those files, of this cluster and named `S`, never a split's new file, and prints each node and file.
+- **`drop-partition` is refused on a node the map lists as one of the partition's replicas.** The exception is the copy an unfinished promote left there, which failover's message tells you to drop.
+
+**Partition ids:** `S`'s id can be used again by a later partition. An old transaction id or feed token naming `S` gets a clean refusal from it, and never reads or decides the new partition's data.
+
 ## Performance
 These numbers are for `phdb serve` on one machine, serving a single database file and also as a one-node cluster. All rows use a fixed offered write rate. They show latency and feed delivery at that rate, not peak throughput.
 
