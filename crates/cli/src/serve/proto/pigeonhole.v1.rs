@@ -7906,6 +7906,12 @@ pub struct LocalPartition {
     /// WAL included), for the balancer. Open partitions only; 0 when closed.
     #[prost(uint64, tag = "32")]
     pub file_bytes: u64,
+    /// D331 PR 5: its device bytes written per second, the same average as `load_device`
+    /// (writes only, flushes and compactions included: an over-estimate of what a range move's
+    /// change-feed hold keeps), for a move's plan. Absent until the first interval ends (or
+    /// from an older node): unknown. 0 is an idle partition.
+    #[prost(uint64, optional, tag = "34")]
+    pub write_bytes_rate: ::core::option::Option<u64>,
 }
 /// A share held in doubt (D329).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

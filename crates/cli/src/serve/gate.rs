@@ -141,8 +141,10 @@ pub(crate) struct WriteGate {
     extensions: AtomicUsize,
     /// Range drains waiting, so a write's release wakes them.
     range_draining: AtomicUsize,
-    /// One range drain at a time: a second one's new generation would mix the first's.
-    range_drain: tokio::sync::Mutex<()>,
+    /// One range drain at a time: a second one's new generation would mix the first's. It
+    /// holds the slot a drain left undrained (its wait ended first): no generation starts
+    /// while it holds writes, since a third would share its slot (cli692's M2 on #2130).
+    range_drain: tokio::sync::Mutex<Option<usize>>,
     /// `OPERATOR`, set or clear.
     fence: AtomicU8,
     /// When the lease ends, on `clock`: 0 when the partition has held none since it opened
@@ -177,7 +179,7 @@ impl WriteGate {
             generation: AtomicUsize::new(0),
             extensions: AtomicUsize::new(0),
             range_draining: AtomicUsize::new(0),
-            range_drain: tokio::sync::Mutex::new(()),
+            range_drain: tokio::sync::Mutex::new(None),
             fence: AtomicU8::new(if operator { OPERATOR } else { OPEN }),
             lease_end: AtomicU64::new(0),
             leased_once: std::sync::atomic::AtomicBool::new(false),
@@ -380,25 +382,37 @@ impl WriteGate {
     /// once a range fence's state is in [`ranges`](Self::ranges): a new generation starts, and
     /// only the writes counted before it are waited for. Writes admitted from now go on (the
     /// fence refuses the range's own). `Err` with the count still running when `wait` ends
-    /// first.
+    /// first; the slot stays pending, and the next drain (a retry, or another move's) waits
+    /// it out before it starts a generation, so a write admitted before any fence is never
+    /// left behind (cli692's M2 on #2130).
     pub(crate) async fn drain_range_fence(&self, wait: Duration) -> Result<(), usize> {
         let deadline = tokio::time::Instant::now() + wait;
-        let _one = self.range_drain.lock().await;
+        let mut pending = self.range_drain.lock().await;
         // The state's store comes before the new generation (module docs).
         std::sync::atomic::fence(Ordering::SeqCst);
+        if let Some(slot) = *pending {
+            self.drain_slot(slot, deadline).await?;
+        }
         let old = self.generation.fetch_add(1, Ordering::SeqCst) & 1;
+        *pending = Some(old);
+        self.drain_slot(old, deadline).await?;
+        *pending = None;
+        Ok(())
+    }
+
+    /// Waits until `inflight[slot]` is 0, or `deadline` (`Err` with its count).
+    async fn drain_slot(&self, slot: usize, deadline: tokio::time::Instant) -> Result<(), usize> {
         self.range_draining.fetch_add(1, Ordering::SeqCst);
         let done = loop {
             let woken = self.drained.notified();
             tokio::pin!(woken);
             // Registered before the count is read, so a release in between wakes it.
             woken.as_mut().enable();
-            let n = self.inflight[old].load(Ordering::SeqCst);
-            if n == 0 {
+            if self.inflight[slot].load(Ordering::SeqCst) == 0 {
                 break Ok(());
             }
             if tokio::time::timeout_at(deadline, woken).await.is_err() {
-                break Err(self.inflight[old].load(Ordering::SeqCst));
+                break Err(self.inflight[slot].load(Ordering::SeqCst));
             }
         };
         self.range_draining.fetch_sub(1, Ordering::SeqCst);
@@ -713,6 +727,33 @@ mod tests {
         );
         drop(after);
         assert_eq!(g.drain_range_fence(Duration::from_millis(20)).await, Ok(()));
+    }
+
+    // cli692's M2 on #2130: a drain whose wait ends first leaves its slot pending. The retry
+    // (or another move's drain) waits on that same slot, never a new generation's, so the
+    // write admitted before the fence is waited for however often the fence retries, and
+    // writes admitted since don't stand in for it.
+    #[tokio::test]
+    async fn a_retried_range_drain_still_waits_for_the_write_admitted_before_the_fence() {
+        let g = open("p1");
+        let stuck = g.enter().unwrap();
+        let wait = Duration::from_millis(20);
+        assert_eq!(g.drain_range_fence(wait).await, Err(1));
+        // Admitted after the first drain began, and finished: not what the retry waits for.
+        drop(g.enter().unwrap());
+        for _ in 0..3 {
+            assert_eq!(
+                g.drain_range_fence(wait).await,
+                Err(1),
+                "a retry let the pre-fence write go"
+            );
+        }
+        let later = g.enter().unwrap();
+        drop(stuck);
+        // The pending slot drains; the retry's own generation then holds `later`.
+        assert_eq!(g.drain_range_fence(wait).await, Err(1));
+        drop(later);
+        assert_eq!(g.drain_range_fence(wait).await, Ok(()));
     }
 
     /// A write and a range drain racing: the drain waits for it, or it reads the state

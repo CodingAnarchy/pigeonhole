@@ -64,8 +64,8 @@ pub(super) struct Plan {
     pub bound: Bound,
     /// The copy's time at S's node's `--move-rate-bytes`.
     pub copy: Duration,
-    /// S's writes over the copy, which its change-feed hold keeps (its device bytes a
-    /// second, reads included: an over-estimate).
+    /// S's writes over the copy, which its change-feed hold keeps (its device bytes written
+    /// a second, flushes and compactions included: an over-estimate).
     pub retained: u64,
 }
 
@@ -92,8 +92,9 @@ pub(super) enum Skip {
 
 /// Step 0's plan for a move (or a split) out of partition `from` (design §1): pure. The copy
 /// time from `bytes` (else S's whole file) at S's node's `--move-rate-bytes`, and S's writes
-/// over it against `--move-retention-cap`; a `Busy` past `--max-move-followers`, counting
-/// the moves the map has copying from S's node.
+/// over it (`write_bytes_rate`: absent is unknown, 0 idle) against `--move-retention-cap`;
+/// a `Busy` past `--max-move-followers`, counting the moves the map has copying from S's
+/// node.
 pub(super) fn plan(
     m: &ClusterMap,
     statuses: &std::collections::HashMap<String, NodeStatus>,
@@ -135,8 +136,17 @@ pub(super) fn plan(
         Some(b) => (b, Bound::Estimate),
         None => (lp.file_bytes, Bound::WholePartition),
     };
-    let copy = Duration::from_secs_f64(bytes as f64 / st.move_rate_bytes as f64);
-    let retained = (lp.load_device * copy.as_secs_f64()) as u64;
+    let Some(writes) = lp.write_bytes_rate else {
+        return Err(Skip::Unknown(format!(
+            "node {node:?} doesn't report {from}'s write rate yet (its first load interval, \
+             or an older build)"
+        )));
+    };
+    // Capped: a size past a day's copy is refused anyway, and `from_secs_f64` must not
+    // overflow (cli692's nit).
+    let secs = (bytes as f64 / st.move_rate_bytes as f64).min(u32::MAX as f64);
+    let copy = Duration::from_secs_f64(secs);
+    let retained = (writes as f64 * secs) as u64;
     let cap = st.move_retention_cap;
     if cap > 0 && retained > cap {
         let of = match bound {
@@ -166,7 +176,21 @@ pub(super) fn plan(
 /// `--skip-fit-check`, which `fit: false` (the operator's) skips.
 async fn cli_plan(args: &NodeArgs, m: &ClusterMap, from: &str, fit: bool) -> Result<(), Failure> {
     let (node, address) = node_of(m, from)?;
-    let st = At::new(args, node, address).await?.status().await?;
+    let at = At::new(args, node, address).await?;
+    // S's write rate is reported once its first load interval ends (30 s at most, from its
+    // open): wait for it rather than refuse a move just after a start.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    let st = loop {
+        let st = at.status().await?;
+        let rated = st
+            .partitions
+            .iter()
+            .any(|lp| lp.id == from && lp.write_bytes_rate.is_some());
+        if rated || tokio::time::Instant::now() >= deadline {
+            break st;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     let statuses = [(node.to_owned(), st)].into();
     match plan(m, &statuses, from, None) {
         Ok(_) => Ok(()),
@@ -1326,7 +1350,7 @@ mod tests {
             let lp = LocalPartition {
                 id: "p1".into(),
                 file_bytes,
-                load_device: (10u64 << 20) as f64,
+                write_bytes_rate: Some(10 << 20),
                 ..Default::default()
             };
             let st = NodeStatus {
@@ -1380,6 +1404,17 @@ mod tests {
         let mut old = status(GIB, 2);
         old.get_mut("a").unwrap().move_rate_bytes = 0;
         assert!(matches!(plan(&m, &old, "p1", None), Err(Skip::Unknown(_))));
+        // cli692's M3: the write rate is bytes a second. Absent (its first interval, or an
+        // older node) is unknown; a present 0 is idle, and any size fits.
+        let mut unknown = status(GIB, 2);
+        unknown.get_mut("a").unwrap().partitions[0].write_bytes_rate = None;
+        assert!(matches!(
+            plan(&m, &unknown, "p1", None),
+            Err(Skip::Unknown(_))
+        ));
+        let mut idle = status(1000 * GIB, 2);
+        idle.get_mut("a").unwrap().partitions[0].write_bytes_rate = Some(0);
+        assert_eq!(plan(&m, &idle, "p1", None).map(|p| p.retained), Ok(0));
         assert!(matches!(
             plan(&m, &status(GIB, 2), "p7", None),
             Err(Skip::Unknown(_))
