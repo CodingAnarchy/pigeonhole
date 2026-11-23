@@ -28,8 +28,8 @@ pub(crate) fn split_key_bytes(k: &SplitKey) -> Result<Vec<u8>, Refusal> {
 }
 
 /// Whether `m` places anything on partition `p`: a range of a table, an index or the memory
-/// store (what `validate` keeps a partition for). D331 PR 6: a merge removes a partition
-/// only once it places nothing.
+/// store. One that places nothing is emptied: its moved-away rows go after
+/// [`super::range_prune::EMPTIED_GRACE`], and D331 PR 6's merge removes it.
 pub(crate) fn placed(m: &ClusterMap, p: &str) -> bool {
     m.tables.iter().any(|t| t.partitions.iter().any(|q| q == p))
         || m.indexes
