@@ -2066,9 +2066,6 @@ pub(super) mod tests {
         assert!(e.message.contains("\"p2\" has another history"), "{e:?}");
     }
 
-    /// D331 PR 3b: a resume starts each partition the map gave the subscription's tables
-    /// since the token at its hand-over (cli692's F1), and expires on one the token reads
-    /// that the subscription no longer covers.
     /// simp724's (2) on #2135, with feed1248's condition: a node still behind a resume
     /// token's map refuses it retry-safe while a node of the newest map it holds may hold
     /// that map (not asked yet, didn't answer, or its newer map didn't install), asks a node
@@ -2113,6 +2110,9 @@ pub(super) mod tests {
         assert_eq!(verdict(&abd, &d_short), "checks");
     }
 
+    /// D331 PR 3b: a resume starts each partition the map gave the subscription's tables
+    /// since the token at its hand-over (cli692's F1), and expires on one the token reads
+    /// that the subscription no longer covers.
     #[test]
     fn a_resume_starts_a_gained_partition_at_its_hand_over() {
         let token = ClusterToken {
