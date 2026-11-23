@@ -1,0 +1,2 @@
+### Added
+- **Range moves (D331): an emptied source's rows go after 24 hours.** A partition left holding no range, index or memory store takes no writes, so its byte-kept change-feed retention never passes its moves' rows. It now prunes each move's rows 24 hours after that move's hand-over (fixed; the serve guide names it), so a merge can remove it. A token that had read the partition up to a move's end still resumes after the prune and reads on from the target; one from before it, or one naming a partition a merge removed, answers `FeedExpired`.

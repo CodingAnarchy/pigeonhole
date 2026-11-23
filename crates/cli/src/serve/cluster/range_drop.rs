@@ -190,6 +190,8 @@ impl Drops {
             let (drops, db, follows) = (Arc::clone(self), db.clone(), follows.cloned());
             rt.spawn(async move {
                 let id = p.id.clone();
+                #[cfg(test)]
+                hold(&id).await;
                 match drops.run(&db, p, follows).await {
                     Ok(()) => {
                         drops.done().insert(id.clone());
@@ -338,4 +340,33 @@ pub(crate) fn pending_overlap(db: &Pigeonhole, m: &RangeMove) -> Result<Option<S
             && p.end.as_deref().is_none_or(|e| start.as_slice() < e)
     };
     Ok(read_pending(db)?.into_iter().find(overlaps).map(|p| p.id))
+}
+
+/// A hold seam (tests): the drop of the move named first, once, waits before it starts
+/// until the test releases it, after telling the test it got there, so a test can close
+/// the partition under a drop that hasn't run (main's Windows red on 0285e076f).
+#[cfg(test)]
+pub(crate) static HOLD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+
+/// One [`HOLD`]: the move id, then the reached and go signals.
+#[cfg(test)]
+pub(crate) type Held = (
+    String,
+    Arc<tokio::sync::Notify>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+async fn hold(id: &str) {
+    let held = {
+        let mut holds = HOLD.lock().unwrap_or_else(PoisonError::into_inner);
+        holds
+            .iter()
+            .position(|(m, _, _)| m == id)
+            .map(|i| holds.swap_remove(i))
+    };
+    if let Some((_, reached, go)) = held {
+        reached.notify_one();
+        let _ = go.await;
+    }
 }

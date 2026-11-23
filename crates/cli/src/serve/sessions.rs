@@ -732,6 +732,26 @@ impl Sessions {
             .count()
     }
 
+    /// D331 PR 6: the spanning transactions homed on this partition still open (their home
+    /// sessions, `--txn-lifetime-ms` bounds them): an emptied partition stays in the map
+    /// while any is.
+    pub(crate) fn live_homes(&self) -> usize {
+        let Some(p) = &self.partition else {
+            return 0;
+        };
+        let t = self.lock();
+        t.map
+            .values()
+            .filter(|e| {
+                matches!(e.state, State::Txn(_) | State::Committing)
+                    && e.xid
+                        .as_deref()
+                        .and_then(spanning_parts)
+                        .is_some_and(|(home, _, _)| home == p.as_str())
+            })
+            .count()
+    }
+
     pub(crate) fn stats(&self, now: Instant) -> Stats {
         let t = self.lock();
         let mut s = Stats::default();

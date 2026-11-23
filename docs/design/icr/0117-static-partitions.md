@@ -1091,7 +1091,7 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
   - the map no longer has its move;
   - every node of the map answers with a map at or after the hand-over's version;
   - the transaction lifetime plus the request timeout have passed since the partition recorded it;
-  - its feed retention has passed it.
+  - its feed retention has passed it, or, on a partition the map places nothing on (an emptied merge source), 24 h have passed since the partition recorded it (`range_prune::EMPTIED_GRACE`; the coordinator's ruling of 2026-11-23 on cli692's D331 PR 6 finding). Cluster partitions retain their feed by bytes, and an emptied one takes no writes, so its retention never passes.
 - **A target's serving row:**
   - its node's map no longer has the move (P1);
   - no older moved-away row on the partition overlaps it;
@@ -1107,6 +1107,7 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
 - **A resume below the watermark** of a component's table is `FeedExpired`, on the source and on the target alike, whatever rows of the table are live: another move's row doesn't cover the pruned range. This holds on every copy, whatever its retention (P2).
 - **A resume that gains a target through a move** (`from_hand_over`) starts at the earliest live serving row's hand-over. If the table has a served watermark there, an earlier move into the target was pruned, and that start would skip it. The target's seqnos can't be compared with the resume's position elsewhere, so it fails closed: `FeedExpired`. The expiry is permanent for that table on that partition, since the watermark never goes down. That includes one rare false case: the target served the table, moved all of it away, a token was taken, then a new move brought a range back. A resume from that token expires, though its start might have been rebuilt; it fails closed, never out of order.
 - **A component from the oldest position starts no lower than its tables' watermarks** on that partition, moved and served (`feed::Spec::floor`). Without it, a promoted copy with longer retention would replay a range's history from before a pruned partial move, whose barrier is gone, out of per-key order.
+- **A resume at or past the watermark on an emptied source** (feed1248's C1): under the 24 h grace, a token taken after the source's part read up to a move's last seqno, but before the part retired, outlives the row. Every table is then left out with nothing kept, and the component answers `MovedAway` at its open rather than `WrongPartition`, so the merge retires the part, as if it had read on to the move's end, instead of reopening it on the same partition.
 - **A start from now** isn't checked: nothing before it is read.
 
 **The source's table.** Once the last moved-away row of a table moved off whole goes, the schema reconcile drops the table there at the next map install.

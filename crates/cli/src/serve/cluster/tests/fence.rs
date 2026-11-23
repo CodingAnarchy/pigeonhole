@@ -3145,18 +3145,32 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
     use crate::serve::proto::BalancerEventKind;
     // simp724's S2 and audit120's M1 on #2103: every node has tokens, and the writer runs
     // its move with its cluster token alone, its map changes set in process. Node c weighs
-    // ten, so a is over its size bound: the balancer moves a's p1 to c. One MOVE event, p1's
-    // history, the record gone, p1 serving on c; nothing else moves within the dwell.
+    // ten, so a and b are over their size bounds: the balancer moves one of their
+    // partitions (p1 from a or p2 from b, whichever measures bigger) to c. One MOVE event,
+    // the partition's history, the record gone, it serving on c; nothing else moves within
+    // the dwell.
     let mut t = Rig::start_with(&balancer_tokens());
     let tok = Some(BALANCER_ADMIN);
     writer_leased_as(&mut t, tok);
     let [a, _, c] = t.ports;
     t.rt.block_on(async {
         balance_skewed(&t, tok).await;
-        let m = map_until(a, tok, Duration::from_secs(30), "p1 moved to c", |m| {
-            m.moves.is_empty() && m.partitions.iter().any(|p| p.id == "p1" && p.node == "c")
-        })
+        let on_c = |m: &crate::serve::proto::ClusterMap| {
+            m.partitions
+                .iter()
+                .find(|p| ["p1", "p2"].contains(&p.id.as_str()) && p.node == "c")
+                .map(|p| p.id.clone())
+        };
+        let m = map_until(
+            a,
+            tok,
+            Duration::from_secs(30),
+            "p1 or p2 moved to c",
+            |m| m.moves.is_empty() && on_c(m).is_some(),
+        )
         .await;
+        let moved = on_c(&m).unwrap();
+        let from = if moved == "p1" { "a" } else { "b" };
         let moves: Vec<_> = m
             .balancer_events
             .iter()
@@ -3169,12 +3183,12 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
                 moves[0].from.as_str(),
                 moves[0].to.as_str()
             ),
-            ("p1", "a", "c")
+            (moved.as_str(), from, "c")
         );
-        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
-        assert_eq!(p1.moves_history.len(), 1, "{p1:?}");
-        eventually_within(Duration::from_secs(10), "p1 to serve on c", async || {
-            local_as(c, "p1", tok).await.state() == LocalPartitionState::Serving
+        let p = m.partitions.iter().find(|p| p.id == moved).unwrap();
+        assert_eq!(p.moves_history.len(), 1, "{p:?}");
+        eventually_within(Duration::from_secs(10), "it to serve on c", async || {
+            local_as(c, &moved, tok).await.state() == LocalPartitionState::Serving
         })
         .await;
         // Within the dwell: no second move.
@@ -3321,10 +3335,12 @@ fn a_balancer_move_an_earlier_writer_left_past_its_commit_point_is_finished() {
 fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
     use crate::serve::proto::{BalancerEventKind, MovePhase};
     // simp724's M1 on #2103 (the plan's Amendment 2): the writer's lease bounds its
-    // balancer moves at every term, term 0 included. The balancer's move of p1 to c is held
-    // just before its stamp; a is cut off and its writer lease runs out; released, the move
-    // stamps c's copy but can't set its next map, so the record stays at COPYING and p1 on
-    // a. Joined again, the writer aborts it (it's before its commit point).
+    // balancer moves at every term, term 0 included. The balancer's move to c (of p1 from a
+    // or p2 from b: both are over their bound, and which goes first depends on their
+    // measured sizes) is held just before its stamp; the writer a is cut off and its writer
+    // lease runs out; released, the move stamps c's copy but can't set its next map, so the
+    // record stays at COPYING and the partition where it was. Joined again, the writer
+    // aborts it (it's before its commit point).
     use crate::serve::cluster::moving::HOLD_BEFORE_STAMP;
     let mut t = Rig::start();
     writer_leased(&mut t);
@@ -3354,8 +3370,16 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         )
         .await;
     });
-    let (id, from) = t.rt.block_on(async {
-        let (id, from, _) = bal_record(&map_of(a).await).expect("recorded");
+    let (id, from, home) = t.rt.block_on(async {
+        let m = map_of(a).await;
+        let (id, from, _) = bal_record(&m).expect("recorded");
+        // Where the moved partition was when the move was recorded.
+        let home = m
+            .partitions
+            .iter()
+            .find(|p| p.id == from)
+            .map(|p| p.node.clone())
+            .expect("the moved partition is listed");
         release_tx.send(()).expect("the move waits");
         // Passes enough for the move to try its next map, and the writer to try an abort.
         tokio::time::sleep(Duration::from_millis(2_000)).await;
@@ -3363,11 +3387,11 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         let (still, _, phase) = bal_record(&m).expect("still recorded");
         assert_eq!((still.as_str(), phase), (id.as_str(), MovePhase::Copying));
         assert!(
-            m.partitions.iter().any(|p| p.id == from && p.node == "a"),
+            m.partitions.iter().any(|p| p.id == from && p.node == home),
             "{:?}",
             m.partitions
         );
-        (id, from)
+        (id, from, home)
     });
     cut(&t, 0, false);
     t.rt.block_on(async {
@@ -3378,10 +3402,14 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
                     .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
         })
         .await;
+        let port = t.ports[["a", "b", "c"]
+            .iter()
+            .position(|n| *n == home)
+            .expect("a node of the rig")];
         eventually_within(
             Duration::from_secs(10),
-            "the partition to serve on a",
-            async || state(a, &from).await == LocalPartitionState::Serving,
+            "the partition to serve where it was",
+            async || state(port, &from).await == LocalPartitionState::Serving,
         )
         .await;
     });

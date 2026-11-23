@@ -403,6 +403,28 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// Merge partition S into partition `--into` (D331 PR 6): each of S's ranges moves into
+    /// it as `move-range` moves a range, under writes, one after another; then S leaves the
+    /// map and its files move aside on its nodes. An emptied S stays listed while it still
+    /// serves its change feed's tail or its transaction outcomes (its node's status says
+    /// what it waits for): the merge then ends saying so, and a later run removes it. Run it
+    /// again to go on after a stop, from whatever the map holds.
+    Merge {
+        /// The partition merged away.
+        partition: String,
+        /// The partition its ranges move into.
+        #[arg(long, value_name = "ID")]
+        into: String,
+        /// Start though the plan says the copy would outrun S's `--move-retention-cap`, as
+        /// `move-range`'s (S's whole file is the merge's exact size).
+        #[arg(long)]
+        skip_fit_check: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Give up waiting for a range move after SECS (at least 1), as `move-range`'s.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
     /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
     /// once the map no longer places it there and it isn't open (close it first). Nothing
     /// is deleted: delete that directory once the move is checked. It frees no space
@@ -602,6 +624,19 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 node: to.clone(),
                 id: id.clone(),
             },
+            timeout.map(Duration::from_secs),
+            !skip_fit_check,
+        )),
+        ClusterCommand::Merge {
+            partition,
+            into,
+            skip_fit_check,
+            node,
+            timeout,
+        } => runtime()?.block_on(super::range_merge::run(
+            node,
+            partition,
+            into,
             timeout.map(Duration::from_secs),
             !skip_fit_check,
         )),

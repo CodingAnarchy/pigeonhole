@@ -7906,6 +7906,13 @@ pub struct LocalPartition {
     /// WAL included), for the balancer. Open partitions only; 0 when closed.
     #[prost(uint64, tag = "32")]
     pub file_bytes: u64,
+    /// D331 PR 6: on a partition the map places no range on (a merge emptied it), what still
+    /// holds it in the map, the first of: a moved-away row not yet pruned (its feed tail), a
+    /// decision row not yet collectable (its transaction outcomes), a live spanning session
+    /// homed on it, an in-doubt share of it. Empty when it may be removed, and on every
+    /// partition that holds a range. Free text, not a parsing contract.
+    #[prost(string, tag = "33")]
+    pub drop_waits: ::prost::alloc::string::String,
     /// D331 PR 5: its device bytes written per second, the same average as `load_device`
     /// (writes only, flushes and compactions included: an over-estimate of what a range move's
     /// change-feed hold keeps), for a move's plan. Absent until the first interval ends (or
@@ -8835,8 +8842,6 @@ pub enum MoveKind {
     Partition = 2,
     /// D332: a whole partition relocated to another node (no table or range; `to` names the
     /// node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
-    ///
-    /// PR 6 (merge) adds MOVE_KIND_MERGE = 4.
     Node = 3,
 }
 impl MoveKind {
@@ -8881,9 +8886,6 @@ pub enum MovePhase {
     /// T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
     /// ended); S deletes its copy.
     Cleaning = 5,
-    /// PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
-    /// the merged-away source waits for its transaction outcomes before it's dropped. The
-    /// phases stay in order, so "from HANDED_OVER on" includes it.
     /// D331 PR 5: an abort under way, from COPYING, CATCHING_UP or HANDING_OVER: before the
     /// commit point and inactive. S serves the range as if no move named it (no fence), T
     /// serves none of it and drops what it copied, and a split's new partition goes once its

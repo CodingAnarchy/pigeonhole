@@ -568,6 +568,22 @@ impl Service {
                 ));
             }
         }
+        // D331 PR 6 (Amendment 4's MUST): no commit point on a home the map places nothing
+        // on (a merge emptied it), so no decision row is born there after. One already
+        // racing this is a live home session, which keeps the home listed (`drop_waits`)
+        // until it ends.
+        if driver
+            .node
+            .get_map()
+            .is_ok_and(|m| !super::super::cluster::map::placed(&m, &driver.home))
+        {
+            abort().await;
+            return Err(conflict(format!(
+                "partition {:?} holds no range now (a merge emptied it), so it is no \
+                 transaction's home: begin it again",
+                driver.home
+            )));
+        }
         // The commit point: the decision row read (absent: no abort marker) and written in
         // the home's own commit, through its gate, at GroupSync or stronger.
         let epoch = super::super::sessions::spanning_parts(&driver.xid).map_or(0, |(_, e, _)| e);
