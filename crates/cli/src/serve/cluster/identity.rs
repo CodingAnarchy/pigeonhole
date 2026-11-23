@@ -204,6 +204,16 @@ pub(crate) fn holds_no_rows(db: &Pigeonhole) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The split mark of the closed partition file at `path` (D331 PR 6: Status's line for a
+/// file the map doesn't list).
+pub(crate) fn split_mark_file(path: &Path) -> Result<Option<SplitMark>, String> {
+    let db = Pigeonhole::open(path, Options::default().read_only(true))
+        .map_err(|e| format!("open: {e}"))?;
+    let mark = split_mark(&db);
+    let _ = db.close();
+    mark
+}
+
 /// The identity of the partition file at `path`, read through a read-only open: no partition
 /// is open while ticket 1's node runs. Once ticket 2's node holds its partitions open for
 /// writing, `Status` reads the identity from the open handle ([`read`]) instead, rather than
