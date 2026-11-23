@@ -2568,5 +2568,42 @@ fn merge_moves_every_range_into_the_target_and_leaves_the_emptied_source_waiting
         .unwrap();
         assert_eq!(again.document["ranges_moved"], serde_json::json!(0));
         assert_eq!(again.document["source"], serde_json::json!("waiting"));
+        // A later move of part of the joined range matches its own record (simp724's (4)):
+        // [d, f) back to p1, its rows with it.
+        super::super::range_move::run(
+            &super::backup::args(a),
+            &super::super::range_move::Spec {
+                table: "users".into(),
+                from: "p2".into(),
+                to: "p1".into(),
+                start: Some(b"d".to_vec()),
+                end: Some(b"f".to_vec()),
+            },
+            Some(Duration::from_secs(120)),
+            true,
+        )
+        .await
+        .unwrap();
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"d",
+            Some(b"f"),
+            "p1"
+        ));
+        assert!(super::super::map::inside(&m.tables[0], b"f", None, "p2"));
+        for (row, value) in &last {
+            assert_eq!(
+                get_row(c, row).await.unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "row {row} after the later move"
+            );
+        }
     });
 }
