@@ -274,13 +274,6 @@ impl PartitionLoad {
     /// The read keys of the current window, or of the window before while the current one
     /// has seen fewer than [`ENOUGH_READS`] (perf287), and how many reads each stands for
     /// (its window's sampled reads, times [`READ_EVERY`], over the keys kept).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the balancer picks split keys from it once D331 PR 5's split lands"
-        )
-    )]
     pub(crate) fn read_keys(&self) -> (Vec<ReadKey>, f64) {
         let cur = self.current.load(Ordering::Acquire) & 1;
         let r = if self.reservoirs[cur].reads.load(Ordering::Relaxed) >= ENOUGH_READS {

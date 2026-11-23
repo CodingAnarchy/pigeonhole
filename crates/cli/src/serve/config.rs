@@ -280,8 +280,14 @@ pub(crate) struct ServeArgs {
     pub max_uploads: usize,
     /// A cluster node's copy bandwidth for range moves, in bytes a second (D331): every
     /// move copying from one of its partitions shares it. The catch-up that follows a copy
-    /// isn't counted. 64 MiB/s until the reference machine's run sizes it.
-    #[arg(long, value_name = "BYTES", default_value_t = 64 << 20)]
+    /// isn't counted. 64 MiB/s until the reference machine's run sizes it. At least 1: a
+    /// node reporting 0 reads as an older build (perf2's N2 on #2137).
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = 64 << 20,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub move_rate_bytes: u64,
     /// The most change-feed history a range move's source keeps for its catch-up, in bytes
     /// (D331): past it the hold lapses, and the move must be aborted rather than catch up

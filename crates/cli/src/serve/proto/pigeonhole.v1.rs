@@ -7969,7 +7969,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 52, 49"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 52, 49, 51"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -8099,7 +8099,52 @@ pub mod forward_request {
         /// D331 PR 4b: one chunk of a range move's copy, from the move's target to its source.
         #[prost(message, tag = "49")]
         RangeCopy(super::RangeCopyRequest),
+        /// D332: a partition's tablets and their sampled loads, from the map's writer to the
+        /// partition's owner, for the balancer's split. Cluster scope only.
+        #[prost(message, tag = "51")]
+        Tablets(super::TabletsRequest),
     }
+}
+/// D332: the partition whose tablets the balancer asks for.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TabletsRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+}
+/// D332: a partition's tablets, as its owner holds them now.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub tablets: ::prost::alloc::vec::Vec<TabletInfo>,
+    /// How many reads each sampled read stands for: the partition's sampled reads in the
+    /// current balance window, times the sampling interval, over the keys kept.
+    #[prost(double, tag = "2")]
+    pub read_each: f64,
+    /// The partition's epoch here: an answer from an owner that's since been replaced
+    /// names an older one.
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+}
+/// D332: one tablet of a table in a partition (the engine's `tablets()`, ICR 0142).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletInfo {
+    #[prost(string, tag = "1")]
+    pub table: ::prost::alloc::string::String,
+    /// Its first key; the table's first tablet has the empty key.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub start: ::prost::bytes::Bytes,
+    /// Its end, exclusive; empty for the table's last tablet.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub end: ::prost::bytes::Bytes,
+    /// Its SST bytes (a shared SST's divided among its tablets).
+    #[prost(uint64, tag = "4")]
+    pub bytes: u64,
+    /// The engine's moving average of rows written to it per balancer interval.
+    #[prost(double, tag = "5")]
+    pub write_load: f64,
+    /// The partition's sampled read keys that fall in it (each standing for `read_each`).
+    #[prost(uint64, tag = "6")]
+    pub reads: u64,
 }
 /// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
 /// partition's statistics for the query, read at one snapshot. Every partition of the index
@@ -8332,7 +8377,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 30, 27"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 30, 27, 29"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -8406,6 +8451,9 @@ pub mod forward_response {
         /// D331 PR 4b: `range_copy`'s chunk.
         #[prost(message, tag = "27")]
         RangeCopy(super::RangeCopyResponse),
+        /// D332: `tablets`'s answer.
+        #[prost(message, tag = "29")]
+        Tablets(super::TabletsReply),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

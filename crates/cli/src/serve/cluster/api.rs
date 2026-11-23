@@ -373,6 +373,17 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 ..Default::default()
             }));
         }
+        // D332: a partition's tablets, for the map's writer's balancer.
+        if let Some(proto::forward_request::Op::Tablets(r)) = &msg.op {
+            let Some(cluster) = shared.router.cluster.as_ref() else {
+                return Err(ApiError::unsupported("this node isn't a cluster node").into());
+            };
+            let reply = balancing::serve_tablets(cluster, &r.partition).await?;
+            return Ok(tonic::Response::new(proto::ForwardResponse {
+                reply: Some(proto::forward_response::Reply::Tablets(reply)),
+                ..Default::default()
+            }));
+        }
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
         // node's own token entry (D317 amendment 1).
