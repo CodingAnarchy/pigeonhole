@@ -1819,11 +1819,18 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
         Some(db_b.clone()),
     );
     rt.block_on(async {
-        eventually("b's follower stops, naming the row", async || {
-            move_status(b, "p2", "mv1")
-                .await
-                .is_some_and(|s| s.follower_error.contains("row \"d\""))
-        })
+        // After the restart the follower retries until b's lease is back, its backoff
+        // doubling to 5 s; its first step then names the row. On a slow runner that step
+        // can come past 5 s (Windows on #2131), so the bound is the restart tests' 30 s.
+        eventually_within(
+            Duration::from_secs(30),
+            "b's follower stops, naming the row",
+            async || {
+                move_status(b, "p2", "mv1")
+                    .await
+                    .is_some_and(|s| s.follower_error.contains("row \"d\""))
+            },
+        )
         .await;
         let s = move_status(b, "p2", "mv1").await.unwrap();
         assert!(!s.copy_done, "{s:?}");
