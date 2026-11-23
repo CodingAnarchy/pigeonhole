@@ -680,7 +680,8 @@ fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
 }
 
 /// `t` with `[start, end)` given to partition `to` (D331's hand-over): the range's ends
-/// become split keys where they aren't, and every range inside it goes to `to`.
+/// become split keys where they aren't, every range inside it goes to `to`, and
+/// neighbouring ranges left on one partition join (D331 PR 6).
 pub(crate) fn handed_over(
     t: &TablePlacement,
     start: &[u8],
@@ -705,6 +706,11 @@ pub(crate) fn handed_over(
             cuts.push((pt, key, if moved { to.to_owned() } else { p.to_owned() }));
         }
     }
+    // Neighbours left on one partition are one range (D331 Amendment 3, PR 6): a range moved
+    // next to its target's own, as each range of a merge is, drops the split key between
+    // them, so merges don't leave the table layer longer. Nothing keys on those split keys:
+    // a move's gates and moved-away rows use its record's `[start, end)` (ai1249).
+    cuts.dedup_by(|later, earlier| later.2 == earlier.2);
     let mut out = t.clone();
     out.splits = cuts
         .iter()
@@ -2131,6 +2137,15 @@ mod tests {
         let h = handed_over(t, b"m", None, "p3");
         assert_eq!(keys(&h), [b"m".to_vec()]);
         assert_eq!(h.partitions, ["p1", "p3"]);
+        // D331 PR 6: neighbours left on one partition join, so the key between them goes.
+        // The end of p1's range onto p2, next to p2's own: one range of p2 from f.
+        let h = handed_over(t, b"f", Some(b"m"), "p2");
+        assert_eq!(keys(&h), [b"f".to_vec()]);
+        assert_eq!(h.partitions, ["p1", "p2"]);
+        // p2's whole range onto p1 (a merge's last move): the table is p1's alone.
+        let h = handed_over(t, b"m", None, "p1");
+        assert!(keys(&h).is_empty(), "{:?}", keys(&h));
+        assert_eq!(h.partitions, ["p1"]);
         // The table's own keys keep their form; new ones are canonical (cli692's N3).
         let mut raw_m = t.clone();
         raw_m.splits = vec![raw(b"m")];

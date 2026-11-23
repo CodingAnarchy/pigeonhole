@@ -2541,14 +2541,9 @@ fn merge_moves_every_range_into_the_target_and_leaves_the_emptied_source_waiting
         assert!(m.moves.is_empty(), "{:?}", m.moves);
         assert!(m.partitions.iter().any(|p| p.id == "p1"), "p1 stays listed");
         assert!(!super::super::map::placed(&m, "p1"));
-        // Every range of the table is p2's (the hand-over keeps the split key between them).
-        assert!(
-            super::super::map::table_ranges(&m.tables[0])
-                .iter()
-                .all(|(_, _, p)| *p == "p2"),
-            "{:?}",
-            m.tables[0]
-        );
+        // The hand-over joined p1's range to p2's: one range, no split key left.
+        assert!(m.tables[0].splits.is_empty(), "{:?}", m.tables[0]);
+        assert!(super::super::map::inside(&m.tables[0], b"", None, "p2"));
         let mut last = std::collections::HashMap::new();
         for (row, value) in acked.lock().unwrap().iter() {
             last.insert(row.clone(), value.clone());
