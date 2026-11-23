@@ -160,9 +160,10 @@ pub(crate) async fn subscribe(
     // though it no longer places these tables there: a range move took them, and the
     // partition serves them up to the move's last seqno while it holds the moved-away row,
     // or refuses (and the resume expires). This node can't read the row: its node decides.
-    // A partition the map dropped altogether (a merge emptied it) isn't kept: PR 6 serves a
-    // dropped partition's feed read-only for `--merge-feed-retention` (D331 amendment 3,
-    // simp724's should 2); until it lands, a resume across such a drop expires.
+    // A partition the map dropped altogether (a merge removed it) isn't kept, so a resume
+    // whose token reads it is `FeedExpired` ([`resume_starts`]), terminal, not the
+    // retry-safe `PartitionUnavailable` (the coordinator's ruling of 2026-11-23): its
+    // watermark went with it.
     if let Some(S::Resume(bytes)) = &r.start
         && let Ok(t) = ClusterToken::decode(bytes)
     {
@@ -770,6 +771,11 @@ impl Merge {
                 }
                 Ok(())
             }
+            // Its resume is past an emptied source's pruned moves (`moved_end`, C1).
+            Err(e) if e.code == "MovedAway" => {
+                self.retire(i);
+                Ok(())
+            }
             Err(e) if self.allow_partial && retryable(&e) => {
                 self.unavailable(i, &e);
                 Ok(())
@@ -812,17 +818,23 @@ impl Merge {
             },
             // D331 PR 3b: a source's component of tables moved away whole is done.
             Some(Err(e)) if e.code == "MovedAway" => {
-                let p = &mut self.parts[i];
-                p.retired = true;
-                p.events = None;
-                p.retry = None;
-                self.moved = true;
+                self.retire(i);
                 return Ok(None);
             }
             Some(Err(e)) => e,
             None => ApiError::partition_unavailable("its stream ended"),
         };
         self.failed(i, ended).map(|()| None)
+    }
+
+    /// Part `i`'s component is done (`MovedAway`): its tables moved to other partitions, and
+    /// it read up to their moves' last seqno. Later checkpoints leave it out.
+    fn retire(&mut self, i: usize) {
+        let p = &mut self.parts[i];
+        p.retired = true;
+        p.events = None;
+        p.retry = None;
+        self.moved = true;
     }
 
     /// Takes part `i`'s event: its position, and what to send for it, if anything.
@@ -1673,6 +1685,13 @@ pub(crate) async fn serve(
 /// moved-away row covers, is `FeedExpired`, not left out, on every copy of the partition:
 /// a promoted replica with longer retention can't take the "neither" branch below a pruned
 /// move.
+///
+/// The 24 h emptied-partition grace (`range_prune::EMPTIED_GRACE`, feed1248's C1): a
+/// token taken after this partition's part read up to a move's last seqno, but before the
+/// part retired, outlives the pruned row. Its resume is at or past the watermark and
+/// nothing here is kept. That's `MovedAway` at the open, so the merge retires the part as
+/// if it had read on to the move's end, not `WrongPartition`, which would reopen it here
+/// again.
 fn moved_end(
     service: &Service,
     routes: &super::route::Routes,
@@ -1687,14 +1706,17 @@ fn moved_end(
     let mut kept = Vec::with_capacity(tables.len());
     let mut gone = 0;
     let mut last = 0;
+    // A table left out at or past its pruned watermark (C1).
+    let mut past_pruned = false;
     for t in tables {
         let here = routes
             .partitions_of_table(t, b"")
             .is_some_and(|ps| ps.contains(&partition));
         // Below the table's pruned watermark: expired, whatever rows of it are live (another
         // move's row doesn't cover the pruned one: simp724 on feed1248's M1 on #2130).
+        let mut mark = 0;
         if let (Some(from), Some(part)) = (resumed, service.part_opt()) {
-            let mark =
+            mark =
                 crate::serve::ranges::watermark(&part.db, crate::serve::ranges::Pruned::Moved, t)
                     .map_err(ApiError::internal)?;
             if from < mark {
@@ -1714,7 +1736,15 @@ fn moved_end(
             kept.push(t.clone());
             gone += 1;
             last = last.max(f);
+        } else if mark > 0 {
+            past_pruned = true;
         }
+    }
+    if kept.is_empty() && past_pruned {
+        return Err(ApiError::moved_away(format!(
+            "this component's tables moved off partition {partition:?}, and the resume is \
+             past their moves' last seqno"
+        )));
     }
     if kept.is_empty() {
         return Err(ApiError::wrong_partition(

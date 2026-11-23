@@ -6,7 +6,12 @@
 //!   here by an older one); the transaction lifetime plus the request timeout have passed
 //!   since the partition recorded it (M3's conflicts need it no longer); and the
 //!   partition's feed retention has passed it (P3: the resume rule's own test, a resume
-//!   from the token taken at the hand-over expires).
+//!   from the token taken at the hand-over expires), or, on a partition the map places
+//!   nothing on (an emptied merge source), [`EMPTIED_GRACE`] has passed since it recorded
+//!   the row. Cluster partitions retain their feed by bytes, and an emptied one takes no
+//!   writes, so its retention never passes (cli692 on D331 PR 6; the ruling of
+//!   2026-11-23). A resume from before the move's last seqno then expires; one at or past
+//!   it retires the partition's part cleanly (feed1248's C1, `cluster::feed`'s `moved_end`).
 //! - **A target's serving row** goes once its node's map no longer has the move (P1: the
 //!   gate serves the range from CLEANING only while the row exists); no older moved-away row
 //!   here overlaps it (it clears one, a move back); and the partition's feed retention has
@@ -32,6 +37,11 @@ use crate::serve::ranges::{self, Moved, Pruned};
 /// How often a node prunes, by default (`Peers::prune_interval`; shorter in tests).
 pub(crate) const INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long an emptied partition (one the map places nothing on) keeps a moved-away row
+/// after recording it, when its feed retention hasn't passed the row: a fixed 24 h, which
+/// the serve guide names (the ruling of 2026-11-23; no flag yet).
+pub(crate) const EMPTIED_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// What the prune of one partition's rows depends on, gathered by the pass.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bounds {
@@ -44,23 +54,28 @@ pub(crate) struct Bounds {
     pub every_node_at: Option<u64>,
 }
 
-/// The rows of a partition to prune now, by the module's rules: pure, but for
+/// The rows of `partition` to prune now, by the module's rules: pure, but for
 /// `passed(row)`, whether the partition's feed retention has passed the row.
 pub(crate) fn prunable(
     map: &ClusterMap,
+    partition: &str,
     moved: &[Moved],
     serving: &[Moved],
     bounds: Bounds,
     mut passed: impl FnMut(&Moved) -> bool,
 ) -> Vec<(Pruned, Moved)> {
     let live = |m: &Moved| map.moves.iter().any(|r| r.id == m.id);
+    let since = |m: &Moved, d: Duration| {
+        bounds.now_ms
+            >= m.at_ms
+                .saturating_add(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    };
+    let emptied = !super::map::placed(map, partition);
     let mut out = Vec::new();
     for m in moved {
         let settled = bounds.every_node_at.is_some_and(|v| v >= m.version);
-        let old = bounds.now_ms
-            >= m.at_ms
-                .saturating_add(u64::try_from(bounds.open_for.as_millis()).unwrap_or(u64::MAX));
-        if !live(m) && settled && old && passed(m) {
+        let old = since(m, bounds.open_for);
+        if !live(m) && settled && old && (passed(m) || (emptied && since(m, EMPTIED_GRACE))) {
             out.push((Pruned::Moved, m.clone()));
         }
     }
@@ -167,9 +182,10 @@ impl Node {
                 every_node_at: every_node_at.flatten(),
             };
             let map2 = map.clone();
+            let part_id = id.clone();
             let check = db.clone();
             let doomed = tokio::task::spawn_blocking(move || {
-                prunable(&map2, &moved, &serving, bounds, |m| {
+                prunable(&map2, &part_id, &moved, &serving, bounds, |m| {
                     retention_passed(&check, m)
                 })
             })
@@ -278,7 +294,14 @@ mod tests {
             |v: Vec<(Pruned, Moved)>| v.into_iter().map(|(k, m)| (k, m.id)).collect::<Vec<_>>();
         let all = |_: &Moved| true;
         assert_eq!(
-            ids(prunable(&none, std::slice::from_ref(&m), &[], ok, all)),
+            ids(prunable(
+                &none,
+                "p1",
+                std::slice::from_ref(&m),
+                &[],
+                ok,
+                all
+            )),
             [(Pruned::Moved, "mv1".to_owned())]
         );
         // The move still in the map.
@@ -289,29 +312,36 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(prunable(&live, std::slice::from_ref(&m), &[], ok, all).is_empty());
+        assert!(prunable(&live, "p1", std::slice::from_ref(&m), &[], ok, all).is_empty());
         // A node below the hand-over's version, or one that didn't answer.
         for every in [Some(6), None] {
             let b = Bounds {
                 every_node_at: every,
                 ..ok
             };
-            assert!(prunable(&none, std::slice::from_ref(&m), &[], b, all).is_empty());
+            assert!(prunable(&none, "p1", std::slice::from_ref(&m), &[], b, all).is_empty());
         }
         // Within the transaction lifetime plus the request timeout.
         let early = Bounds {
             now_ms: 59_999,
             ..ok
         };
-        assert!(prunable(&none, std::slice::from_ref(&m), &[], early, all).is_empty());
+        assert!(prunable(&none, "p1", std::slice::from_ref(&m), &[], early, all).is_empty());
         // Retention not past it.
-        assert!(prunable(&none, std::slice::from_ref(&m), &[], ok, |_| false).is_empty());
+        assert!(prunable(&none, "p1", std::slice::from_ref(&m), &[], ok, |_| false).is_empty());
 
         // A serving row: P1 (its move in the map), retention, and an older moved-away row
         // it overlaps, which it clears.
         let s = row("mv2", "d", Some("m"), 9, 0);
         assert_eq!(
-            ids(prunable(&none, &[], std::slice::from_ref(&s), ok, all)),
+            ids(prunable(
+                &none,
+                "p1",
+                &[],
+                std::slice::from_ref(&s),
+                ok,
+                all
+            )),
             [(Pruned::Serving, "mv2".to_owned())]
         );
         let live2 = ClusterMap {
@@ -321,12 +351,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(prunable(&live2, &[], std::slice::from_ref(&s), ok, all).is_empty());
-        assert!(prunable(&none, &[], std::slice::from_ref(&s), ok, |_| false).is_empty());
+        assert!(prunable(&live2, "p1", &[], std::slice::from_ref(&s), ok, all).is_empty());
+        assert!(prunable(&none, "p1", &[], std::slice::from_ref(&s), ok, |_| false).is_empty());
         let older = row("mv0", "k", None, 3, 99_999);
         assert!(
             ids(prunable(
                 &none,
+                "p1",
                 std::slice::from_ref(&older),
                 std::slice::from_ref(&s),
                 ok,
@@ -338,9 +369,83 @@ mod tests {
         );
         let apart = row("mv0", "m", None, 3, 99_999);
         assert!(
-            ids(prunable(&none, &[apart], &[s], ok, all))
+            ids(prunable(&none, "p1", &[apart], &[s], ok, all))
                 .contains(&(Pruned::Serving, "mv2".to_owned())),
             "[m, end) doesn't overlap [d, m)"
         );
+    }
+
+    /// An emptied partition's moved-away row goes once [`EMPTIED_GRACE`] has passed since it
+    /// recorded it, though its feed retention hasn't passed it; a partition the map still
+    /// places a table, an index or the memory store on waits for retention (the ruling of
+    /// 2026-11-23). The grace never waives the other rules.
+    #[test]
+    fn an_emptied_partitions_moved_away_row_goes_after_the_grace() {
+        use crate::serve::proto::{IndexPlacement, MemoryPlacement, TablePlacement};
+        let grace = u64::try_from(EMPTIED_GRACE.as_millis()).unwrap();
+        let m = row("mv1", "", None, 7, 50_000);
+        let at = |now_ms| Bounds {
+            now_ms,
+            open_for: Duration::from_secs(10),
+            every_node_at: Some(9),
+        };
+        let kept = |_: &Moved| false;
+        let emptied = ClusterMap::default();
+        let go = |map: &ClusterMap, b: Bounds| {
+            !prunable(map, "p1", std::slice::from_ref(&m), &[], b, kept).is_empty()
+        };
+        assert!(!go(&emptied, at(50_000 + grace - 1)), "within the grace");
+        assert!(go(&emptied, at(50_000 + grace)), "the grace has passed");
+        // Still placed: a table's range, an index or the memory store.
+        let on = |p: &str| vec![p.to_owned()];
+        let table = ClusterMap {
+            tables: vec![TablePlacement {
+                name: "orders".into(),
+                partitions: on("p1"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = ClusterMap {
+            indexes: vec![IndexPlacement {
+                partitions: on("p1"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let memory = ClusterMap {
+            memory: Some(MemoryPlacement {
+                partitions: on("p1"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for map in [&table, &index, &memory] {
+            assert!(!go(map, at(u64::MAX)), "{map:?} places p1");
+        }
+        // Placing only another partition leaves p1 emptied.
+        let other = ClusterMap {
+            tables: vec![TablePlacement {
+                name: "orders".into(),
+                partitions: on("p2"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(go(&other, at(50_000 + grace)));
+        // The other rules still hold it: its move in the map, or a node below its version.
+        let live = ClusterMap {
+            moves: vec![crate::serve::proto::RangeMove {
+                id: "mv1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!go(&live, at(u64::MAX)));
+        let behind = Bounds {
+            every_node_at: Some(6),
+            ..at(u64::MAX)
+        };
+        assert!(!go(&emptied, behind));
     }
 }

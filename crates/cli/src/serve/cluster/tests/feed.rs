@@ -2651,6 +2651,160 @@ fn a_token_from_before_a_pruned_whole_table_move_expires() {
     });
 }
 
+/// feed1248's C1 on the 24 h emptied-partition grace (`range_prune::EMPTIED_GRACE`): a token
+/// taken once p1's part had read up to the move's last seqno, but before it retired,
+/// outlives p1's pruned moved-away row. Its resume retires p1's part (`MovedAway` at the
+/// open), not `WrongPartition` (a reopen of p1 again) or `FeedExpired`, and reads on from p2.
+/// The prune goes through [`ranges::prune_row`] as the grace's pass would; the grace itself
+/// is `range_prune`'s, tested there.
+///
+/// [`ranges::prune_row`]: crate::serve::ranges::prune_row
+#[test]
+fn a_token_at_a_pruned_moves_end_retires_the_emptied_source_on_resume() {
+    use crate::serve::cluster::token::ClusterToken;
+    use crate::serve::ranges::{self, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        let req = |start| SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            start,
+            ..Default::default()
+        };
+        let reads_p1 = |b: &Bytes| {
+            ClusterToken::decode(b)
+                .unwrap()
+                .components
+                .iter()
+                .any(|c| c.partition == "p1")
+        };
+        let (token, last) = t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            put_order(c, "k1").await;
+            let last = put_order(c, "k2").await;
+            let (seen, _) = commits(&mut s, 2).await;
+            drop(s);
+            // p1's part at the move's last seqno, before any move: it never retired.
+            let token = seen[1].token.clone().unwrap();
+            assert!(reads_p1(&token));
+            move_orders(&ports, "", last).await;
+            (token, last)
+        });
+        let db = t.dbs[0].clone().unwrap();
+        let row = ranges::read_moved(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .expect("p1's moved-away row");
+        assert_eq!(row.final_seqno, last);
+        ranges::prune_row(&db, Pruned::Moved, &row).unwrap();
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut s = loop {
+                match subscribe(c, req(Some(Start::Resume(token.clone())))).await {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        let again =
+                            matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+                        assert!(
+                            again && tokio::time::Instant::now() < deadline,
+                            "the resume: {e}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            };
+            put_order(c, "k3").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            assert_eq!(seen[0].rows, ["k3"]);
+            assert_eq!(seen[0].partition, "p2");
+            let token = seen[0].token.clone().unwrap();
+            assert!(!reads_p1(&token), "p1's part retired");
+        });
+    });
+}
+
+/// The coordinator's ruling on a token naming a partition a merge removed (2026-11-23): its
+/// resume is `FeedExpired` (subscribe again), never `PartitionUnavailable`, which a client
+/// would retry for ever, even when the token had read p1 up to its move's last seqno (C1's
+/// token). The removed partition's watermark went with it, so its node can't tell. The
+/// subscribe answers before any part opens (`resume_starts`).
+#[test]
+fn a_token_naming_a_partition_a_merge_removed_expires() {
+    use crate::serve::proto::{GetMapRequest, PushMapRequest};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        let req = |start| SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            start,
+            ..Default::default()
+        };
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            let last = put_order(c, "k1").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            drop(s);
+            let token = seen[0].token.clone().unwrap();
+            // A merge of p1 into p2: orders' range, then users' (`[.., m)`), each move ended
+            // once it's done, then p1, which places nothing now, leaves the map.
+            move_orders(&ports, "", last).await;
+            let push = async |m: &crate::serve::proto::ClusterMap| {
+                for port in &ports {
+                    client(*port)
+                        .await
+                        .push_map(PushMapRequest {
+                            map: Some(m.clone()),
+                        })
+                        .await
+                        .unwrap();
+                }
+            };
+            let now = async || {
+                client(a)
+                    .await
+                    .get_map(GetMapRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner()
+            };
+            let end_moves = async || {
+                let mut m = now().await;
+                m.map_version += 1;
+                m.moves.clear();
+                push(&m).await;
+            };
+            end_moves().await;
+            move_range_to(
+                &ports,
+                "users",
+                "mvu",
+                "",
+                Some("m"),
+                last,
+                crate::serve::proto::MovePhase::Cleaning,
+            )
+            .await;
+            end_moves().await;
+            let mut m = now().await;
+            assert!(!crate::serve::cluster::map::placed(&m, "p1"), "{m:?}");
+            m.map_version += 1;
+            m.partitions.retain(|p| p.id != "p1");
+            push(&m).await;
+            let e = resume_ends(c, req(Some(Start::Resume(token)))).await;
+            assert_eq!(code(&e), "FeedExpired", "{e}");
+        });
+    });
+}
+
 /// How a resume of `req` through `port` ends, once its partitions answer: the first error
 /// that isn't a retry-safe wait. Panics if it reads on.
 async fn resume_ends(port: u16, req: SubscribeRequest) -> tonic::Status {
