@@ -1322,7 +1322,7 @@ From 1.3.0 (D331), a key range of a table moves from one partition to another wh
 
 **Before it starts, each one checks that the copy fits** on `S`'s node:
 - **The copy time** is the range's bytes at `S`'s node's `--move-rate-bytes`. The command can't measure one range's bytes, so it counts the whole of `S`'s file (an upper bound).
-- **The writes during the copy** are `S`'s device bytes a second over that time, an overestimate since it includes reads. `S`'s change-feed hold keeps them.
+- **The writes during the copy** are `S`'s device bytes written a second, over that time. Its flushes and compactions count too, so this overestimates what `S`'s change-feed hold keeps. The rate is `write_bytes_rate` in `phdb cluster status`, reported after each partition's first load interval (30 s); the command waits for it.
 - **If they pass `--move-retention-cap`, the command refuses**, and the message says it used the whole-partition bound. A small range in a big partition fits anyway: run it again with `--skip-fit-check`. The cluster balancer measures the range's own bytes and never skips the check.
 - **If `S`'s node is already copying `--max-move-followers` moves, the command refuses with `Busy`.** That's safe to retry once one of them finishes.
 - **A command run again for a move the map already records** skips the check and goes on.
@@ -1330,13 +1330,14 @@ From 1.3.0 (D331), a key range of a table moves from one partition to another wh
 Both run on the map's writer, through its own map changes, and print each phase as it starts:
 1. **COPYING:** `T` copies the range from snapshots of `S`, at most `--move-rate-bytes` from `S`'s node, while `S` serves it as before.
 2. **CATCHING_UP:** `T` applies `S`'s writes to the range from its change history, until it's within about a second of `S`.
-3. **HANDING_OVER:** `S` refuses writes to the range (`Fenced`, reason `RANGE_MOVING`, retry-safe; nothing was written) until `T` has applied the last of them, usually well under a second. Reads go on. A transaction prepared on `S` that may touch the range is decided first; if one stays undecided, the move aborts and the range takes writes again.
+3. **HANDING_OVER:** `S` refuses writes to the range (`Fenced`, reason `RANGE_MOVING`, retry-safe; nothing was written) until `T` has applied the last of them, usually well under a second. Reads go on. A transaction begun before then that writes on `S`, a spanning one's branch included, is refused at its commit or prepare (`Fenced`, retry-safe): retry it.
+   - **A transaction share prepared on `S` that may touch the range** holds the move at CATCHING_UP until its home decides it, so the move never cuts it off. If the fenced wait lasts more than about 30 s, the move aborts and the range takes writes again.
 4. **HANDED_OVER:** the map gives the range to `T`. This is the commit point: from here the move only goes forward. `S`'s epoch rises in the same change, so its lease takes a round to come back. Meanwhile `S`'s other writes are refused, and are safe to retry. One in flight may answer `Unknown`.
 5. **CLEANING:** `T` serves the range, and `S` drops its copy. Then the move's record leaves the map.
 
 **Rerun and abort:**
 - **A rerun of the same command goes on** from the phase the map records, after a crash or a timeout. A different move of a partition already moving is refused, naming the move in flight.
-- **`phdb cluster move-range --abort ID`** stops move `ID` (a split's too) before its commit point: `T` drops what it copied, `S` serves the range as before, and a split's new partition leaves the map with the record, its file moved aside into `.phdb-dropped/` once it's empty (never deleted). A range move's target that's down when the abort lands cleans up when it comes back. A split's record stays ABORTING until its new partition has dropped what it copied: if its node is down, rerun the abort once it's back. Past the commit point the abort is refused: rerun the move to finish it.
+- **`phdb cluster move-range --abort ID`** stops move `ID` (a split's too) before its commit point: `T` drops what it copied, `S` serves the range as before, and a split's new partition leaves the map with the record, its file moved aside into `.phdb-dropped/` once it's empty (never deleted). Replica copies of the split's partition, if an operator added any before the abort, are closed by the map and left on disk: `phdb cluster status` lists them as a partition the map doesn't have, and `drop-partition` moves them aside. A range move's target that's down when the abort lands cleans up when it comes back. A split's record stays ABORTING until its new partition has dropped what it copied: if its node is down, rerun the abort once it's back. Past the commit point the abort is refused: rerun the move to finish it.
 - **A failover of `S` or `T` before the hand-over aborts the move.** From HANDING_OVER until the move is done, a failover or a promote of either partition is refused.
 
 **Limits:**
@@ -1348,7 +1349,8 @@ Both run on the map's writer, through its own map changes, and print each phase 
 
 **Backups and restores:** a whole restore ([Backup and restore](#backup-and-restore)) ends every range move in flight: the backup's map has no move record, and each restored file is clipped to that map's ranges, so a range a move had half copied isn't served twice. `restore --partition` is refused while a move names the partition.
 
-**Change feeds:** a subscription to the table goes on across the move, in per-key order: it reads the range from `S` until the hand-over, then from `T`. A token from before a move's hand-over still resumes while the move's rows are kept (the change-feed retention past the hand-over). Once they're pruned, such a token answers `FeedExpired` on any copy of `S` or `T`: open the feed again.
+**Change feeds:** a subscription to the table goes on across the move, in per-key order: it reads the range from `S` until the hand-over, then from `T`. A token from before a move's hand-over still resumes while the move's rows are kept. Once they're pruned, such a token answers `FeedExpired` on any copy of `S` or `T`: open the feed again. A subscription from the oldest position starts, on each of `S` and `T`, past a pruned move's history of the table there, so it never replays a range out of order.
+- **When a move's rows are pruned:** each node prunes its own partitions' rows, about once a minute. It prunes once the move has left the map, every node holds a map from after the hand-over, the transaction lifetime plus the request timeout have passed, and the partition's change-feed retention has passed the hand-over.
 
 ## Performance
 These numbers are for `phdb serve` on one machine, serving a single database file and also as a one-node cluster. All rows use a fixed offered write rate. They show latency and feed delivery at that rate, not peak throughput.
