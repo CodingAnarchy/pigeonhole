@@ -139,6 +139,12 @@ pub(crate) async fn subscribe(
     let mut tables = r.tables.clone();
     tables.sort();
     tables.dedup();
+    if let Some(S::Resume(bytes)) = &r.start
+        && let Ok(t) = ClusterToken::decode(bytes)
+    {
+        let parts: Vec<&str> = t.components.iter().map(|c| c.partition.as_str()).collect();
+        catch_up(&node, t.map_version, &parts, service.request_timeout()).await?;
+    }
     let guard = node.routes();
     let Some(routes) = guard.as_ref() else {
         return Err(ApiError::partition_unavailable(
@@ -584,6 +590,71 @@ fn expired(message: String) -> ApiError {
     ApiError::from_code(pigeonhole::ErrorCode::FeedExpired, &message)
 }
 
+/// Whether `e` is the engine's refusal of a component's position as another database's
+/// (`InvalidArgument`, which has no code of its own): the only refusal of that code whose
+/// message says so.
+fn another_database(e: &ApiError) -> bool {
+    e.code == "InvalidArgument" && e.message.contains("the token is another database's")
+}
+
+/// Before a resume's checks (a feed's [`resume_starts`], a memory watch's): a token from a
+/// map newer than this node's that reads a partition this node's map doesn't list, a
+/// split's new partition this node hasn't taken yet, isn't a lost partition but a map
+/// behind. The node pulls the map from each other node of its map in turn, within
+/// `within` in all, until its map is at or past the token's version or lists the
+/// partition: a newer map short of the token's may not list it yet (feed1248). Only then
+/// does an unlisted partition count as lost (`FeedExpired`, the checks'); still behind,
+/// the resume is refused retry-safe (`PartitionUnavailable`). A token from no newer a map,
+/// or whose every partition is listed, goes on to the checks as it is.
+pub(super) async fn catch_up(
+    node: &Arc<Node>,
+    token_version: u64,
+    partitions: &[&str],
+    within: Duration,
+) -> Result<(), ApiError> {
+    // This node's map version and a partition it doesn't list, while behind the token's.
+    let behind = || {
+        let guard = node.routes();
+        let routes = guard.as_ref()?;
+        let here = routes.map_version();
+        if here >= token_version {
+            return None;
+        }
+        let unlisted = partitions.iter().find(|p| routes.owner(p).is_none())?;
+        Some((here, (*unlisted).to_owned()))
+    };
+    if behind().is_none() {
+        return Ok(());
+    }
+    let peers: Vec<(String, String)> = node.get_map().map_or_else(
+        |_| Vec::new(),
+        |m| {
+            m.nodes
+                .iter()
+                .filter(|n| n.id != node.id())
+                .map(|n| (n.id.clone(), n.address.clone()))
+                .collect()
+        },
+    );
+    let _ = tokio::time::timeout(within, async {
+        for (id, address) in &peers {
+            let Some((here, _)) = behind() else {
+                return;
+            };
+            let _ = node.pull_now(id, address, here).await;
+        }
+    })
+    .await;
+    match behind() {
+        None => Ok(()),
+        Some((here, unlisted)) => Err(ApiError::partition_unavailable(format!(
+            "this node's cluster map (version {here}) is behind the resume token's (version \
+             {token_version}), which reads partition {unlisted:?} this map doesn't list: \
+             retry once this node has a later map"
+        ))),
+    }
+}
+
 /// A subscription's merge: its hub's (#1798), or a member's own.
 pub(super) struct Merge {
     ctx: Arc<Ctx>,
@@ -776,6 +847,19 @@ impl Merge {
                 self.retire(i);
                 Ok(())
             }
+            // The partition's file is another database than the one its position was read
+            // from: dropped and created again under the same id (a merge's source added back,
+            // cli692's S3 on #2131). Its position is gone for good: `FeedExpired`, so the
+            // client subscribes again, not the engine's `InvalidArgument` (the coordinator's
+            // ruling of 2026-11-23).
+            Err(e) if another_database(&e) => Err(in_partition(
+                &self.parts[i].partition,
+                expired(format!(
+                    "its file is another database than the one this position was read from (the \
+                     partition was dropped and created again): subscribe again ({})",
+                    e.message
+                )),
+            )),
             Err(e) if self.allow_partial && retryable(&e) => {
                 self.unavailable(i, &e);
                 Ok(())

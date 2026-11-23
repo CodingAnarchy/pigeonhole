@@ -66,6 +66,14 @@ pub(crate) async fn watch(
     let mut namespaces = r.namespaces.clone();
     namespaces.sort();
     namespaces.dedup();
+    // A token from a newer map naming a partition this node's map doesn't list yet: the
+    // map, or a retry-safe refusal ([`super::feed::catch_up`]).
+    if !r.resume.is_empty()
+        && let Ok(t) = ClusterToken::decode(&r.resume)
+    {
+        let parts: Vec<&str> = t.components.iter().map(|c| c.partition.as_str()).collect();
+        super::feed::catch_up(&node, t.map_version, &parts, service.request_timeout()).await?;
+    }
     let guard = node.routes();
     let Some(routes) = guard.as_ref() else {
         return Err(ApiError::partition_unavailable(

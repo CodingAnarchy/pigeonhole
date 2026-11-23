@@ -2805,6 +2805,152 @@ fn a_token_naming_a_partition_a_merge_removed_expires() {
     });
 }
 
+/// The coordinator's ruling on a resume through a node whose map is behind the token's
+/// (2026-11-23): a token from a newer map naming a partition this node's map doesn't list
+/// (a split's new one, here p9) is refused retry-safe (`PartitionUnavailable`) while no
+/// node has a newer map to pull, not expired. Once one does, the node pulls it before the
+/// resume's checks: the token is no newer than its map then, and an unlisted partition is
+/// lost, as before (`FeedExpired`).
+#[test]
+fn a_resume_from_a_newer_map_through_a_node_behind_it_is_retried_not_expired() {
+    use crate::serve::cluster::token::{At, ClusterToken, Component, TokenCache};
+    use crate::serve::proto::{GetMapRequest, PushMapRequest};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        let req = |start| SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            start,
+            ..Default::default()
+        };
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            put_order(c, "k1").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            drop(s);
+            let real = ClusterToken::decode(&seen[0].token.clone().unwrap()).unwrap();
+            // `real` from map `version`, reading p9 too.
+            let with_p9 = |version: u64| {
+                let mut parts = real.components.clone();
+                parts.push(Component {
+                    partition: "p9".into(),
+                    epoch: 1,
+                    at: At::Now,
+                });
+                parts.sort_by(|x, y| x.partition.cmp(&y.partition));
+                let mut out = Vec::new();
+                TokenCache::default().encode(
+                    &real.cluster_id,
+                    version,
+                    real.subscription,
+                    parts.iter().map(|p| (p.partition.as_str(), p.epoch, &p.at)),
+                    &mut out,
+                );
+                Bytes::from(out)
+            };
+            let map_of = async |port| {
+                client(port)
+                    .await
+                    .get_map(GetMapRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner()
+            };
+            let push_to = async |port, m: &crate::serve::proto::ClusterMap| {
+                client(port)
+                    .await
+                    .push_map(PushMapRequest {
+                        map: Some(m.clone()),
+                    })
+                    .await
+                    .unwrap();
+            };
+            // b alone has a newer map than c's, short of the token's (v + 5), and p9 isn't
+            // in it (feed1248's case): c pulls it, and is still behind, so it refuses
+            // retry-safe, not FeedExpired.
+            let mut m = map_of(a).await;
+            let v = m.map_version;
+            m.map_version = v + 2;
+            push_to(ports[1], &m).await;
+            let e = subscribe(c, req(Some(Start::Resume(with_p9(v + 5)))))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+            assert!(e.message().contains("is behind the resume token's"), "{e}");
+            assert!(map_of(c).await.map_version >= v + 2, "c pulled b's map");
+            // A map at the token's version on a: c pulls it, and then p9 is lost, as before.
+            let mut m = map_of(a).await;
+            m.map_version = v + 3;
+            push_to(a, &m).await;
+            let e = subscribe(c, req(Some(Start::Resume(with_p9(m.map_version)))))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&e), "FeedExpired", "{e}");
+            assert!(map_of(c).await.map_version >= m.map_version);
+        });
+    });
+}
+
+/// The coordinator's ruling (2026-11-23, cli692's S3 on #2131): a component whose position
+/// the partition's database refuses as another database's (the partition dropped and
+/// created again under its id) makes the resume `FeedExpired`, so the client subscribes
+/// again, not the engine's `InvalidArgument`. Here p1's position is one read from p2's
+/// database.
+#[test]
+fn a_resume_whose_position_is_another_databases_expires() {
+    use crate::serve::cluster::token::{At, ClusterToken, TokenCache};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        let req = |table: &str, start| SubscribeRequest {
+            tables: vec![table.into()],
+            checkpoint_every: 1,
+            start,
+            ..Default::default()
+        };
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            table_on(a, "items", "p2").await;
+            let token_of = async |table: &str| {
+                let mut s = subscribe(c, req(table, None)).await.unwrap();
+                put_in(c, table, "k1").await;
+                let (seen, _) = commits(&mut s, 1).await;
+                ClusterToken::decode(&seen[0].token.clone().unwrap()).unwrap()
+            };
+            let orders = token_of("orders").await;
+            let items = token_of("items").await;
+            let At::Token(p2s) = &items.components[0].at else {
+                panic!("{items:?}");
+            };
+            let foreign = At::Token(p2s.clone());
+            let mut out = Vec::new();
+            TokenCache::default().encode(
+                &orders.cluster_id,
+                orders.map_version,
+                orders.subscription,
+                orders
+                    .components
+                    .iter()
+                    .map(|p| (p.partition.as_str(), p.epoch, &foreign)),
+                &mut out,
+            );
+            let token = Bytes::from(out);
+            // Through c, which forwards p1's component to a (the refusal arrives as a
+            // forwarded status), and through a, which opens it itself. Either breaks if the
+            // engine's wording drifts from `another_database`'s.
+            for port in [c, a] {
+                let e = resume_ends(port, req("orders", Some(Start::Resume(token.clone())))).await;
+                assert_eq!(code(&e), "FeedExpired", "through {port}: {e}");
+                assert!(e.message().contains("another database"), "{e}");
+            }
+        });
+    });
+}
+
 /// How a resume of `req` through `port` ends, once its partitions answer: the first error
 /// that isn't a retry-safe wait. Panics if it reads on.
 async fn resume_ends(port: u16, req: SubscribeRequest) -> tonic::Status {
