@@ -6120,6 +6120,9 @@ impl Inner {
                         seqno,
                     }),
             );
+            // A flush already holding one of their memtables skips its edits at its commit
+            // (the range's rows are dropped), rather than be refused as for a split's.
+            catalog.note_range_dropped(&dropped);
             *out.lock().unwrap_or_else(PoisonError::into_inner) = dropped;
             Ok(edits)
         })?;
