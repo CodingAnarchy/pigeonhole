@@ -245,7 +245,8 @@ pub(crate) async fn serve_tablets(
         tokio::task::spawn_blocking(move || (db.tablets(), load.read_keys()))
             .await
             .map_err(|e| ApiError::internal(format!("a partition's tablets: {e}")))?;
-    Ok(proto::TabletsReply {
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut reply = proto::TabletsReply {
         tablets: tablets
             .into_iter()
             .map(|t| {
@@ -269,8 +270,26 @@ pub(crate) async fn serve_tablets(
             .collect(),
         read_each: each,
         epoch,
-    })
+    };
+    // A test's tablets for this node's partition: a real tablet splits only at 256 MiB.
+    #[cfg(test)]
+    if let Some((.., ts)) = TABLETS_FOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(dir, p, _)| dir == cluster.node.dir() && p == partition)
+    {
+        reply.tablets.clone_from(ts);
+    }
+    Ok(reply)
 }
+
+/// A test seam: the tablets a node (by directory) reports for a partition, in place of its
+/// engine's, so a short test has a tablet boundary to split at.
+#[cfg(test)]
+pub(crate) static TABLETS_FOR: std::sync::Mutex<
+    Vec<(std::path::PathBuf, String, Vec<proto::TabletInfo>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 impl Node {
     /// The policy's tablets for split candidate `p` (D332 PR 5's design §1): asked of its

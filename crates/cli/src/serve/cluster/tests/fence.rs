@@ -3547,3 +3547,287 @@ fn a_grant_from_before_the_balancer_was_on_still_says_a_share_is_in_doubt() {
         let _ = commit.await;
     });
 }
+
+/// A put of `row` through `port`, as `token`: `Ok` once acknowledged.
+async fn put_as(
+    port: u16,
+    row: &str,
+    value: &str,
+    token: Option<&str>,
+) -> Result<(), tonic::Status> {
+    data(port)
+        .await
+        .mutate(with(
+            crate::serve::proto::MutateRequest {
+                writes: Some(put_row(row, value)),
+                durability: 0,
+            },
+            token,
+        ))
+        .await
+        .map(drop)
+}
+
+/// `row`'s cell through `port`, as `token`.
+async fn get_as(port: u16, row: &str, token: Option<&str>) -> Option<Vec<u8>> {
+    data(port)
+        .await
+        .get(with(
+            crate::serve::proto::GetRequest {
+                table: "users".into(),
+                row: row.as_bytes().to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            },
+            token,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("get {row} through {port}: {e}"))
+        .into_inner()
+        .cell
+        .map(|c| c.value.to_vec())
+}
+
+/// The map's family for `users` (a range move copies its families' rows), as `token`.
+async fn with_family(t: &Rig, token: Option<&str>) -> u64 {
+    balancer_map(t, token, |m| {
+        m.tables[0].families = vec![crate::serve::proto::FamilySpec {
+            name: "f".into(),
+            ..Default::default()
+        }];
+    })
+    .await
+}
+
+#[test]
+fn a_big_partition_splits_at_its_halving_tablet_onto_a_cold_node_with_tokens_configured() {
+    use crate::serve::proto::{BalancerEventKind, TabletInfo};
+    // D332 PR 5's design §7.2: every node has tokens, and the writer runs the split with its
+    // cluster token alone. p2 and p3 are pinned and the size bound tiny, so p1 alone is a
+    // split candidate; its owner reports tablets at "" and "d" (a test's tablets: a real one
+    // splits at 256 MiB), so the cut is at d and [d, g) goes to a new partition p1-<v> on b
+    // or c, under writes. One SPLIT event naming users; p1's history has it and the new
+    // partition's is empty; every acknowledged write reads back; nothing else splits within
+    // the dwell.
+    let mut t = Rig::start_with(&balancer_tokens());
+    let tok = Some(BALANCER_ADMIN);
+    writer_leased_as(&mut t, tok);
+    let a = t.ports[0];
+    let tablet = |start: &str| TabletInfo {
+        table: "users".into(),
+        start: start.as_bytes().to_vec().into(),
+        bytes: 1 << 20,
+        ..Default::default()
+    };
+    super::super::balancing::TABLETS_FOR.lock().unwrap().push((
+        t.dirs[0].clone(),
+        "p1".into(),
+        vec![tablet(""), tablet("d")],
+    ));
+    let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    // Writes answered `Unknown`: the hand-over raises p1's epoch, so its lease on a ends
+    // for a round, and a commit in flight then may or may not be kept.
+    let unknown: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    t.rt.block_on(async {
+        with_family(&t, tok).await;
+        for i in 0..20 {
+            put_as(a, &format!("b{i:02}"), "0", tok).await.unwrap();
+            put_as(a, &format!("e{i:02}"), "0", tok).await.unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (acked, stop) = (std::sync::Arc::clone(&acked), std::sync::Arc::clone(&stop));
+            let unknown = std::sync::Arc::clone(&unknown);
+            tokio::spawn(async move {
+                let mut i = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for row in [format!("b{:02}", i % 20), format!("e{:02}", i % 20)] {
+                        match put_as(a, &row, &i.to_string(), tok).await {
+                            Ok(()) => acked.lock().unwrap().push((row, i.to_string())),
+                            Err(e) if e.code() == tonic::Code::Unknown => {
+                                unknown.lock().unwrap().push((row, i.to_string()));
+                            }
+                            // Refused: nothing was written.
+                            Err(_) => {}
+                        }
+                    }
+                    i += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        balancer_map(&t, tok, |m| {
+            for p in m.partitions.iter_mut().filter(|p| p.id != "p1") {
+                p.pinned = true;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                partition_max_bytes: 1 << 10,
+                partition_min_bytes: 1,
+                passes: 1,
+                dwell_ms: 600_000,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        let new_of = |m: &crate::serve::proto::ClusterMap| {
+            m.partitions
+                .iter()
+                .find(|p| {
+                    p.id.strip_prefix("p1-")
+                        .is_some_and(|v| v.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .cloned()
+        };
+        let m = map_until(a, tok, Duration::from_secs(60), "p1 split", |m| {
+            m.moves.is_empty() && new_of(m).is_some()
+        })
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        let new = new_of(&m).unwrap();
+        assert_ne!(new.node, "a", "{new:?}");
+        assert!(new.moves_history.is_empty(), "{new:?}");
+        let splits: Vec<_> = m
+            .balancer_events
+            .iter()
+            .filter(|e| e.kind() == BalancerEventKind::Split)
+            .collect();
+        assert_eq!(splits.len(), 1, "{:?}", m.balancer_events);
+        assert_eq!(
+            (
+                splits[0].partition.as_str(),
+                splits[0].table.as_str(),
+                splits[0].to.as_str()
+            ),
+            ("p1", "users", new.node.as_str())
+        );
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(
+            p1.moves_history
+                .iter()
+                .map(crate::serve::proto::MoveHistory::kind)
+                .collect::<Vec<_>>(),
+            vec![BalancerEventKind::Split],
+            "{p1:?}"
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"d",
+            Some(b"g"),
+            &new.id
+        ));
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"a",
+            Some(b"d"),
+            "p1"
+        ));
+        let mut last = std::collections::HashMap::new();
+        for (row, value) in acked.lock().unwrap().iter() {
+            last.insert(row.clone(), value.clone());
+        }
+        assert!(last.len() >= 2, "{last:?}");
+        for (row, value) in &last {
+            // The last acknowledged write, or a later one whose outcome was unknown.
+            let read = get_as(a, row, tok).await;
+            let later: Vec<String> = unknown
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(r, v)| {
+                    r == row && v.parse::<u32>().unwrap() > value.parse::<u32>().unwrap()
+                })
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert!(
+                read.as_deref() == Some(value.as_bytes())
+                    || later.iter().any(|v| read.as_deref() == Some(v.as_bytes())),
+                "row {row}: read {read:?}, last acknowledged {value}, unknown since {later:?}"
+            );
+        }
+        // Within the dwell: no second split.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of_as(a, tok).await;
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert_eq!(
+            m.balancer_events
+                .iter()
+                .filter(|e| e.kind() == BalancerEventKind::Split)
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn an_earlier_writers_split_before_its_hand_over_is_aborted_and_leaves_no_partition() {
+    use crate::serve::proto::BalancerEventKind;
+    // D332 PR 5's design §7.3 (simp724's M1): a `bal-` split of p1 at d onto c, recorded at
+    // COPYING with its new partition and no driver left, as an earlier writer would leave
+    // it. The writer's balancer doesn't take it up: it aborts it. The record and the new
+    // partition go together, an ABORT event names the move, and p1 serves the range as
+    // before.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    let args = super::super::cli::NodeArgs {
+        own: None,
+        node: format!("http://127.0.0.1:{a}"),
+        token_file: None,
+        ca: None,
+    };
+    t.rt.block_on(async {
+        with_family(&t, None).await;
+        for i in 0..20 {
+            put_as(a, &format!("e{i:02}"), "0", None).await.unwrap();
+        }
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        let id = super::super::range_move::begin_split(
+            &args,
+            &spec,
+            "p1-1",
+            &super::super::moving::Start {
+                prefix: "bal",
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let new = map_of(a)
+            .await
+            .moves
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.to.clone())
+            .expect("recorded");
+        balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
+        let m = map_until(a, None, Duration::from_secs(60), "the split aborted", |m| {
+            m.moves.is_empty()
+                && m.balancer_events
+                    .iter()
+                    .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
+        })
+        .await;
+        assert!(
+            !m.partitions.iter().any(|p| p.id == new),
+            "{:?}",
+            m.partitions
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"a",
+            Some(b"g"),
+            "p1"
+        ));
+        put_as(a, "e05", "after", None).await.unwrap();
+        assert_eq!(get_as(a, "e05", None).await, Some(b"after".to_vec()));
+    });
+}
