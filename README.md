@@ -82,9 +82,10 @@ One line per family of operations, with the calls that do it, a guide page that 
   - **automatic failover, off by default** (D330, #1484): with the map's `failover` on, the map's writer promotes a down partition's freshest replica, and a down writer is replaced by an elected one. It can lose the commits the replica hadn't applied. Guide: [Automatic failover](docs/guide/serve.md#automatic-failover);
   - **`Admin.Info`, `Flush` and `Compact`** on a cluster node;
 
+  - **online range moves, splits and merges** (D331, #1499): `phdb cluster move-range` moves a key range of a table to another partition while both serve, `phdb cluster split` moves the end of a partition's range into a new partition, and `phdb cluster merge S --into T` moves all of `S` into `T` and removes `S`. Each phase is recorded in the map, so a stopped command is run again, resumed by id or aborted before its hand-over. Guide: [Moving and splitting ranges](docs/guide/serve.md#moving-and-splitting-ranges), [Merging partitions](docs/guide/serve.md#merging-partitions);
   - **the cluster balancer, off by default** (D332, #1485): with it on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, one move at a time. Guide: [The cluster balancer](docs/guide/serve.md#the-cluster-balancer).
 
-  Planned for 1.3.0 and not finished on `main`: online split and range move (D331, #1499), which the balancer's splits and merges also wait for. Its map records, gates and the range's copy are on `main`; the move's driver and its commands are to come. [`docs/status.md`](docs/status.md#capabilities) has its state.
+  Planned for 1.3.0 and not finished on `main`: the balancer's splits and merges (D332, #1485), which run through these commands' drivers. [`docs/status.md`](docs/status.md#capabilities) has their state.
 
   Guide: [Clusters](docs/guide/serve.md#clusters). Reference: [`phdb serve`](docs/guide/agent-reference.md#phdb-serve-120).
 
