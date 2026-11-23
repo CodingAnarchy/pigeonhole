@@ -1098,12 +1098,18 @@ mod tests {
     #[test]
     fn nothing_gates_a_partition_no_move_names() {
         assert!(gate(&map(None), "p1", Vec::new(), 1).load().is_none());
-        // Nor while the move copies, on its source.
-        assert!(
-            gate(&map(Some(MovePhase::Copying)), "p1", Vec::new(), 1)
-                .load()
-                .is_none()
-        );
+        // Nor while the move copies, on its source: its range is only watched (D331 PR 5,
+        // the in-doubt watch), so reads and writes of it go on, and a write is tagged.
+        let source = gate(&map(Some(MovePhase::Copying)), "p1", Vec::new(), 1)
+            .state
+            .load_full()
+            .expect("the watch");
+        assert_eq!(code(&source, &get("d")), None);
+        assert_eq!(code(&source, &put("d")), None);
+        let ServiceOp::Mutate(m) = put("d") else {
+            unreachable!()
+        };
+        assert_eq!(source.watched(&[m.writes.unwrap()]), vec!["mv1".to_owned()]);
     }
 
     #[test]
