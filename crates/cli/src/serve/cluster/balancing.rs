@@ -10,11 +10,24 @@
 //!    older reign's, on older samples, and that writer may still be copying (simp724's M1).
 //!    The abort removes the record, sends the target's copy aside, unfences the partition
 //!    on its node and records an ABORT event. From its commit point the move is finished.
+//!    A `bal-` range move or split is the same through D331 PR 5's driver: aborted before
+//!    HANDED_OVER (a split's new partition removed once empty), an ABORTING one's abort
+//!    carried on, and finished from HANDED_OVER (`range_move::resume`).
 //! 2. **Waits** while any move is in flight (one action at a time), or while PAUSED.
 //! 3. **Surveys** every node's `Status` with `open_only` (perf287), and runs the policy.
 //! 4. **Acts:** a whole move runs on a task of its own through `phdb cluster move`'s steps
 //!    (`moving::run_as`, its record `bal-<ms>`), with the writer's cluster token (#2094). A
-//!    pin or an unpin is a map change. A split or a merge waits for D331 PR 5 and PR 6.
+//!    pin or an unpin is a map change. A split runs the same way through D331 PR 5's split
+//!    driver (`range_move::split_as`, a `bal-` record), which names the new partition
+//!    `<P>-<v>`. A merge runs through D331 PR 6's merge (`range_merge::run_as`, each range
+//!    a `bal-` record), with no merge record of its own: one interrupted part-way leaves a
+//!    valid layout, and a later pass decides afresh.
+//! 5. **Removes an emptied source:** a partition the balancer merged away (its last history
+//!    entry MERGE) that holds nothing but is still listed, through the merge's removal, each
+//!    pass until nothing waits for it (`drop_waits`). The removal reads those before it
+//!    fences, so a pass while S waits costs Status calls only. A paused balancer does it
+//!    too. While S waits, or its removal stopped (named in `state`), the pass goes on
+//!    without it.
 //!
 //! A pass that does nothing changes nothing in the map: the current skip is in this
 //! node's `NodeStatus.balancer` only (simp724's M2, perf287's should-fix 1). The counters
@@ -26,8 +39,8 @@ use std::time::Duration;
 
 use super::balance::{self, Action, Bounds, Counters, Decision, Kind, NodeView, PartView};
 use super::proto::{
-    self, BalancerEvent, BalancerEventKind, BalancerMode, ClusterMap, MoveHistory, MovePhase,
-    NodeStatus, PartitionRequest, PartitionRole, SetMapRequest,
+    self, BalancerEvent, BalancerEventKind, BalancerMode, ClusterMap, MoveHistory, NodeStatus,
+    PartitionRequest, PartitionRole, SetMapRequest,
 };
 use super::{Node, map, schema};
 
@@ -38,10 +51,6 @@ pub(crate) const PASS: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub(crate) static PASS_FOR: std::sync::Mutex<Vec<(std::path::PathBuf, Duration)>> =
     std::sync::Mutex::new(Vec::new());
-
-/// `--move-rate-bytes`' default, per second, for the copy-time check until D331 PR 4b adds
-/// the flag.
-const MOVE_RATE: u64 = 64 << 20;
 
 /// The writer's balancer state: in memory, new with each writer term (S3).
 #[derive(Debug, Default)]
@@ -60,6 +69,10 @@ pub(crate) struct Run {
     ratios: Vec<(String, f64)>,
     /// A pass is running ([`Node::spawn_balance`]).
     passing: bool,
+    /// Split candidates set aside, until when (ms), and why: a survey found no cut, the
+    /// owner didn't answer it, or the split couldn't start (perf2's and ai1249's S1 on
+    /// #2137). `state` names them.
+    no_cut: HashMap<String, (u64, String)>,
 }
 
 fn wall_ms() -> u64 {
@@ -212,11 +225,161 @@ pub(crate) fn views(
     (nodes, parts)
 }
 
+/// D332: partition `partition`'s tablets, answered by its owner for the map's writer
+/// (`Forward`'s `tablets` arm, cluster scope): the engine's `tablets()` and the partition's
+/// sampled read keys counted per tablet, with its epoch, so the writer drops an answer from
+/// an owner since replaced.
+pub(crate) async fn serve_tablets(
+    cluster: &crate::serve::router::Cluster,
+    partition: &str,
+) -> Result<proto::TabletsReply, crate::serve::errors::ApiError> {
+    use crate::serve::errors::ApiError;
+    let map = cluster.node.get_map()?;
+    let Some(p) = map.partitions.iter().find(|p| p.id == partition) else {
+        return Err(ApiError::wrong_partition(
+            map.map_version,
+            format!("no partition {partition:?} in the map"),
+        ));
+    };
+    let Some(service) = cluster
+        .here(partition)
+        .filter(|_| p.node == cluster.node.id())
+    else {
+        return Err(ApiError::wrong_partition(
+            map.map_version,
+            format!("partition {partition:?} isn't served here"),
+        ));
+    };
+    let part = service.part()?;
+    let (db, load, epoch) = (part.db.clone(), Arc::clone(&part.load), p.epoch);
+    // In memory: a walk of every tablet's SST metadata, with no file reads (perf2's N4 on
+    // #2137); off the async workers all the same (perf287).
+    let (tablets, (keys, each)) =
+        tokio::task::spawn_blocking(move || (db.tablets(), load.read_keys()))
+            .await
+            .map_err(|e| ApiError::internal(format!("a partition's tablets: {e}")))?;
+    // Each sampled key to its tablet, by a binary search over the tablets in (table, start)
+    // order (perf2's N3 on #2137).
+    let mut order: Vec<usize> = (0..tablets.len()).collect();
+    order.sort_by(|&x, &y| {
+        (tablets[x].table.as_str(), &tablets[x].start[..])
+            .cmp(&(tablets[y].table.as_str(), &tablets[y].start[..]))
+    });
+    let mut reads = vec![0u64; tablets.len()];
+    for k in &keys {
+        let at = order.partition_point(|&j| {
+            (tablets[j].table.as_str(), &tablets[j].start[..]) <= (k.table.as_str(), &k.key[..])
+        });
+        let Some(&j) = at.checked_sub(1).and_then(|i| order.get(i)) else {
+            continue;
+        };
+        let t = &tablets[j];
+        if t.table == k.table && t.end.as_deref().is_none_or(|e| k.key[..] < *e) {
+            reads[j] += 1;
+        }
+    }
+    Ok(proto::TabletsReply {
+        tablets: tablets
+            .into_iter()
+            .zip(reads)
+            .map(|(t, reads)| proto::TabletInfo {
+                table: t.table,
+                start: t.start.into(),
+                end: t.end.unwrap_or_default().into(),
+                bytes: t.bytes,
+                write_load: t.write_load,
+                reads,
+            })
+            .collect(),
+        read_each: each,
+        epoch,
+    })
+}
+
+impl Node {
+    /// The policy's tablets for split candidate `p` (D332 PR 5's design §1): asked of its
+    /// owner, bounded by the push timeout. `None` when the owner can't answer, or answers
+    /// at another epoch than the map's (a stale owner).
+    async fn tablets_of(&self, map: &ClusterMap, p: &PartView) -> Option<Vec<balance::Tablet>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        let cluster = shared.router.cluster.as_ref()?;
+        let epoch = map.partitions.iter().find(|q| q.id == p.id)?.epoch;
+        let reply = if p.node == self.id {
+            serve_tablets(cluster, &p.id).await.ok()?
+        } else {
+            let address = &map.nodes.iter().find(|n| n.id == p.node)?.address;
+            let fwd = proto::ForwardRequest {
+                map_version: map.map_version,
+                caller: Some(
+                    super::forward::forwarded_caller(&crate::serve::auth::Caller::anonymous())
+                        .ok()?,
+                ),
+                partition: p.id.clone(),
+                op: Some(proto::forward_request::Op::Tablets(proto::TabletsRequest {
+                    partition: p.id.clone(),
+                })),
+                ..Default::default()
+            };
+            match cluster
+                .forwarder
+                .send(address, fwd, self.peers.push_timeout, false)
+                .await
+                .ok()?
+                .reply
+            {
+                Some(proto::forward_response::Reply::Tablets(r)) => r,
+                _ => return None,
+            }
+        };
+        if reply.epoch != epoch {
+            return None;
+        }
+        let report: Vec<balance::TabletReport> = reply
+            .tablets
+            .into_iter()
+            .map(|t| balance::TabletReport {
+                table: t.table,
+                start: t.start.to_vec(),
+                bytes: t.bytes,
+                write_load: t.write_load,
+                reads: t.reads,
+            })
+            .collect();
+        Some(balance::tablet_loads(&report, p.load))
+    }
+}
+
 /// `m` with `e` appended to its events, the oldest dropped past [`map::BALANCER_EVENTS`].
 fn push_event(m: &mut ClusterMap, e: BalancerEvent) {
     m.balancer_events.push(e);
     let over = m.balancer_events.len().saturating_sub(map::BALANCER_EVENTS);
     m.balancer_events.drain(..over);
+}
+
+/// The partitions the balancer merged away that the map still lists while they hold
+/// nothing: each one's last history entry is MERGE (only a balancer merge's source gets
+/// one), and nothing places it. An operator's merge, or a partition never given a range,
+/// isn't the balancer's to remove.
+fn emptied(m: &ClusterMap) -> Vec<String> {
+    m.partitions
+        .iter()
+        .filter(|p| {
+            !map::placed(m, &p.id)
+                && p.moves_history
+                    .last()
+                    .is_some_and(|h| h.kind() == BalancerEventKind::Merge)
+        })
+        .map(|p| p.id.clone())
+        .collect()
+}
+
+/// What an abort's state line adds when its ABORT event's map change failed (audit120's
+/// nit on #2137): the abort happened, the event wasn't recorded.
+fn unrecorded(recorded: Result<(), String>) -> String {
+    recorded
+        .err()
+        .map(|e| format!(" (its ABORT event wasn't recorded: {e})"))
+        .unwrap_or_default()
 }
 
 /// `p`'s history in `m` with `kind` at `at` appended, the oldest dropped past
@@ -319,7 +482,22 @@ impl Node {
             return;
         }
         if self.writer_lease_remaining(&map).is_zero() {
-            self.set_balancer_state("waiting: this writer holds no writer lease".into());
+            // A balancer move left mid-way (a hand-over's range refuses writes) is named
+            // (audit120's nit on #2137).
+            let left = map
+                .moves
+                .iter()
+                .find(|m| m.id.starts_with("bal-"))
+                .map(|m| {
+                    format!(
+                        "; balancer move {} of {} ({:?}) stays recorded until a writer holds it",
+                        m.id,
+                        m.from,
+                        map::phase(m)
+                    )
+                })
+                .unwrap_or_default();
+            self.set_balancer_state(format!("waiting: this writer holds no writer lease{left}"));
             return;
         }
         let now = self.grants.clock().now();
@@ -353,7 +531,7 @@ impl Node {
             .find(|m| map::node_move(m) && m.id.starts_with("bal-"))
             .cloned()
         {
-            if map::phase(&rec) < MovePhase::HandedOver {
+            if !map::committed(map::phase(&rec)) {
                 self.abort_balancer_move(&map, &rec).await;
             } else {
                 self.set_balancer_state(format!(
@@ -364,12 +542,72 @@ impl Node {
             }
             return;
         }
+        // A balancer range move or split no task of this writer's runs (D332 PR 5's design
+        // §5): an earlier writer's, or this writer's own that stopped. Aborted before its
+        // hand-over, ABORTING carried on, finished from HANDED_OVER.
+        if let Some(rec) = map
+            .moves
+            .iter()
+            .find(|m| !map::node_move(m) && m.id.starts_with("bal-"))
+            .cloned()
+        {
+            if map::committed(map::phase(&rec)) {
+                self.set_balancer_state(format!(
+                    "finishing range move {} of {} into {} (past its commit point)",
+                    rec.id, rec.from, rec.to
+                ));
+                self.spawn_resume(&map, &rec.id);
+            } else {
+                self.abort_balancer_range_move(&map, &rec).await;
+            }
+            return;
+        }
         if let Some(m) = map.moves.first() {
             self.set_balancer_state(format!("waiting: move {} is in flight", m.id));
             return;
         }
+        // A source the balancer emptied by a merge (D332 PR 5's design §3): its removal.
+        let emptied = emptied(&map);
+        let mut waiting = Vec::new();
+        for s in &emptied {
+            let Some(args) = self.own_args(&map) else {
+                return;
+            };
+            match super::range_merge::remove(&args, s).await {
+                Ok(super::range_merge::Ended::Waiting(why)) => {
+                    waiting.push(format!("{s}, merged away, waits for {why}"));
+                }
+                Ok(super::range_merge::Ended::Removed { dropped, left }) => {
+                    let mut st = format!("removed {s}, merged away earlier");
+                    if !dropped.is_empty() {
+                        st.push_str(&format!(" (moved aside: {})", dropped.join(", ")));
+                    }
+                    if !left.is_empty() {
+                        st.push_str(&format!("; not done: {}", left.join("; ")));
+                    }
+                    self.set_balancer_state(st);
+                    return;
+                }
+                // A stop is named in `state` like a wait, and the pass goes on: a fence it left
+                // (an operator's to lift) mustn't halt every other action (audit120's S2 on
+                // #2137). Each later pass tries the removal again.
+                Err(f) => {
+                    waiting.push(format!(
+                        "the removal of {s}, merged away, stopped: {}",
+                        f.message()
+                    ));
+                }
+            }
+        }
+        // A paused balancer names the removals that wait or stopped, as a skip does (audit120's
+        // nit on #2137): pausing doesn't hide a fence an operator has to lift.
         if mode == BalancerMode::Paused {
-            self.set_balancer_state("paused".into());
+            let mut st = String::from("paused");
+            for more in &waiting {
+                st.push_str("; ");
+                st.push_str(more);
+            }
+            self.set_balancer_state(st);
             return;
         }
         let mut statuses: HashMap<String, NodeStatus> = self
@@ -382,38 +620,79 @@ impl Node {
         if let Ok(mine) = tokio::task::spawn_blocking(move || node.status_with(true)).await {
             statuses.insert(self.id.clone(), mine);
         }
-        // Still the writer, with its lease, at the same map: or a later pass decides (S4).
+        let in_doubt = |p: &str| {
+            self.grants
+                .last_grant(p)
+                .is_some_and(|g| g.in_doubt_count > 0)
+        };
+        let (nodes, mut parts) = views(&map, &statuses, in_doubt);
+        // An emptied source is neither moved whole nor merged into while it waits.
+        parts.retain(|p| !emptied.contains(&p.id));
+        let bounds = bounds_of(&map);
+        let at = wall_ms();
+        // The tablets of one split candidate a pass, through the split loop's gates (D332 PR
+        // 5's design §1; S1 on #2137): before `decide`, which counts each pass's conditions
+        // once. One with no cut, or whose owner didn't answer, is set aside for a dwell, so
+        // the next pass surveys the next one over.
+        let candidate = {
+            let r = self.balancing();
+            let until: HashMap<String, u64> =
+                r.no_cut.iter().map(|(p, (t, _))| (p.clone(), *t)).collect();
+            balance::split_candidate(&nodes, &parts, &bounds, &r.counters, at, &until)
+        };
+        if let Some(i) = candidate {
+            let p = parts[i].clone();
+            let why = match self.tablets_of(&map, &p).await {
+                Some(t) => {
+                    parts[i].tablets = t;
+                    balance::unsplittable(&parts[i])
+                }
+                None => Some(format!("{}'s owner didn't answer the tablets survey", p.id)),
+            };
+            if let Some(why) = why {
+                self.set_aside(&p.id, at, &bounds, why);
+            }
+        }
+        // Still the writer, with its lease, at the same map, after the survey's wait: or a
+        // later pass decides (S4; audit120's S1 on #2137).
         let Ok(current) = self.get_map() else { return };
         if (current.writer_term, current.map_version) != (map.writer_term, map.map_version)
             || self.writer_lease_remaining(&current).is_zero()
         {
             return;
         }
-        let in_doubt = |p: &str| {
-            self.grants
-                .last_grant(p)
-                .is_some_and(|g| g.in_doubt_count > 0)
-        };
-        let (nodes, parts) = views(&map, &statuses, in_doubt);
-        let bounds = bounds_of(&map);
-        let at = wall_ms();
+        // The copy-time check's rate: this node's `--move-rate-bytes`, as the nodes' figure.
+        // A split's range copy is held to its source's; a whole move's copy isn't held to
+        // one, so for it this is a planning figure (perf287 on the D332 PR 5 design).
+        let rate = self
+            .server
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .and_then(|sh| sh.router.cluster.as_ref().map(|c| c.range_copies.rate()))
+            .unwrap_or(64 << 20);
         let decision = {
             let mut r = self.balancing();
-            let d = balance::decide(&nodes, &parts, &bounds, &mut r.counters, at, MOVE_RATE);
+            let d = balance::decide(&nodes, &parts, &bounds, &mut r.counters, at, rate);
             r.ratios = node_ratios(&nodes, &parts);
             d
         };
         match decision {
-            Decision::Skip(why) => self.set_balancer_state(format!("skip: {why}")),
-            Decision::Act(Action::Split { partition, .. }, why) => {
-                self.set_balancer_state(format!(
-                    "skip: a split of {partition} ({why}) waits for D331 PR 5's driver"
-                ));
+            Decision::Skip(why) => {
+                let mut st = format!("skip: {why}");
+                let aside = self.set_aside_now(at);
+                for more in waiting.iter().chain(std::iter::once(&aside)) {
+                    if !more.is_empty() {
+                        st.push_str("; ");
+                        st.push_str(more);
+                    }
+                }
+                self.set_balancer_state(st);
             }
-            Decision::Act(Action::Merge { from, into }, why) => {
-                self.set_balancer_state(format!(
-                    "skip: a merge of {from} into {into} ({why}) waits for D331 PR 6"
-                ));
+            Decision::Act(a @ Action::Split { .. }, why) => {
+                self.start_split(&map, &statuses, a, &why, at);
+            }
+            Decision::Act(a @ Action::Merge { .. }, why) => {
+                self.start_merge(&map, a, &why, at);
             }
             Decision::Act(a @ Action::Move { .. }, why) => self.start_move(&map, a, &why, at).await,
             Decision::Act(a @ (Action::Pin { .. } | Action::Unpin { .. }), why) => {
@@ -542,6 +821,344 @@ impl Node {
         self.balancing().moving = Some(task);
     }
 
+    /// Starts the split `a` on a task of its own, through D331 PR 5's split driver with a
+    /// `bal-` record: its SPLIT event and P's history go in the change that records the move
+    /// and adds the new partition, and the dwell starts once that has landed (as a move's).
+    /// The driver names the new partition `<P>-<v>` at the version its start lands at, so
+    /// the name is read from the record, never computed here (ai1249); the check below only
+    /// skips a split whose name couldn't be valid.
+    fn start_split(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+        statuses: &HashMap<String, NodeStatus>,
+        a: Action,
+        why: &str,
+        at: u64,
+    ) {
+        let Action::Split {
+            partition,
+            table,
+            key,
+            node: to_node,
+            bytes,
+            ..
+        } = &a
+        else {
+            return;
+        };
+        // D331's own limits on the source (its followers, its move rate and retention cap),
+        // reckoned on the moving tablets' bytes (the coordinator's amendment), then the
+        // dwell, which is the balancer's own (simp724, perf287's should-fix 2).
+        let bounds = bounds_of(map);
+        // A split that can't start: said in `state`, and its partition set aside (S1 on
+        // #2137), so the next pass surveys the next candidate over.
+        let cant = |reason: String| {
+            self.set_balancer_state(format!("skip: {why}, but {reason}"));
+            self.set_aside(partition, at, &bounds, reason);
+        };
+        let plan = match super::range_move::plan(map, statuses, partition, Some(*bytes)) {
+            Ok(plan) => plan,
+            Err(
+                super::range_move::Skip::Busy(s)
+                | super::range_move::Skip::Fit(s)
+                | super::range_move::Skip::Unknown(s),
+            ) => {
+                cant(format!("its split can't start: {s}"));
+                return;
+            }
+        };
+        if !balance::copy_fits_dwell(plan.copy, &bounds) {
+            cant(format!(
+                "its split's copy of {} bytes would take {} s at the source's move rate, \
+                 longer than the dwell",
+                plan.bytes,
+                plan.copy.as_secs()
+            ));
+            return;
+        }
+        let next = map.map_version.saturating_add(1);
+        let Some(new) = balance::split_id(partition, next) else {
+            cant(format!(
+                "its split's new partition {partition}-{next} would be over 64 characters"
+            ));
+            return;
+        };
+        if map.partitions.iter().any(|q| q.id == new) {
+            cant(format!("its split's new partition {new} is taken"));
+            return;
+        }
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        self.set_balancer_state(format!(
+            "starting the split of {partition}'s {table} onto node {to_node}: {why}"
+        ));
+        let spec = super::range_move::SplitSpec {
+            table: table.clone(),
+            from: partition.clone(),
+            key: key.clone(),
+            node: to_node.clone(),
+            id: None,
+        };
+        let (why, node) = (why.to_owned(), Arc::downgrade(self));
+        let task = tokio::spawn(async move {
+            let Action::Split {
+                partition,
+                table,
+                key,
+                node: to_node,
+                ..
+            } = &a
+            else {
+                return;
+            };
+            let with = |m: &mut ClusterMap| -> Result<(), crate::exit::Failure> {
+                // The decision's inputs (S4): no other move began meanwhile.
+                if m.moves.iter().any(|r| r.from != *partition) {
+                    return Err(crate::exit::Failure::usage(
+                        "another move started since the balancer decided",
+                    ));
+                }
+                let mut e = event(BalancerEventKind::Split, partition, &why, at);
+                e.to = to_node.clone();
+                e.table = table.clone();
+                e.split_key = Some(map::canonical_key(key));
+                push_event(m, e);
+                // P keeps its history; the new partition starts with none (simp724's M2).
+                push_history(m, partition, BalancerEventKind::Split, at);
+                Ok(())
+            };
+            let started = |id: &str| {
+                let Some(node) = node.upgrade() else { return };
+                {
+                    let mut r = node.balancing();
+                    r.counters.took(&a, at, &bounds);
+                    *r.actions.entry("split").or_insert(0) += 1;
+                }
+                let new = node
+                    .get_map()
+                    .ok()
+                    .and_then(|m| m.moves.iter().find(|r| r.id == id).map(|r| r.to.clone()))
+                    .unwrap_or_default();
+                node.set_balancer_state(format!(
+                    "splitting {partition}'s {table} into {new} on node {to_node} ({id}): {why}"
+                ));
+            };
+            let how = super::moving::Start {
+                prefix: "bal",
+                with: Some(&with),
+                on_started: Some(&started),
+            };
+            let out = super::range_move::split_as(&args, &spec, None, &how).await;
+            if let Err(f) = &out {
+                eprintln!(
+                    "phdb serve: the balancer's split of {partition} stopped: {}",
+                    f.message()
+                );
+                if let Some(node) = node.upgrade() {
+                    node.set_balancer_state(format!(
+                        "the split of {partition} stopped: {}",
+                        f.message()
+                    ));
+                }
+            }
+        });
+        self.balancing().moving = Some(task);
+    }
+
+    /// Sets split candidate `p` aside for a dwell from `at`: the next pass surveys the next
+    /// one over (S1 on #2137).
+    fn set_aside(&self, p: &str, at: u64, bounds: &Bounds, why: String) {
+        self.balancing()
+            .no_cut
+            .insert(p.to_owned(), (at.saturating_add(bounds.dwell_ms), why));
+    }
+
+    /// The split candidates set aside at `at`, for `state` (S1 on #2137): what a skip that
+    /// names an unsurveyed partition hides.
+    fn set_aside_now(&self, at: u64) -> String {
+        let mut r = self.balancing();
+        r.no_cut.retain(|_, (until, _)| at < *until);
+        let mut aside: Vec<String> = r
+            .no_cut
+            .iter()
+            .map(|(p, (until, why))| {
+                format!(
+                    "{p} set aside for {} s more as a split candidate: {why}",
+                    until.saturating_sub(at) / 1000
+                )
+            })
+            .collect();
+        aside.sort();
+        aside.join("; ")
+    }
+
+    /// Starts the merge `a` of S into T on a task of its own: D331 PR 6's merge, each of S's
+    /// ranges a `bal-` range move into T, then S's removal (D332 PR 5's design §3). The MERGE
+    /// event and S's history go in the change that records the first range, and the dwell
+    /// starts once that has landed (as a split's). A merge that stops part-way leaves S
+    /// holding the rest, a valid layout; a later pass judges S again, and an emptied S's
+    /// removal is the pass's own ([`emptied`]).
+    fn start_merge(self: &Arc<Self>, map: &ClusterMap, a: Action, why: &str, at: u64) {
+        let Action::Merge { from, into } = &a else {
+            return;
+        };
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        self.set_balancer_state(format!("starting the merge of {from} into {into}: {why}"));
+        let bounds = bounds_of(map);
+        let (why, node) = (why.to_owned(), Arc::downgrade(self));
+        let task = tokio::spawn(async move {
+            let Action::Merge { from, into } = &a else {
+                return;
+            };
+            // Whether the first range's record has landed, with the event and history.
+            let recorded = std::sync::atomic::AtomicBool::new(false);
+            let with = |m: &mut ClusterMap| -> Result<(), crate::exit::Failure> {
+                // The decision's inputs (S4): no other move began meanwhile.
+                if m.moves.iter().any(|r| r.from != *from) {
+                    return Err(crate::exit::Failure::usage(
+                        "another move started since the balancer decided",
+                    ));
+                }
+                if recorded.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
+                let mut e = event(BalancerEventKind::Merge, from, &why, at);
+                e.to = into.clone();
+                push_event(m, e);
+                // S's, which marks it as the balancer's to remove once emptied.
+                push_history(m, from, BalancerEventKind::Merge, at);
+                Ok(())
+            };
+            let started = |id: &str| {
+                let Some(node) = node.upgrade() else { return };
+                if !recorded.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    let mut r = node.balancing();
+                    r.counters.took(&a, at, &bounds);
+                    *r.actions.entry("merge").or_insert(0) += 1;
+                }
+                node.set_balancer_state(format!(
+                    "merging {from} into {into}, range move {id}: {why}"
+                ));
+            };
+            let how = super::moving::Start {
+                prefix: "bal",
+                with: Some(&with),
+                on_started: Some(&started),
+            };
+            let out = super::range_merge::run_as(&args, from, into, None, true, &how).await;
+            let Some(node) = node.upgrade() else { return };
+            match out {
+                Ok(r) => {
+                    let field = |k: &str| {
+                        r.document
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    let (source, detail) = (field("source"), field("detail"));
+                    node.set_balancer_state(if source == "removed" {
+                        format!("merged {from} into {into}, and removed {from}: {why}")
+                    } else {
+                        format!(
+                            "merged {from}'s ranges into {into}; {from}'s removal waits for \
+                             {detail}"
+                        )
+                    });
+                }
+                Err(f) => {
+                    eprintln!(
+                        "phdb serve: the balancer's merge of {from} into {into} stopped: {}",
+                        f.message()
+                    );
+                    node.set_balancer_state(format!(
+                        "the merge of {from} into {into} stopped: {}",
+                        f.message()
+                    ));
+                }
+            }
+        });
+        self.balancing().moving = Some(task);
+    }
+
+    /// Finishes an earlier writer's balancer range move or split `id`, past its commit point,
+    /// on a task of its own (D331 PR 5's `resume`: from the record, by its phase).
+    fn spawn_resume(self: &Arc<Self>, map: &ClusterMap, id: &str) {
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        let (id, node) = (id.to_owned(), Arc::downgrade(self));
+        let task = tokio::spawn(async move {
+            if let Err(f) = super::range_move::resume(&args, &id, None).await {
+                eprintln!(
+                    "phdb serve: the balancer finishing move {id} stopped: {}",
+                    f.message()
+                );
+                if let Some(node) = node.upgrade() {
+                    node.set_balancer_state(format!(
+                        "finishing move {id} stopped: {}",
+                        f.message()
+                    ));
+                }
+            }
+        });
+        self.balancing().moving = Some(task);
+    }
+
+    /// Ends a stopped balancer range move or split `rec` (an earlier writer's, or this
+    /// writer's own whose task stopped) before its commit point,
+    /// or carries on its abort (ABORTING): D331 PR 5's abort, which for a split also removes
+    /// its new partition once empty (simp724's M1 on the D332 PR 5 design). Then an ABORT
+    /// event. A target that can't drop its copy within the bound leaves the record
+    /// ABORTING; a later pass tries again.
+    async fn abort_balancer_range_move(self: &Arc<Self>, map: &ClusterMap, rec: &proto::RangeMove) {
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        self.set_balancer_state(format!(
+            "aborting the stopped balancer range move {} of {} into {}",
+            rec.id, rec.from, rec.to
+        ));
+        if let Err(f) =
+            super::range_move::abort(&args, &rec.id, Some(Duration::from_secs(60))).await
+        {
+            self.set_balancer_state(format!(
+                "aborting the stopped balancer range move {} of {}: {}",
+                rec.id,
+                rec.from,
+                f.message()
+            ));
+            return;
+        }
+        let Ok(now) = self.get_map() else { return };
+        let mut m = now.clone();
+        m.map_version += 1;
+        let at = wall_ms();
+        let mut e = event(
+            BalancerEventKind::Abort,
+            &rec.from,
+            "a stopped balancer range move (an earlier writer's, or this one's own), before its \
+             hand-over: this writer decides afresh",
+            at,
+        );
+        e.move_id = rec.id.clone();
+        e.to = rec.to.clone();
+        e.table = rec.table.clone();
+        push_event(&mut m, e);
+        let recorded = self.balancer_change(&now, m).await;
+        *self.balancing().actions.entry("abort").or_insert(0) += 1;
+        self.set_balancer_state(format!(
+            "aborted the stopped balancer range move {} of {} into {}{}",
+            rec.id,
+            rec.from,
+            rec.to,
+            unrecorded(recorded)
+        ));
+    }
+
     /// A map change of this writer's own balancer move, set here in process (audit120's M1
     /// on #2103: `SetMap` takes the admin scope, and the writer holds only the cluster
     /// token), compare-and-set against the map `m` was built from. Under the writer lease at
@@ -649,11 +1266,14 @@ impl Node {
         e.move_id = rec.id.clone();
         e.to = rec.to.clone();
         push_event(&mut m, e);
-        let _ = self.balancer_change(&now, m).await;
+        let recorded = self.balancer_change(&now, m).await;
         *self.balancing().actions.entry("abort").or_insert(0) += 1;
         self.set_balancer_state(format!(
-            "aborted an earlier writer's move {} of {} to node {}",
-            rec.id, rec.from, rec.to
+            "aborted an earlier writer's move {} of {} to node {}{}",
+            rec.id,
+            rec.from,
+            rec.to,
+            unrecorded(recorded)
         ));
     }
 

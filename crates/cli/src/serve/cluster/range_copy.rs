@@ -77,6 +77,12 @@ struct Bucket {
 }
 
 impl Sources {
+    /// `--move-rate-bytes`: this node's copy bandwidth, bytes a second. The balancer's
+    /// copy-time check reads the writer's, as the nodes' figure (D332 PR 5 design §6).
+    pub(crate) fn rate(&self) -> u64 {
+        self.rate
+    }
+
     pub(crate) fn new(rate: u64, cap: u64, max_followers: usize) -> Self {
         Self {
             copies: Mutex::default(),
@@ -91,6 +97,12 @@ impl Sources {
             lost: Mutex::default(),
             sweeping: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// `--move-rate-bytes`, `--move-retention-cap` and `--max-move-followers`, as this node
+    /// reports them for a move's plan (D331 PR 5).
+    pub(crate) fn limits(&self) -> (u64, u64, usize) {
+        (self.rate, self.cap, self.max_followers)
     }
 
     /// Takes `bytes` from the bucket (negative gives back), and how long the read must wait
@@ -237,8 +249,7 @@ impl Sources {
                     &m.id == id
                         && !super::map::node_move(m)
                         && m.from == s.partition
-                        && (MovePhase::Copying..=MovePhase::HandedOver)
-                            .contains(&super::map::phase(m))
+                        && super::map::follows(super::map::phase(m))
                         && owned(m)
                 });
                 live && now.duration_since(s.asked) < IDLE

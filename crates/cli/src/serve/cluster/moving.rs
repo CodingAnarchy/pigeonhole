@@ -98,18 +98,65 @@ impl At {
     }
 
     /// Partition `p`'s line in the node's `Status`, if it lists it.
-    async fn local(&self, p: &str) -> Result<Option<LocalPartition>, Failure> {
+    pub(super) async fn local(&self, p: &str) -> Result<Option<LocalPartition>, Failure> {
+        Ok(self
+            .status()
+            .await?
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == p))
+    }
+
+    /// The node's `Status`.
+    pub(super) async fn status(&self) -> Result<proto::NodeStatus, Failure> {
         let (mut c, _) = connect(&self.args, &self.args.node).await?;
-        let st = c
-            .status(request(StatusRequest::default(), self.token.as_deref())?)
-            .await
-            .map_err(|s| self.failed("status", &s))?
-            .into_inner();
-        Ok(st.partitions.into_iter().find(|lp| lp.id == p))
+        Ok(
+            c.status(request(StatusRequest::default(), self.token.as_deref())?)
+                .await
+                .map_err(|s| self.failed("status", &s))?
+                .into_inner(),
+        )
+    }
+
+    /// A split's new partition `p` here, created empty at `epoch` and marked for move
+    /// `move_id`, whose COPYING change carries map `version` (`StampRequest.create`, D331
+    /// PR 5). Run again on the same empty file, it refreshes the mark.
+    pub(super) async fn create(
+        &self,
+        cluster: &str,
+        p: &str,
+        epoch: u64,
+        move_id: &str,
+        version: u64,
+    ) -> Result<(), Failure> {
+        let (mut c, _) = connect(&self.args, &self.args.node).await?;
+        c.stamp(request(
+            proto::StampRequest {
+                cluster_id: cluster.to_owned(),
+                partition: p.to_owned(),
+                from_epoch: epoch - 1,
+                to_epoch: epoch,
+                restore: false,
+                restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
+                create: true,
+                create_move: move_id.to_owned(),
+                create_version: version,
+            },
+            self.token.as_deref(),
+        )?)
+        .await
+        .map_err(|s| self.failed("create", &s))?;
+        Ok(())
     }
 
     /// Fence, close or drop partition `p` here.
-    async fn call(&self, p: &str, what: &'static str) -> Result<LocalPartition, Failure> {
+    pub(super) async fn call(
+        &self,
+        p: &str,
+        what: &'static str,
+    ) -> Result<LocalPartition, Failure> {
         let (mut c, _) = connect(&self.args, &self.args.node).await?;
         let req = request(
             PartitionRequest {
@@ -121,6 +168,7 @@ impl At {
         let reply = match what {
             "fence" => c.fence(req).await,
             "close" => c.close(req).await,
+            "unfence" => c.unfence(req).await,
             _ => c.drop_partition(req).await,
         };
         Ok(reply.map_err(|s| self.failed(what, &s))?.into_inner())
@@ -130,7 +178,7 @@ impl At {
 /// A wait for a node: says every [`SAY_EVERY`] that it goes on, and gives up at
 /// `--timeout` (#1784), naming the step, the node's last answer and where that leaves the
 /// partition.
-struct Waiting {
+pub(super) struct Waiting {
     what: String,
     since: tokio::time::Instant,
     said: tokio::time::Instant,
@@ -142,7 +190,7 @@ struct Waiting {
 }
 
 impl Waiting {
-    fn new(what: String, limit: Option<Duration>, then: String) -> Self {
+    pub(super) fn new(what: String, limit: Option<Duration>, then: String) -> Self {
         let now = tokio::time::Instant::now();
         Self {
             what,
@@ -173,7 +221,7 @@ impl Waiting {
     /// the wait past its limit. The outer error is the wait given up; the inner, the
     /// call's own. With no time left (the last poll slept up to the limit), it gives up
     /// at once, with the node's last answer.
-    async fn ask<T>(&mut self, call: impl Future<Output = T>) -> Result<T, Failure> {
+    pub(super) async fn ask<T>(&mut self, call: impl Future<Output = T>) -> Result<T, Failure> {
         match self.left() {
             None => Ok(call.await),
             Some(Duration::ZERO) => Err(self.gave_up()),
@@ -188,7 +236,7 @@ impl Waiting {
     }
 
     /// The node said `now`: wait a poll, or give up at the limit.
-    async fn tick(&mut self, now: &str) -> Result<(), Failure> {
+    pub(super) async fn tick(&mut self, now: &str) -> Result<(), Failure> {
         now.clone_into(&mut self.last);
         if self.left() == Some(Duration::ZERO) {
             return Err(self.gave_up());
@@ -234,7 +282,7 @@ pub(super) fn record_gone(id: &str, partition: &str, node: &str, epoch: u64) -> 
 }
 
 /// The map as `args`' node has it.
-async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
+pub(super) async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
     Ok(c.get_map(request(GetMapRequest {}, token.as_deref())?)
         .await
@@ -249,7 +297,7 @@ async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
 /// CI). Each try reads the map again and applies `change` to it, so a map that landed
 /// meanwhile isn't overwritten or refused as stale (simp724's should on #2092); each is
 /// still compare-and-set.
-async fn set_record(
+pub(super) async fn set_record(
     args: &NodeArgs,
     change: impl Fn(&ClusterMap) -> Result<ClusterMap, Failure>,
 ) -> Result<(), Failure> {
@@ -285,7 +333,7 @@ async fn start_record(
     let prefix = how.prefix;
     if let Some(r) = m.moves.iter().find(|r| r.from == p.id || r.to == p.id) {
         let ours =
-            super::map::node_move(r) && r.to == to && super::map::phase(r) < MovePhase::HandedOver;
+            super::map::node_move(r) && r.to == to && !super::map::committed(super::map::phase(r));
         if !ours {
             return Err(Failure::usage(&format!(
                 "move {:?} names partition {} ({:?}, at {:?}): finish it, or abort it before \
@@ -386,7 +434,7 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
         )));
     };
     let phase = super::map::phase(&r);
-    if phase >= MovePhase::HandedOver {
+    if super::map::committed(phase) {
         return Err(Failure::usage(&format!(
             "move {} of {partition} is at {phase:?}, past its commit point: the map already \
              gives {partition} to node {}. Let it finish: run phdb cluster move {partition} \
@@ -1197,6 +1245,9 @@ async fn stamp(
             restore_from_cluster_id: String::new(),
             promote: false,
             replica_epoch: 0,
+            create: false,
+            create_move: String::new(),
+            create_version: 0,
         },
         new.token.as_deref(),
     )?)

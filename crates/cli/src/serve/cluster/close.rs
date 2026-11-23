@@ -405,6 +405,44 @@ impl Node {
                 "partition {id:?} is open here: close it first (phdb cluster close)"
             )));
         }
+        // D331 PR 6 (audit120's S1): a node the map still lists among the partition's
+        // replicas keeps its copy, open or not (seeding, a failed open), now that a merge
+        // drops files with no operator looking. One exception (R1): a copy an unfinished
+        // promote stamped, at an epoch a failover event names for this node, which failover
+        // tells the operator to drop here (#2087).
+        if let Ok(map) = self.get_map()
+            && let Some(p) = map
+                .partitions
+                .iter()
+                .find(|p| p.id == id && p.replicas.iter().any(|r| *r == self.id))
+        {
+            let path = self.dir.join(format!("{id}.phdb"));
+            let epoch = tokio::task::spawn_blocking(move || {
+                super::identity::read_file(&path)
+                    .ok()
+                    .flatten()
+                    .map(|i| i.epoch)
+            })
+            .await
+            .ok()
+            .flatten();
+            let orphan = epoch.is_some_and(|e| {
+                e != p.epoch
+                    && map.failovers.iter().any(|f| {
+                        f.kind() == crate::serve::proto::FailoverKind::Partition
+                            && f.partition == id
+                            && f.to == self.id
+                            && f.to_epoch == e
+                    })
+            });
+            if !orphan {
+                return Err(ApiError::failed_precondition(format!(
+                    "the cluster map (version {}) lists this node among partition {id:?}'s \
+                     replicas: set a map without it there first (phdb cluster set-map)",
+                    map.map_version
+                )));
+            }
+        }
         // A replica copy (D328) closes when a map drops it here.
         if self.replica_open(id) {
             return Err(ApiError::failed_precondition(format!(
@@ -414,7 +452,22 @@ impl Node {
         }
         let dir = self.dir.clone();
         let part = id.to_owned();
-        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await??;
+        let moved = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await?;
+        // Its operator fence goes with its files, moved now or before (a reconcile's
+        // move-aside): a later partition of the name (a split run again with the same --id)
+        // isn't fenced by it (audit120's S3, cli692's S2 on #2130).
+        // Only once its files are gone: a move that failed part way may leave the main file
+        // (audit120's nit).
+        let gone = match &moved {
+            Ok(_) => true,
+            Err(e) => e
+                .message
+                .contains(&format!("has no files of partition {id}")),
+        };
+        if gone {
+            self.forget_operator_fence(id).await?;
+        }
+        let lp = moved?;
         self.fences.forget_closed(id);
         eprintln!(
             "phdb serve: partition {id}'s files moved to {}: delete it once checked",
@@ -425,7 +478,7 @@ impl Node {
 }
 
 /// [`Node::drop_partition`]'s move, on a blocking thread.
-fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
+pub(super) fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
     let main = dir.join(format!("{id}.phdb"));
     let mut files = pigeonhole::Pigeonhole::database_files(&main)
         .map_err(|e| ApiError::internal(format!("list {}'s files: {e}", main.display())))?;

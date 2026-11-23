@@ -864,3 +864,64 @@ fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
         }
     });
 }
+
+/// D331 PR 5 (simp724's M1 on the design, and the range-scoped in-doubt rule): a spanning
+/// transaction's branch on the moving range is prepared before the move, and its home is
+/// paused before the commit point, so the share stays in doubt on the source. The move
+/// waits before the hand-over (no fence, no `fence_seqno`) for as long as it's in doubt.
+/// Released, the transaction commits, the move goes on, and the target holds the decided
+/// write.
+#[test]
+fn a_share_prepared_before_a_move_holds_it_until_the_home_decides() {
+    use crate::serve::cluster::spanning::seams::Step;
+    use crate::serve::proto::{GetMapRequest, MovePhase};
+    let t = Three::start(["", "", ""]);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        // Home p2 (by "zed"); its branch on p1 writes "d05", inside the moving [c, f).
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(c, &id, vec![put_row("d05", "1"), put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        // At the home's own node: a forward would time out while the home is paused.
+        let (pause, commit) = paused_commit(b, &id, Step::CommitPoint).await;
+        let args = super::backup::args(a);
+        let moving = tokio::spawn(async move {
+            let spec = super::super::range_move::Spec {
+                table: "users".into(),
+                from: "p1".into(),
+                to: "p2".into(),
+                start: Some(b"c".to_vec()),
+                end: Some(b"f".to_vec()),
+            };
+            super::super::range_move::run(&args, &spec, Some(Duration::from_secs(120)), true)
+                .await
+                .map(drop)
+        });
+        let phase = async || {
+            client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .moves
+                .first()
+                .map(super::super::map::phase)
+        };
+        eventually("the move reaches CATCHING_UP", async || {
+            phase().await == Some(MovePhase::CatchingUp)
+        })
+        .await;
+        // Held there while the share is in doubt.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(phase().await, Some(MovePhase::CatchingUp));
+        assert!(!moving.is_finished(), "the move ran past a share in doubt");
+        pause.go.send(false).unwrap();
+        commit.await.unwrap().unwrap();
+        moving.await.unwrap().unwrap();
+        assert_eq!(phase().await, None, "the move ended");
+        // Read through the map, which gives "d05" to p2 now.
+        assert_eq!(get_row(c, "d05").await.unwrap(), Some(b"1".to_vec()));
+    });
+}

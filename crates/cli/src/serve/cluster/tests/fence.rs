@@ -436,6 +436,11 @@ impl Rig {
 
     /// [`Rig::start`], each node with the token file `tokens`.
     fn start_with(tokens: &str) -> Self {
+        Self::start_p1(tokens, None)
+    }
+
+    /// [`Rig::start_with`], p1's database created with `p1` if given (small tablets, say).
+    fn start_p1(tokens: &str, p1: Option<pigeonhole::Options>) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -446,9 +451,14 @@ impl Rig {
         let limits = crate::serve::server_tests::limits();
         let mut stops = Vec::new();
         let mut dbs = Vec::new();
+        let mut p1 = p1;
         for ((l, dir), (id, p)) in listeners.into_iter().zip(&dirs).zip(NODES) {
             super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, tokens, limits, None, false);
+            let given = p1
+                .take()
+                .filter(|_| p == "p1")
+                .map(|o| test_partition_with(dir, p, o));
+            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, tokens, limits, given, false);
             stops.push(Some(stop));
             dbs.push(db);
         }
@@ -3045,7 +3055,9 @@ async fn balancer_mode(t: &Rig, mode: crate::serve::proto::BalancerMode) -> u64 
 
 /// Turns the balancer on over a skewed cluster: node c weighs ten, so a and b each hold ten
 /// times c's share of the bytes per unit of weight (1.43x the mean), over a `size_ratio`
-/// of 1.2 after one pass. The move goes to c; the dwell is long, so it's the only one.
+/// of 1.2 after one pass. The move goes to c; the dwell is long, so it's the only one. No
+/// partition is under a 1-byte `partition_min_bytes`, so none of these idle partitions is
+/// merged meanwhile.
 async fn balance_skewed(t: &Rig, token: Option<&str>) -> u64 {
     balancer_map(t, token, |m| {
         for n in m.nodes.iter_mut().filter(|n| n.id == "c") {
@@ -3055,6 +3067,7 @@ async fn balance_skewed(t: &Rig, token: Option<&str>) -> u64 {
             size_ratio: 1.2,
             passes: 1,
             dwell_ms: 600_000,
+            partition_min_bytes: 1,
             ..Default::default()
         });
         m.set_balancer(crate::serve::proto::BalancerMode::On);
@@ -3145,18 +3158,32 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
     use crate::serve::proto::BalancerEventKind;
     // simp724's S2 and audit120's M1 on #2103: every node has tokens, and the writer runs
     // its move with its cluster token alone, its map changes set in process. Node c weighs
-    // ten, so a is over its size bound: the balancer moves a's p1 to c. One MOVE event, p1's
-    // history, the record gone, p1 serving on c; nothing else moves within the dwell.
+    // ten, so a and b are over their size bounds: the balancer moves one of their
+    // partitions (p1 from a or p2 from b, whichever measures bigger) to c. One MOVE event,
+    // the partition's history, the record gone, it serving on c; nothing else moves within
+    // the dwell.
     let mut t = Rig::start_with(&balancer_tokens());
     let tok = Some(BALANCER_ADMIN);
     writer_leased_as(&mut t, tok);
     let [a, _, c] = t.ports;
     t.rt.block_on(async {
         balance_skewed(&t, tok).await;
-        let m = map_until(a, tok, Duration::from_secs(30), "p1 moved to c", |m| {
-            m.moves.is_empty() && m.partitions.iter().any(|p| p.id == "p1" && p.node == "c")
-        })
+        let on_c = |m: &crate::serve::proto::ClusterMap| {
+            m.partitions
+                .iter()
+                .find(|p| ["p1", "p2"].contains(&p.id.as_str()) && p.node == "c")
+                .map(|p| p.id.clone())
+        };
+        let m = map_until(
+            a,
+            tok,
+            Duration::from_secs(30),
+            "p1 or p2 moved to c",
+            |m| m.moves.is_empty() && on_c(m).is_some(),
+        )
         .await;
+        let moved = on_c(&m).unwrap();
+        let from = if moved == "p1" { "a" } else { "b" };
         let moves: Vec<_> = m
             .balancer_events
             .iter()
@@ -3169,12 +3196,12 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
                 moves[0].from.as_str(),
                 moves[0].to.as_str()
             ),
-            ("p1", "a", "c")
+            (moved.as_str(), from, "c")
         );
-        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
-        assert_eq!(p1.moves_history.len(), 1, "{p1:?}");
-        eventually_within(Duration::from_secs(10), "p1 to serve on c", async || {
-            local_as(c, "p1", tok).await.state() == LocalPartitionState::Serving
+        let p = m.partitions.iter().find(|p| p.id == moved).unwrap();
+        assert_eq!(p.moves_history.len(), 1, "{p:?}");
+        eventually_within(Duration::from_secs(10), "it to serve on c", async || {
+            local_as(c, &moved, tok).await.state() == LocalPartitionState::Serving
         })
         .await;
         // Within the dwell: no second move.
@@ -3321,10 +3348,12 @@ fn a_balancer_move_an_earlier_writer_left_past_its_commit_point_is_finished() {
 fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
     use crate::serve::proto::{BalancerEventKind, MovePhase};
     // simp724's M1 on #2103 (the plan's Amendment 2): the writer's lease bounds its
-    // balancer moves at every term, term 0 included. The balancer's move of p1 to c is held
-    // just before its stamp; a is cut off and its writer lease runs out; released, the move
-    // stamps c's copy but can't set its next map, so the record stays at COPYING and p1 on
-    // a. Joined again, the writer aborts it (it's before its commit point).
+    // balancer moves at every term, term 0 included. The balancer's move to c (of p1 from a
+    // or p2 from b: both are over their bound, and which goes first depends on their
+    // measured sizes) is held just before its stamp; the writer a is cut off and its writer
+    // lease runs out; released, the move stamps c's copy but can't set its next map, so the
+    // record stays at COPYING and the partition where it was. Joined again, the writer
+    // aborts it (it's before its commit point).
     use crate::serve::cluster::moving::HOLD_BEFORE_STAMP;
     let mut t = Rig::start();
     writer_leased(&mut t);
@@ -3354,8 +3383,16 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         )
         .await;
     });
-    let (id, from) = t.rt.block_on(async {
-        let (id, from, _) = bal_record(&map_of(a).await).expect("recorded");
+    let (id, from, home) = t.rt.block_on(async {
+        let m = map_of(a).await;
+        let (id, from, _) = bal_record(&m).expect("recorded");
+        // Where the moved partition was when the move was recorded.
+        let home = m
+            .partitions
+            .iter()
+            .find(|p| p.id == from)
+            .map(|p| p.node.clone())
+            .expect("the moved partition is listed");
         release_tx.send(()).expect("the move waits");
         // Passes enough for the move to try its next map, and the writer to try an abort.
         tokio::time::sleep(Duration::from_millis(2_000)).await;
@@ -3363,11 +3400,11 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         let (still, _, phase) = bal_record(&m).expect("still recorded");
         assert_eq!((still.as_str(), phase), (id.as_str(), MovePhase::Copying));
         assert!(
-            m.partitions.iter().any(|p| p.id == from && p.node == "a"),
+            m.partitions.iter().any(|p| p.id == from && p.node == home),
             "{:?}",
             m.partitions
         );
-        (id, from)
+        (id, from, home)
     });
     cut(&t, 0, false);
     t.rt.block_on(async {
@@ -3378,11 +3415,727 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
                     .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
         })
         .await;
+        let port = t.ports[["a", "b", "c"]
+            .iter()
+            .position(|n| *n == home)
+            .expect("a node of the rig")];
         eventually_within(
             Duration::from_secs(10),
-            "the partition to serve on a",
-            async || state(a, &from).await == LocalPartitionState::Serving,
+            "the partition to serve where it was",
+            async || state(port, &from).await == LocalPartitionState::Serving,
         )
         .await;
+    });
+}
+
+#[test]
+fn a_partition_with_a_share_in_doubt_isnt_moved_by_the_balancer_with_failover_off() {
+    // audit120's M1 on 1.3.0: the balancer never moves a partition with spanning shares in
+    // doubt. It reads the count from the owner's lease renewals, which carried it only with
+    // failover on. With failover off, p1's share is prepared and in doubt: a commit homed on
+    // c is held at its commit point, so the resolver leaves it, since its home has it in
+    // progress. b and c weigh ten, so only a is over its bound, and p1 is its one candidate.
+    // The balancer says so and moves nothing.
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    use crate::serve::proto::BalancerEventKind;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        assert!(!map_of(a).await.failover, "failover is off");
+        // c's p3 (the transaction's home) under its lease, as writer_leased waits only for a.
+        eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+            state(c, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        super::txn_write(
+            c,
+            &id,
+            vec![super::put_row("alice", "1"), super::put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let p = pause(&id, Step::CommitPoint);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move { super::spanning::commit_parts(c, &id, Vec::new()).await })
+        };
+        p.reached.notified().await;
+        // A renewal or two, so the writer holds p1's count before the balancer turns on.
+        tokio::time::sleep(super::TEST_LEASE * 2).await;
+        balancer_map(&t, None, |m| {
+            for n in m.nodes.iter_mut().filter(|n| n.id != "a") {
+                n.weight = 10;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                size_ratio: 1.2,
+                passes: 1,
+                dwell_ms: 600_000,
+                // No partition counts as small, so no merge decision takes the reason.
+                partition_min_bytes: 1,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        balancer_until(a, Duration::from_secs(20), |s| {
+            s.starts_with("skip: node a is over its bound, but no partition on it can move")
+        })
+        .await;
+        // Passes more, and still nothing moved.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of(a).await;
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Move),
+            "{:?}",
+            m.balancer_events
+        );
+        assert!(
+            m.partitions.iter().any(|q| q.id == "p1" && q.node == "a"),
+            "{:?}",
+            m.partitions
+        );
+        // The commit goes on.
+        p.go.send(false).unwrap();
+        let _ = commit.await;
+    });
+}
+
+#[test]
+fn a_grant_from_before_the_balancer_was_on_still_says_a_share_is_in_doubt() {
+    // simp724 on #2127: the balancer reads a partition's in-doubt count from the writer's
+    // last grant of it, ended or not. A grant renewed before the balancer was switched on
+    // must say so too, or the first pass after the switch, with an operator's passes 1,
+    // could move the partition. p2's share is held in doubt (a commit homed on c, held at
+    // its commit point). A few renewals later b's renewals to a are cut, so a's last grant
+    // of p2 is one from before the switch. Then the balancer comes on with only b over its
+    // bound: it reports that b can't move anything, and p2 stays on b.
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    use crate::serve::proto::BalancerEventKind;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        assert!(!map_of(a).await.failover, "failover is off");
+        for (port, p) in [(b, "p2"), (c, "p3")] {
+            eventually_within(Duration::from_secs(10), "p2 and p3 to serve", async || {
+                state(port, p).await == LocalPartitionState::Serving
+            })
+            .await;
+        }
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        super::txn_write(
+            c,
+            &id,
+            vec![super::put_row("hank", "1"), super::put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let p = pause(&id, Step::CommitPoint);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move { super::spanning::commit_parts(c, &id, Vec::new()).await })
+        };
+        p.reached.notified().await;
+        // A renewal or two with the share in doubt, while the balancer is still off; then
+        // b's renewals to a stop, so a's last grant of p2 is one of those.
+        tokio::time::sleep(super::TEST_LEASE * 2).await;
+        let cut = (t.dirs[1].clone(), format!("127.0.0.1:{a}"));
+        super::super::CUT_BETWEEN.lock().unwrap().push(cut.clone());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        balancer_map(&t, None, |m| {
+            for n in m.nodes.iter_mut().filter(|n| n.id != "b") {
+                n.weight = 10;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                size_ratio: 1.2,
+                passes: 1,
+                dwell_ms: 600_000,
+                partition_min_bytes: 1,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        balancer_until(a, Duration::from_secs(20), |s| {
+            s.starts_with("skip: node b is over its bound, but no partition on it can move")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of(a).await;
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Move),
+            "{:?}",
+            m.balancer_events
+        );
+        assert!(
+            m.partitions.iter().any(|q| q.id == "p2" && q.node == "b"),
+            "{:?}",
+            m.partitions
+        );
+        super::super::CUT_BETWEEN
+            .lock()
+            .unwrap()
+            .retain(|e| *e != cut);
+        p.go.send(false).unwrap();
+        let _ = commit.await;
+    });
+}
+
+/// A put of `row` through `port`, as `token`: `Ok` once acknowledged.
+async fn put_as(
+    port: u16,
+    row: &str,
+    value: &str,
+    token: Option<&str>,
+) -> Result<(), tonic::Status> {
+    data(port)
+        .await
+        .mutate(with(
+            crate::serve::proto::MutateRequest {
+                writes: Some(put_row(row, value)),
+                durability: 0,
+            },
+            token,
+        ))
+        .await
+        .map(drop)
+}
+
+/// `row`'s cell through `port`, as `token`.
+async fn get_as(port: u16, row: &str, token: Option<&str>) -> Option<Vec<u8>> {
+    data(port)
+        .await
+        .get(with(
+            crate::serve::proto::GetRequest {
+                table: "users".into(),
+                row: row.as_bytes().to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            },
+            token,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("get {row} through {port}: {e}"))
+        .into_inner()
+        .cell
+        .map(|c| c.value.to_vec())
+}
+
+/// The map's family for `users` (a range move copies its families' rows), as `token`.
+async fn with_family(t: &Rig, token: Option<&str>) -> u64 {
+    balancer_map(t, token, |m| {
+        m.tables[0].families = vec![crate::serve::proto::FamilySpec {
+            name: "f".into(),
+            ..Default::default()
+        }];
+    })
+    .await
+}
+
+#[test]
+fn two_small_neighbours_merge_and_the_emptied_source_is_dropped_with_tokens_configured() {
+    use crate::serve::proto::BalancerEventKind;
+    // D332 PR 5's design §7.2: two small, cold neighbours merge (an idle partition's load,
+    // under a hundredth of `partition_max_load`, is cold), and the emptied source is dropped once nothing waits for it. p3 is pinned, so
+    // p1 merges into its neighbour p2: its range moves as `bal-` records, with one MERGE
+    // event and p1's MERGE history entry. p1 then stays listed, holding nothing, while its
+    // moved-away row waits for the change feed (24 h, pruned here as #2131's tests do); the
+    // balancer's next passes retry its removal, and it leaves the map, the table one range
+    // on p2.
+    let mut t = Rig::start_with(&balancer_tokens());
+    let tok = Some(BALANCER_ADMIN);
+    writer_leased_as(&mut t, tok);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        balancer_map(&t, tok, |m| {
+            for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+                p.pinned = true;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                passes: 1,
+                dwell_ms: 600_000,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        let m = map_until(
+            a,
+            tok,
+            Duration::from_secs(120),
+            "p1 emptied into p2",
+            |m| {
+                m.moves.is_empty()
+                    && !super::super::map::placed(m, "p1")
+                    && m.partitions.iter().any(|p| p.id == "p1")
+            },
+        )
+        .await;
+        let merges: Vec<_> = m
+            .balancer_events
+            .iter()
+            .filter(|e| e.kind() == BalancerEventKind::Merge)
+            .collect();
+        assert_eq!(merges.len(), 1, "{:?}", m.balancer_events);
+        assert_eq!(
+            (merges[0].partition.as_str(), merges[0].to.as_str()),
+            ("p1", "p2")
+        );
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(
+            p1.moves_history
+                .last()
+                .map(crate::serve::proto::MoveHistory::kind),
+            Some(BalancerEventKind::Merge),
+            "{p1:?}"
+        );
+        assert!(
+            super::super::map::inside(&m.tables[0], b"", Some(b"m"), "p2"),
+            "{:?}",
+            m.tables[0]
+        );
+        // p1's moved-away rows pruned, as the 24 h grace would; the next pass drops it. Its
+        // removal closes p1's database, so a read here may find it closed: p1 is going.
+        let db_a = t.dbs[0].clone().unwrap();
+        let m = map_until(a, tok, Duration::from_secs(60), "p1 dropped", |m| {
+            for row in crate::serve::ranges::read_moved(&db_a).unwrap_or_default() {
+                let _ = crate::serve::ranges::prune_row(
+                    &db_a,
+                    crate::serve::ranges::Pruned::Moved,
+                    &row,
+                );
+            }
+            !m.partitions.iter().any(|p| p.id == "p1")
+        })
+        .await;
+        assert!(
+            super::super::map::inside(&m.tables[0], b"", Some(b"m"), "p2"),
+            "{:?}",
+            m.tables[0]
+        );
+    });
+}
+
+#[test]
+fn an_emptied_sources_stopped_removal_doesnt_halt_the_balancer() {
+    // audit120's S2 on #2137: p1, merged into p2 and waiting on its change feed, is fenced
+    // by an operator, so its removal stops (an operator's fence is the operator's to lift).
+    // The pass goes on to decide all the same: `state` is a skip that names the stop.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        balancer_map(&t, None, |m| {
+            for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+                p.pinned = true;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                passes: 1,
+                dwell_ms: 600_000,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        map_until(
+            a,
+            None,
+            Duration::from_secs(120),
+            "p1 emptied into p2",
+            |m| {
+                m.moves.is_empty()
+                    && !super::super::map::placed(m, "p1")
+                    && m.partitions.iter().any(|p| p.id == "p1")
+            },
+        )
+        .await;
+        fence(a, "p1").await.unwrap();
+        balancer_until(a, Duration::from_secs(30), |st| {
+            st.starts_with("skip:") && st.contains("the removal of p1, merged away, stopped")
+        })
+        .await;
+        // Paused, `state` still names the stop (audit120's nit on #2137).
+        balancer_mode(&t, crate::serve::proto::BalancerMode::Paused).await;
+        balancer_until(a, Duration::from_secs(30), |st| {
+            st.starts_with("paused; ") && st.contains("the removal of p1, merged away, stopped")
+        })
+        .await;
+        // Still listed: nothing removed it past the operator's fence.
+        assert!(
+            map_of_as(a, None)
+                .await
+                .partitions
+                .iter()
+                .any(|p| p.id == "p1")
+        );
+    });
+}
+
+#[test]
+fn a_big_partition_splits_at_its_halving_tablet_onto_a_cold_node_with_tokens_configured() {
+    use crate::serve::proto::BalancerEventKind;
+    // D332 PR 5's design §7.2: every node has tokens, and the writer runs the split with its
+    // cluster token alone. p2 and p3 are pinned and the size bound tiny, so p1 alone is a
+    // split candidate. p1's database splits its tablets at 16 KiB (the engine's test hook,
+    // the coordinator's ruling on #2137), so its users rows fill real tablets, and the
+    // balancer cuts [cut, g) to a new partition p1-<v> on b or c, under writes. One SPLIT
+    // event naming users; p1's history has it and the new partition's is empty; every
+    // acknowledged write reads back; nothing else splits within the dwell.
+    let small = pigeonhole::Options::default()
+        .tablet_changes(true)
+        .tablet_balance(Duration::from_millis(20), 1 << 20, 16 << 10);
+    let mut t = Rig::start_p1(&balancer_tokens(), Some(small));
+    let tok = Some(BALANCER_ADMIN);
+    writer_leased_as(&mut t, tok);
+    let a = t.ports[0];
+    let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    // Writes answered `Unknown`: the hand-over raises p1's epoch, so its lease on a ends
+    // for a round, and a commit in flight then may or may not be kept.
+    let unknown: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    t.rt.block_on(async {
+        with_family(&t, tok).await;
+        // About 400 KiB of users rows in p1 that don't compress (hex from a fixed xorshift),
+        // flushed: SST bytes past the tablets' 16 KiB. Values of 1 KiB stay in the SSTs (a
+        // large one is kept apart, and a tablet's bytes count its SSTs only).
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut value = || {
+            (0..64)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    format!("{x:016x}")
+                })
+                .collect::<String>()
+        };
+        // Two flushes, so the engine's size split (at the middle of its SSTs' bounds) cuts
+        // between the b rows and the e rows, where the writes below split evenly too.
+        let db = t.dbs[0].clone().unwrap();
+        for prefix in ["b", "e"] {
+            for i in 0..200 {
+                put_as(a, &format!("{prefix}{i:03}"), &value(), tok)
+                    .await
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+        let until = tokio::time::Instant::now() + Duration::from_secs(30);
+        while db
+            .tablets()
+            .iter()
+            .filter(|t| t.table == "users" && !t.start.is_empty())
+            .count()
+            == 0
+        {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "p1's users rows in two or more tablets: tablets {:?}; refusals {:?}",
+                db.tablets()
+                    .iter()
+                    .map(|t| (t.table.clone(), t.start.clone(), t.bytes))
+                    .collect::<Vec<_>>(),
+                db.tablet_refusals()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for i in 0..20 {
+            put_as(a, &format!("b{i:02}"), "0", tok).await.unwrap();
+            put_as(a, &format!("e{i:02}"), "0", tok).await.unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (acked, stop) = (std::sync::Arc::clone(&acked), std::sync::Arc::clone(&stop));
+            let unknown = std::sync::Arc::clone(&unknown);
+            tokio::spawn(async move {
+                let mut i = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for row in [format!("b{:02}", i % 20), format!("e{:02}", i % 20)] {
+                        match put_as(a, &row, &i.to_string(), tok).await {
+                            Ok(()) => acked.lock().unwrap().push((row, i.to_string())),
+                            Err(e) if e.code() == tonic::Code::Unknown => {
+                                unknown.lock().unwrap().push((row, i.to_string()));
+                            }
+                            // Refused: nothing was written.
+                            Err(_) => {}
+                        }
+                    }
+                    i += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        balancer_map(&t, tok, |m| {
+            for p in m.partitions.iter_mut().filter(|p| p.id != "p1") {
+                p.pinned = true;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                partition_max_bytes: 1 << 10,
+                partition_min_bytes: 1,
+                passes: 1,
+                dwell_ms: 600_000,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        let new_of = |m: &crate::serve::proto::ClusterMap| {
+            m.partitions
+                .iter()
+                .find(|p| {
+                    p.id.strip_prefix("p1-")
+                        .is_some_and(|v| v.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .cloned()
+        };
+        let m = map_until(a, tok, Duration::from_secs(60), "p1 split", |m| {
+            m.moves.is_empty() && new_of(m).is_some()
+        })
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        let new = new_of(&m).unwrap();
+        assert_ne!(new.node, "a", "{new:?}");
+        assert!(new.moves_history.is_empty(), "{new:?}");
+        let splits: Vec<_> = m
+            .balancer_events
+            .iter()
+            .filter(|e| e.kind() == BalancerEventKind::Split)
+            .collect();
+        assert_eq!(splits.len(), 1, "{:?}", m.balancer_events);
+        assert_eq!(
+            (
+                splits[0].partition.as_str(),
+                splits[0].table.as_str(),
+                splits[0].to.as_str()
+            ),
+            ("p1", "users", new.node.as_str())
+        );
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(
+            p1.moves_history
+                .iter()
+                .map(crate::serve::proto::MoveHistory::kind)
+                .collect::<Vec<_>>(),
+            vec![BalancerEventKind::Split],
+            "{p1:?}"
+        );
+        // The cut is a real tablet boundary inside p1's [.., g).
+        let cut = super::super::map::table_ranges(&m.tables[0])
+            .into_iter()
+            .find(|(_, _, p)| *p == new.id)
+            .map(|(lo, _, _)| lo)
+            .unwrap();
+        assert!(
+            !cut.is_empty() && cut.as_slice() < b"g".as_slice(),
+            "{cut:?}"
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            &cut,
+            Some(b"g"),
+            &new.id
+        ));
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"",
+            Some(&cut),
+            "p1"
+        ));
+        let mut last = std::collections::HashMap::new();
+        for (row, value) in acked.lock().unwrap().iter() {
+            last.insert(row.clone(), value.clone());
+        }
+        assert!(last.len() >= 2, "{last:?}");
+        for (row, value) in &last {
+            // The last acknowledged write, or a later one whose outcome was unknown.
+            let read = get_as(a, row, tok).await;
+            let later: Vec<String> = unknown
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(r, v)| {
+                    r == row && v.parse::<u32>().unwrap() > value.parse::<u32>().unwrap()
+                })
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert!(
+                read.as_deref() == Some(value.as_bytes())
+                    || later.iter().any(|v| read.as_deref() == Some(v.as_bytes())),
+                "row {row}: read {read:?}, last acknowledged {value}, unknown since {later:?}"
+            );
+        }
+        // Within the dwell: no second split.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of_as(a, tok).await;
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert_eq!(
+            m.balancer_events
+                .iter()
+                .filter(|e| e.kind() == BalancerEventKind::Split)
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn an_earlier_writers_split_before_its_hand_over_is_aborted_and_leaves_no_partition() {
+    use crate::serve::proto::BalancerEventKind;
+    // D332 PR 5's design §7.3 (simp724's M1): a `bal-` split of p1 at d onto c, recorded at
+    // COPYING with its new partition and no driver left, as an earlier writer would leave
+    // it. The writer's balancer doesn't take it up: it aborts it. The record and the new
+    // partition go together, an ABORT event names the move, and p1 serves the range as
+    // before.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    let args = super::super::cli::NodeArgs {
+        own: None,
+        node: format!("http://127.0.0.1:{a}"),
+        token_file: None,
+        ca: None,
+    };
+    t.rt.block_on(async {
+        with_family(&t, None).await;
+        for i in 0..20 {
+            put_as(a, &format!("e{i:02}"), "0", None).await.unwrap();
+        }
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        let (id, new) = super::super::range_move::begin_split(
+            &args,
+            &spec,
+            &super::super::moving::Start {
+                prefix: "bal",
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
+        let m = map_until(a, None, Duration::from_secs(60), "the split aborted", |m| {
+            m.moves.is_empty()
+                && m.balancer_events
+                    .iter()
+                    .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
+        })
+        .await;
+        assert!(
+            !m.partitions.iter().any(|p| p.id == new),
+            "{:?}",
+            m.partitions
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"a",
+            Some(b"g"),
+            "p1"
+        ));
+        put_as(a, "e05", "after", None).await.unwrap();
+        assert_eq!(get_as(a, "e05", None).await, Some(b"after".to_vec()));
+    });
+}
+
+#[test]
+fn an_earlier_writers_split_past_its_hand_over_is_finished() {
+    use crate::serve::proto::{BalancerEventKind, MovePhase};
+    // D332 PR 5's design §7.3: a `bal-` split of p1 at d onto c stopped right after its
+    // HANDED_OVER change landed (range_move::STOP), as an earlier writer would leave it. The
+    // writer's balancer finishes it (range_move::resume): the record goes, the new
+    // partition holds [d, g), the rows read back, and nothing is aborted.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    let args = super::super::cli::NodeArgs {
+        own: None,
+        node: format!("http://127.0.0.1:{a}"),
+        token_file: None,
+        ca: None,
+    };
+    t.rt.block_on(async {
+        with_family(&t, None).await;
+        for i in 0..20 {
+            put_as(a, &format!("e{i:02}"), &i.to_string(), None)
+                .await
+                .unwrap();
+        }
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandedOver));
+        let stopped = super::super::range_move::split_as(
+            &args,
+            &spec,
+            Some(Duration::from_secs(120)),
+            &super::super::moving::Start {
+                prefix: "bal",
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(stopped.is_err(), "the split ran past HANDED_OVER");
+        let m = map_of(a).await;
+        let r = m
+            .moves
+            .iter()
+            .find(|r| r.id.starts_with("bal-"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{:?}", m.moves));
+        assert_eq!(super::super::map::phase(&r), MovePhase::HandedOver);
+        balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
+        let m = map_until(
+            a,
+            None,
+            Duration::from_secs(60),
+            "the split finished",
+            |m| m.moves.is_empty(),
+        )
+        .await;
+        assert!(
+            m.partitions.iter().any(|p| p.id == r.to && p.node == "c"),
+            "{:?}",
+            m.partitions
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"d",
+            Some(b"g"),
+            &r.to
+        ));
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Abort),
+            "{:?}",
+            m.balancer_events
+        );
+        for i in 0..20 {
+            assert_eq!(
+                get_as(a, &format!("e{i:02}"), None).await,
+                Some(i.to_string().into_bytes()),
+                "e{i:02}"
+            );
+        }
     });
 }
