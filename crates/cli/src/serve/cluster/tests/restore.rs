@@ -10,7 +10,7 @@ use super::*;
 use crate::serve::cluster::backup::backup;
 use crate::serve::cluster::restore::{RestoreArgs, restore};
 use crate::serve::proto::{
-    LocalPartitionState, MutateRequest, PartitionRequest, SubscribeRequest,
+    LocalPartitionState, MutateRequest, PartitionRequest, PartitionRole, SubscribeRequest,
     feed_client::FeedClient, feed_event::Event, subscribe_request::Start,
 };
 
@@ -304,6 +304,109 @@ async fn the_live_map(port: u16) -> ClusterMap {
         .await
         .unwrap()
         .into_inner()
+}
+
+/// audit120's M10: a whole restore that puts p3 on b, which holds p3's replica copy (D328),
+/// is refused before any upload or stamp. Before, b's stamp refused it only after every
+/// upload, and after p1 and p2 were stamped.
+#[test]
+fn a_restore_onto_a_node_holding_the_partitions_replica_is_refused_before_anything_changes() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    load(&rt, a, 6);
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    rt.block_on(async {
+        // b in p3's replicas, through the writer (retried while a peer's map is settling).
+        let mut last = None;
+        for _ in 0..100 {
+            let mut m = the_live_map(a).await;
+            let expected = m.map_version;
+            m.map_version += 1;
+            m.partitions
+                .iter_mut()
+                .filter(|q| q.id == "p3")
+                .for_each(|q| q.replicas = vec!["b".into()]);
+            match client(a)
+                .await
+                .set_map(SetMapRequest {
+                    force: false,
+                    expected_map_version: expected,
+                    map: Some(m),
+                    copies: Vec::new(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(last.is_none(), "set the map: {last:?}");
+        eventually("b's replica copy of p3 to open", async || {
+            client(b)
+                .await
+                .status(StatusRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p3" && lp.role == PartitionRole::Replica as i32)
+        })
+        .await;
+        assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
+        assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
+        let before = the_live_map(a).await;
+
+        // The backup's map with p3 on b: its tables are the backup's, so `--map` takes it.
+        let mut m =
+            super::super::map::parse_json(&std::fs::read_to_string(out.join("map.json")).unwrap())
+                .unwrap();
+        m.partitions
+            .iter_mut()
+            .filter(|q| q.id == "p3")
+            .for_each(|q| q.node = "b".into());
+        let edited = test_dir().join("p3-on-b.json");
+        std::fs::write(&edited, super::super::map::canonical_json(&m)).unwrap();
+        let e = restore(
+            &args(a),
+            &RestoreArgs {
+                map: Some(edited),
+                ..restore_args(&out)
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            e.message()
+                .contains("which partition p3 is restored to, holds a replica copy of it"),
+            "{}",
+            e.message()
+        );
+        // Nothing changed: the same map, and every node's own copy still at epoch 1 (p1 and
+        // p2 weren't stamped before p3's refusal).
+        assert_eq!(the_live_map(a).await, before);
+        for (port, (_, p)) in ports.iter().zip(NODES) {
+            let listed = client(*port)
+                .await
+                .status(StatusRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions;
+            let own = listed
+                .iter()
+                .find(|lp| lp.id == p && lp.role != PartitionRole::Replica as i32)
+                .unwrap_or_else(|| panic!("{p} listed: {listed:?}"));
+            assert_eq!(own.epoch, 1, "{p}: {own:?}");
+        }
+    });
 }
 
 /// simp724's S1 on #1764: a restore that failed after its stamps, run again, neither
