@@ -2575,6 +2575,69 @@ fn a_token_from_before_a_whole_table_move_resumes_through_the_source_then_the_ta
     });
 }
 
+/// D331 PR 5 (simp724's P2 form; feed1248's W1, W3): once the source's moved-away row of a
+/// table moved off it whole is pruned, a token from before the move is `FeedExpired` there,
+/// not left out by the "neither" branch: the table's pruned watermark answers for it, read
+/// from the file as a copy that never had the row would read it. The prune is the pass's
+/// own write ([`ranges::prune_row`]); its rules are `range_prune`'s, tested there. The node
+/// restarts so its gate takes the file's rows, as a promoted copy's does.
+///
+/// [`ranges::prune_row`]: crate::serve::ranges::prune_row
+#[test]
+fn a_token_from_before_a_pruned_whole_table_move_expires() {
+    use crate::serve::ranges::{self, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        let req = |start| SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            start,
+            ..Default::default()
+        };
+        let token = t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            put_order(c, "k1").await;
+            let (first, _) = commits(&mut s, 1).await;
+            let token = first[0].token.clone().unwrap();
+            let last = put_order(c, "k2").await;
+            drop(s);
+            move_orders(&ports, "", last).await;
+            token
+        });
+        let db = t.dbs[0].clone().unwrap();
+        let row = ranges::read_moved(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .expect("p1's moved-away row");
+        ranges::prune_row(&db, Pruned::Moved, &row).unwrap();
+        assert!(ranges::watermark(&db, Pruned::Moved, "orders").unwrap() >= row.final_seqno);
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let ended = loop {
+                let e = match subscribe(c, req(Some(Start::Resume(token.clone())))).await {
+                    Err(e) => e,
+                    Ok(mut s) => match s.message().await {
+                        Err(e) => e,
+                        Ok(m) => panic!("the resume read on: {m:?}"),
+                    },
+                };
+                let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+                if !again || tokio::time::Instant::now() >= deadline {
+                    break e;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+        });
+    });
+}
+
 /// D331 PR 3b (cli692's M1): between a move's HANDED_OVER and CLEANING the target serves none
 /// of the range yet and has no hand-over position: a subscription isn't rerouted then, and a
 /// resume that would gain the target is refused retry-safe (`PartitionUnavailable`), not

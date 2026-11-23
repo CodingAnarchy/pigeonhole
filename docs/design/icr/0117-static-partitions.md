@@ -880,7 +880,7 @@ A partition that opens gates its moved ranges from those rows before it serves.
 - A moved-away range is served again only where a serving row with a newer hand-over pair covers it: a later move gave it back, partly or whole.
 - Any other part a map places on the partition, such as a forced map with no move back, answers `PartitionUnavailable`, naming the move, because its rows there may have been cleaned.
 
-A moved-away row outlives the move record and is pruned by PR 5's writer, at the later of two bounds: every node holds a map at or after the hand-over, and the transaction lifetime plus the request timeout has passed. A serving row lives while it gates its target or clears an older moved-away row.
+A moved-away row outlives the move record. Each node prunes its own partitions' rows on its own timer (D331 PR 5, below), not the map's writer: a moved-away row at the latest of these bounds: every node holds a map at or after the hand-over, the transaction lifetime plus the request timeout has passed, and its feed retention has passed it. A serving row lives while it gates its target or clears an older moved-away row.
 
 **Not yet:** the copy and the range follower (PR 4); the driver, the drain and `final_seqno`, the never-both decision, cleanup and the CLI (PR 5); refusing D329 prepares and read holds on a fenced range (with D329 PR 2a); the cluster feed's hold, clipping and backups (PR 3).
 
@@ -937,9 +937,10 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 - The merge retires the part and leaves it out of later checkpoints.
 - Without the row, it answers `WrongPartition`, and a resume of it expires.
 
-**Pruning, for PR 5:**
-- A target's serving row goes only once its own feed floor has passed `t_from`.
+**Pruning (PR 5, below):**
+- A target's serving row goes only once its own feed floor has passed `t_from`, and once its node's map no longer has the move.
 - A source's moved-away row goes only once its feed retention has passed `final_seqno`, plus PR 2's bounds.
+- **"Without the row" no longer leans on retention** (simp724's P2 form). Each prune raises its table's watermark in the same logged write, so every copy carries it. A resume below the watermark that no live row covers is `FeedExpired` on any copy, including a promoted replica with longer retention than the owner's.
 
 ## D331 PR 4b: a range move's copy and catch-up (1.3.0, #1499)
 **A range move's target copies its range from the source, then applies the source's history of it through the move's `final_seqno`.** The design was reviewed by cli692 (M1–M4), feed1248 (G1, G2), simp724 (the copy's idempotence, D34) and perf287 (the cost). PR 5's driver moves the phases. This PR runs what each phase needs.
@@ -1081,3 +1082,31 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 
 **Not yet:** splits and merges (D331 PR 5, PR 6; until then a too-big or too-hot partition's state says its split waits for D331 PR 5, since no tablets are surveyed), `--move-rate-bytes` (D331 PR 4b; the copy-time check uses its 64 MiB/s default), and the guide (PR 4).
 
+
+## D331 PR 5: pruning a range move's rows (1.3.0, #1499)
+**Each node prunes its own partitions' moved-away and serving rows on a timer (every 60 s), and a pruned move leaves a per-table watermark.** No wire change. The rules are the design's and feed1248's (P1–P3), with simp724's watermark form for P2.
+
+**When a row goes.** Each check below must hold.
+- **A source's moved-away row:**
+  - the map no longer has its move;
+  - every node of the map answers with a map at or after the hand-over's version;
+  - the transaction lifetime plus the request timeout have passed since the partition recorded it;
+  - its feed retention has passed it.
+- **A target's serving row:**
+  - its node's map no longer has the move (P1);
+  - no older moved-away row on the partition overlaps it;
+  - its feed retention has passed its `t_from`.
+- **"Retention has passed" is the resume rule's own test (P3):** a resume from the row's token expires. A moved-away row records the feed token at its hand-over, which is past `final_seqno`. A row without a token (the feed was off) has nothing retained for it.
+
+**How a row goes.**
+- The prune runs under the partition's write gate, so only an owner holding its lease prunes.
+- It is one logged write: the row's delete, and its table's watermark raised to the row's `final_seqno` (moved-away) or `t_from` (serving), `pruned/moved/<table>` or `pruned/serving/<table>` in `__phdb_cluster`.
+- The watermark only rises (feed1248's W2), and outlives the table (W1).
+
+**What the watermark answers.**
+- A cluster component's resume below a table's watermark, with no live row of the table covering it, is `FeedExpired`, on the source and on the target alike. This holds on every copy, whatever its retention (P2).
+- A component starting from now, or from the oldest retained position, isn't checked. On the owner, the oldest retained position is already past the watermark, since the prune needed retention to pass it.
+
+**The source's table.** Once the last moved-away row of a table moved off whole goes, the schema reconcile drops the table there at the next map install.
+
+**A forced map** placing a pruned range back on its old source serves it empty, not `Returned` (the coordinator's ruling on Q1). The guide says to check the move's status before forcing a range back.

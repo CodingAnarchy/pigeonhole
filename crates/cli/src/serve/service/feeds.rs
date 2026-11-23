@@ -176,6 +176,33 @@ impl Service {
             })?;
             r.start = Some(S::Resume(first.token.clone().into()));
         }
+        // D331 PR 5 (simp724's P2 form): a resume below a table's pruned watermark, with no
+        // live serving row of the table, has lost its hand-over's barrier: expired, on every
+        // copy, whatever its own retention.
+        if let (Some(S::Resume(t)), Some(part)) = (r.start.as_ref(), self.part_opt()) {
+            let from = super::super::cluster::token::token_seqno(t).unwrap_or(0);
+            for table in tables
+                .iter()
+                .filter(|t| !rows.iter().any(|m| m.table == **t))
+            {
+                let mark = super::super::ranges::watermark(
+                    &part.db,
+                    super::super::ranges::Pruned::Serving,
+                    table,
+                )
+                .map_err(ApiError::internal)?;
+                if from < mark {
+                    return Err(ApiError::from_code(
+                        pigeonhole::ErrorCode::FeedExpired,
+                        &format!(
+                            "a range of table {table:?} moved to this partition past this \
+                             resume's position, and that move's record here is pruned: \
+                             subscribe again"
+                        ),
+                    ));
+                }
+            }
+        }
         Ok(barriers_for(rows, r.start.as_ref()))
     }
 

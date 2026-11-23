@@ -1415,7 +1415,13 @@ impl Ctx {
                 let routes = routes
                     .as_ref()
                     .ok_or_else(|| ApiError::partition_unavailable("this node has no map"))?;
-                let (kept, ends_at) = moved_end(&here, routes, &open.partition, &request.tables)?;
+                let (kept, ends_at) = moved_end(
+                    &here,
+                    routes,
+                    &open.partition,
+                    &request.tables,
+                    request.start.as_ref(),
+                )?;
                 request.tables = kept;
                 ends_at
             };
@@ -1621,7 +1627,13 @@ pub(crate) async fn serve(
                 req.partition
             )));
         };
-        let (kept, ends_at) = moved_end(&service, routes, &req.partition, &r.tables)?;
+        let (kept, ends_at) = moved_end(
+            &service,
+            routes,
+            &req.partition,
+            &r.tables,
+            r.start.as_ref(),
+        )?;
         r.tables = kept;
         (service, ends_at)
     };
@@ -1649,20 +1661,29 @@ pub(crate) async fn serve(
 /// D331 PR 3b: which of `tables` a component on `partition` (served by `service`) reads,
 /// and where it ends. A table the map places here is read. One it doesn't that a range move
 /// took from it whole is still its own to serve, up to the move's last seqno, while it holds
-/// the moved-away row. Any other is left out (feed1248's M1): it was never here, or PR 5
-/// pruned its row. Leaving a pruned one out is safe only by PR 5's rule that it prunes a row
-/// once this partition's feed retention has passed the move's last seqno, so a position
-/// below that fails on retention here anyway (cli692; ICR 0117's D331 PR 3b section). None left: `WrongPartition` (a resume of it expires). When every
+/// the moved-away row. Any other is left out (feed1248's M1): it was never here, or its row
+/// was pruned, when a resume below the table's pruned watermark is `FeedExpired` instead
+/// (below). None left: `WrongPartition` (a resume of it expires). When every
 /// table kept is a moved one, the component ends past the latest of their last seqnos
 /// (`Some`); else it reads on (`None`: the moved tables' later events here are only
 /// feed-silent cleanup). A running component finds the same end when a move takes its last
 /// table here ([`crate::serve::feed`]'s barriers' watch).
+///
+/// D331 PR 5 (simp724's P2 form): a resume below a table's pruned watermark, which no live
+/// moved-away row covers, is `FeedExpired`, not left out, on every copy of the partition:
+/// a promoted replica with longer retention can't take the "neither" branch below a pruned
+/// move.
 fn moved_end(
     service: &Service,
     routes: &super::route::Routes,
     partition: &str,
     tables: &[String],
+    start: Option<&S>,
 ) -> Result<(Vec<String>, Option<u64>), ApiError> {
+    let resumed = match start {
+        Some(S::Resume(t)) => Some(super::token::token_seqno(t).unwrap_or(0)),
+        _ => None,
+    };
     let mut kept = Vec::with_capacity(tables.len());
     let mut gone = 0;
     let mut last = 0;
@@ -1676,6 +1697,19 @@ fn moved_end(
             kept.push(t.clone());
             gone += 1;
             last = last.max(f);
+        } else if let (Some(from), Some(part)) = (resumed, service.part_opt()) {
+            let mark =
+                crate::serve::ranges::watermark(&part.db, crate::serve::ranges::Pruned::Moved, t)
+                    .map_err(ApiError::internal)?;
+            if from < mark {
+                return Err(ApiError::from_code(
+                    pigeonhole::ErrorCode::FeedExpired,
+                    &format!(
+                        "table {t:?} moved off partition {partition:?} past this resume's \
+                         position, and that move's record here is pruned: subscribe again"
+                    ),
+                ));
+            }
         }
     }
     if kept.is_empty() {
