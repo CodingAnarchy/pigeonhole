@@ -301,7 +301,7 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
         // 5.
         let mut dropped = Vec::new();
         at.call(s, "close").await?;
-        if let Some(file) = drop_at(&at, s).await? {
+        if let Some(file) = drop_settled(&at, s).await? {
             dropped.push(format!("{node}: {file}"));
         }
         for r in &p.replicas {
@@ -319,7 +319,7 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
                     continue;
                 }
             };
-            match drop_replica(&at, s).await {
+            match drop_settled(&at, s).await {
                 Ok(Some(file)) => dropped.push(format!("{r}: {file}")),
                 Ok(None) => {}
                 Err(e) => eprintln!(
@@ -457,13 +457,18 @@ async fn drop_at(at: &At, s: &str) -> Result<Option<String>, Failure> {
     }
 }
 
-/// [`drop_at`] on a former replica node, which closes its copy once it installs the map
-/// without `s`: a copy still open is retried for [`REPLICA_CLOSE`] (audit120's S2).
-async fn drop_replica(at: &At, s: &str) -> Result<Option<String>, Failure> {
+/// [`drop_at`] on a node that may not have installed the map without `s` yet: its refusal
+/// while it still places `s` (cli692's S1 on #2130), or while a former replica's copy is
+/// still open (audit120's S2), is retried for [`REPLICA_CLOSE`].
+async fn drop_settled(at: &At, s: &str) -> Result<Option<String>, Failure> {
     let until = tokio::time::Instant::now() + REPLICA_CLOSE;
     loop {
         match drop_at(at, s).await {
-            Err(f) if f.message().contains("still open") && tokio::time::Instant::now() < until => {
+            Err(f)
+                if (f.message().contains("still open")
+                    || f.message().contains("still places partition"))
+                    && tokio::time::Instant::now() < until =>
+            {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             other => return other,
@@ -512,7 +517,7 @@ async fn unlisted_drops(args: &NodeArgs, m: &ClusterMap, s: &str) -> Result<Vec<
             }
             at.call(s, "close").await?;
         }
-        if let Some(file) = drop_replica(&at, s).await? {
+        if let Some(file) = drop_settled(&at, s).await? {
             dropped.push(format!("{}: {file}", n.id));
         }
     }

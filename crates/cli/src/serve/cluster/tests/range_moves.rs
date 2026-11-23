@@ -2486,3 +2486,92 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
         assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
     });
 }
+
+/// D331 PR 6: `phdb cluster merge p1 --into p2` under writes. p1's range of `users` moves
+/// into p2 (one RANGE record, as a `move-range` would make), every acknowledged write reads
+/// back, the map places the whole table on p2, and p1 stays listed holding nothing: its
+/// node says what still needs it (its change feed's tail, until its feed retention prunes
+/// the moved-away row), and the merge ends saying it waits rather than removing it.
+#[test]
+fn merge_moves_every_range_into_the_target_and_leaves_the_emptied_source_waiting() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    t.rt.block_on(async {
+        with_families(&t).await;
+        for i in 0..30 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (acked, stop) = (std::sync::Arc::clone(&acked), std::sync::Arc::clone(&stop));
+            tokio::spawn(async move {
+                let mut i = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (row, value) = (format!("d{:02}", i % 30), i.to_string());
+                    if try_put(c, &row, &value).await.is_ok() {
+                        acked.lock().unwrap().push((row, value));
+                    }
+                    i += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let report = super::super::range_merge::run(
+            &super::backup::args(a),
+            "p1",
+            "p2",
+            Some(Duration::from_secs(120)),
+            true,
+        )
+        .await
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        assert_eq!(report.document["source"], serde_json::json!("waiting"));
+        assert_eq!(report.document["ranges_moved"], serde_json::json!(1));
+        let detail = report.document["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("change feed"), "{detail}");
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(m.partitions.iter().any(|p| p.id == "p1"), "p1 stays listed");
+        assert!(!super::super::map::placed(&m, "p1"));
+        // Every range of the table is p2's (the hand-over keeps the split key between them).
+        assert!(
+            super::super::map::table_ranges(&m.tables[0])
+                .iter()
+                .all(|(_, _, p)| *p == "p2"),
+            "{:?}",
+            m.tables[0]
+        );
+        let mut last = std::collections::HashMap::new();
+        for (row, value) in acked.lock().unwrap().iter() {
+            last.insert(row.clone(), value.clone());
+        }
+        assert!(!last.is_empty());
+        for (row, value) in &last {
+            assert_eq!(
+                get_row(c, row).await.unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "row {row}"
+            );
+        }
+        // A rerun finds nothing left to move and still waits.
+        let again = super::super::range_merge::run(
+            &super::backup::args(a),
+            "p1",
+            "p2",
+            Some(Duration::from_secs(60)),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.document["ranges_moved"], serde_json::json!(0));
+        assert_eq!(again.document["source"], serde_json::json!("waiting"));
+    });
+}
