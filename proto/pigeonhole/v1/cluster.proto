@@ -380,7 +380,11 @@ enum MoveKind {
   // D332: a whole partition relocated to another node (no table or range; `to` names the
   // node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
   MOVE_KIND_NODE = 3;
-  // PR 6 (merge) adds MOVE_KIND_MERGE = 4.
+  // 4 was MOVE_KIND_MERGE, withdrawn before release (the coordinator, 2026-11-22): a merge
+  // (D331 PR 6) is a sequence of MOVE_KIND_RANGE records, one per range, then the source's
+  // removal. Never reassigned.
+  reserved 4;
+  reserved "MOVE_KIND_MERGE";
 }
 
 // D331: where a range move is. A move goes forward one phase per map; before HANDED_OVER it
@@ -399,9 +403,11 @@ enum MovePhase {
   // T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
   // ended); S deletes its copy.
   MOVE_PHASE_CLEANING = 5;
-  // PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
-  // the merged-away source waits for its transaction outcomes before it's dropped. The
-  // phases stay in order, so "from HANDED_OVER on" includes it.
+  // 6 was MOVE_PHASE_AWAITING_OUTCOMES, withdrawn before release (the coordinator,
+  // 2026-11-22): a merged-away source waits, listed and holding no range, until its node's
+  // `LocalPartition.drop_waits` is empty. Never reassigned.
+  reserved 6;
+  reserved "MOVE_PHASE_AWAITING_OUTCOMES";
   // D331 PR 5: an abort under way, from COPYING, CATCHING_UP or HANDING_OVER: before the
   // commit point and inactive. S serves the range as if no move named it (no fence), T
   // serves none of it and drops what it copied, and a split's new partition goes once its
@@ -789,6 +795,12 @@ message LocalPartition {
   // D332: the partition file's size here, from the file system (the database is one file,
   // WAL included), for the balancer. Open partitions only; 0 when closed.
   uint64 file_bytes = 32;
+  // D331 PR 6: on a partition the map places no range on (a merge emptied it), what still
+  // holds it in the map, the first of: a moved-away row not yet pruned (its feed tail), a
+  // decision row not yet collectable (its transaction outcomes), a live spanning session
+  // homed on it, an in-doubt share of it. Empty when it may be removed, and on every
+  // partition that holds a range. Free text, not a parsing contract.
+  string drop_waits = 33;
   // D331 PR 5: its device bytes written per second, the same average as `load_device`
   // (writes only, flushes and compactions included: an over-estimate of what a range move's
   // change-feed hold keeps), for a move's plan. Absent until the first interval ends (or

@@ -136,7 +136,30 @@ impl Node {
                                 "the map has it at epoch {}, the file at {}",
                                 p.epoch, id.epoch
                             ),
-                            None if map.is_some() => "the map has no such partition".into(),
+                            // A split's new partition is created before the change that
+                            // records it: its own line, so a merge's rerun (which drops only
+                            // files with exactly the line above) never takes it (audit120's
+                            // S-a on #2131).
+                            None if map.is_some() => match open.get(&named) {
+                                Some(part) => identity::split_mark(&part.db),
+                                None => identity::split_mark_file(&path),
+                            }
+                            .map_or_else(
+                                |e| {
+                                    format!(
+                                        "the map has no such partition (its split mark \
+                                         couldn't be read: {e})"
+                                    )
+                                },
+                                |mark| match mark {
+                                    Some(mark) => format!(
+                                        "the map has no such partition yet: split {:?} \
+                                         created it",
+                                        mark.move_id
+                                    ),
+                                    None => "the map has no such partition".into(),
+                                },
+                            ),
                             _ => String::new(),
                         }
                     };
@@ -223,6 +246,17 @@ impl Node {
                     // path the database opened, not one built from the id (CodeQL on
                     // #2103).
                     lp.file_bytes = std::fs::metadata(part.db.path()).map_or(0, |m| m.len());
+                    // D331 PR 6: an owner's partition the map places nothing on (a merge
+                    // emptied it): what still keeps it listed.
+                    if let Some(m) = &map
+                        && m.partitions.iter().any(|p| p.id == id && p.node == self.id)
+                        && !super::map::placed(m, &id)
+                    {
+                        lp.drop_waits = part
+                            .service()
+                            .drop_waits(super::spanning::now_ms())
+                            .unwrap_or_default();
+                    }
                 }
             }
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).

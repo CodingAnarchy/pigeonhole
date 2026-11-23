@@ -405,6 +405,44 @@ impl Node {
                 "partition {id:?} is open here: close it first (phdb cluster close)"
             )));
         }
+        // D331 PR 6 (audit120's S1): a node the map still lists among the partition's
+        // replicas keeps its copy, open or not (seeding, a failed open), now that a merge
+        // drops files with no operator looking. One exception (R1): a copy an unfinished
+        // promote stamped, at an epoch a failover event names for this node, which failover
+        // tells the operator to drop here (#2087).
+        if let Ok(map) = self.get_map()
+            && let Some(p) = map
+                .partitions
+                .iter()
+                .find(|p| p.id == id && p.replicas.iter().any(|r| *r == self.id))
+        {
+            let path = self.dir.join(format!("{id}.phdb"));
+            let epoch = tokio::task::spawn_blocking(move || {
+                super::identity::read_file(&path)
+                    .ok()
+                    .flatten()
+                    .map(|i| i.epoch)
+            })
+            .await
+            .ok()
+            .flatten();
+            let orphan = epoch.is_some_and(|e| {
+                e != p.epoch
+                    && map.failovers.iter().any(|f| {
+                        f.kind() == crate::serve::proto::FailoverKind::Partition
+                            && f.partition == id
+                            && f.to == self.id
+                            && f.to_epoch == e
+                    })
+            });
+            if !orphan {
+                return Err(ApiError::failed_precondition(format!(
+                    "the cluster map (version {}) lists this node among partition {id:?}'s \
+                     replicas: set a map without it there first (phdb cluster set-map)",
+                    map.map_version
+                )));
+            }
+        }
         // A replica copy (D328) closes when a map drops it here.
         if self.replica_open(id) {
             return Err(ApiError::failed_precondition(format!(

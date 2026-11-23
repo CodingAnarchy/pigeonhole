@@ -6,6 +6,7 @@
 //! request awaits its outcome. A client that goes away loses only the reply; the commit lands
 //! or fails as it would have, and a lost reply is logged and counted.
 
+mod drop_waits;
 mod spanning;
 mod txn;
 use txn::*;

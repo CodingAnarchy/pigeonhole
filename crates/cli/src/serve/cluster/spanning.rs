@@ -292,9 +292,16 @@ pub(crate) async fn ask_home(
         let routes = routes
             .as_ref()
             .ok_or_else(|| ApiError::wrong_partition(0, "this node has no cluster map yet"))?;
+        // Retry-safe: this node's map may predate the home (a split's new partition), which
+        // a later map lists (ai1249's S2 on #2131). If a merge removed the home instead (it
+        // does so only once no share homed there is in doubt on any node that answers), the
+        // message names the way out (simp724's S1 on the D331 PR 6 design).
         let owner = routes.owner(home).cloned().ok_or_else(|| {
             ApiError::partition_unavailable(format!(
-                "the map no longer lists the transaction's home partition {home:?}"
+                "the cluster map here (version {}) doesn't list the transaction's home \
+                 partition {home:?}: retry once this node has a later map; if a merge removed \
+                 it, decide this share with phdb cluster txn decide",
+                routes.map_version()
             ))
         })?;
         (owner, routes.map_version())
