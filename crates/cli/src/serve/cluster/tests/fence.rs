@@ -3823,3 +3823,93 @@ fn an_earlier_writers_split_before_its_hand_over_is_aborted_and_leaves_no_partit
         assert_eq!(get_as(a, "e05", None).await, Some(b"after".to_vec()));
     });
 }
+
+#[test]
+fn an_earlier_writers_split_past_its_hand_over_is_finished() {
+    use crate::serve::proto::{BalancerEventKind, MovePhase};
+    // D332 PR 5's design §7.3: a `bal-` split of p1 at d onto c stopped right after its
+    // HANDED_OVER change landed (range_move::STOP), as an earlier writer would leave it. The
+    // writer's balancer finishes it (range_move::resume): the record goes, the new
+    // partition holds [d, g), the rows read back, and nothing is aborted.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    let args = super::super::cli::NodeArgs {
+        own: None,
+        node: format!("http://127.0.0.1:{a}"),
+        token_file: None,
+        ca: None,
+    };
+    t.rt.block_on(async {
+        with_family(&t, None).await;
+        for i in 0..20 {
+            put_as(a, &format!("e{i:02}"), &i.to_string(), None)
+                .await
+                .unwrap();
+        }
+        let spec = super::super::range_move::SplitSpec {
+            table: "users".into(),
+            from: "p1".into(),
+            key: b"d".to_vec(),
+            node: "c".into(),
+            id: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandedOver));
+        let stopped = super::super::range_move::split_as(
+            &args,
+            &spec,
+            Some(Duration::from_secs(120)),
+            &super::super::moving::Start {
+                prefix: "bal",
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(stopped.is_err(), "the split ran past HANDED_OVER");
+        let m = map_of(a).await;
+        let r = m
+            .moves
+            .iter()
+            .find(|r| r.id.starts_with("bal-"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{:?}", m.moves));
+        assert_eq!(super::super::map::phase(&r), MovePhase::HandedOver);
+        balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
+        let m = map_until(
+            a,
+            None,
+            Duration::from_secs(60),
+            "the split finished",
+            |m| m.moves.is_empty(),
+        )
+        .await;
+        assert!(
+            m.partitions.iter().any(|p| p.id == r.to && p.node == "c"),
+            "{:?}",
+            m.partitions
+        );
+        assert!(super::super::map::inside(
+            &m.tables[0],
+            b"d",
+            Some(b"g"),
+            &r.to
+        ));
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Abort),
+            "{:?}",
+            m.balancer_events
+        );
+        for i in 0..20 {
+            assert_eq!(
+                get_as(a, &format!("e{i:02}"), None).await,
+                Some(i.to_string().into_bytes()),
+                "e{i:02}"
+            );
+        }
+    });
+}
