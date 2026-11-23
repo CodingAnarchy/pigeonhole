@@ -559,6 +559,12 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
                     "a range copy is answered by the cluster, not as a call",
                 ));
             }
+            // Answered by the balancer's code before a forward becomes a call (D332).
+            Op::Tablets(_) => {
+                return Err(ApiError::internal(
+                    "a partition's tablets are answered by the cluster, not as a call",
+                ));
+            }
         },
     )
 }
@@ -651,6 +657,11 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::RangeCopy(_) => {
                 return Err(ApiError::internal(
                     "a range copy's chunk is read by the range follower, not as a call's reply",
+                ));
+            }
+            Reply::Tablets(_) => {
+                return Err(ApiError::internal(
+                    "a partition's tablets are read by the balancer, not as a call's reply",
                 ));
             }
         },

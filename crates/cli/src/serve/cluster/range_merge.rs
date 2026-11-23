@@ -256,8 +256,8 @@ fn next_range(m: &ClusterMap, from: &str) -> Option<(String, Vec<u8>, Option<Vec
 }
 
 /// The removal of an emptied `s` (the module docs' steps 0-5): `Waiting` while something
-/// still needs it.
-async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
+/// still needs it. The balancer runs it alone for a source its merge emptied (D332 PR 5).
+pub(super) async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
     let mut moved_by = Vec::new();
     for _ in 0..RESTARTS {
         // 0.
@@ -330,6 +330,28 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
                     unfence_or_stop(&at, s, node, address).await?;
                 }
                 continue;
+            }
+            // The balancer's own removal (in process), refused with nothing landed: the map is
+            // still v0 and lists S as before, a lost writer lease say. It lifts its own fence,
+            // else its retry next pass would stop on it as an operator's (audit120's P1 on
+            // #2137). The CLI's leaves the fence named, for the operator.
+            Err(f) if args.own.is_some() => {
+                let now = map_now(args)
+                    .await
+                    .map_err(|e| fence_left(s, node, address, e.message()))?;
+                let unchanged = now.map_version == v0
+                    && now
+                        .partitions
+                        .iter()
+                        .any(|q| q.id == s && q.node == node && q.epoch == p.epoch);
+                if !unchanged {
+                    return Err(fence_left(s, node, address, f.message()));
+                }
+                unfence_or_stop(&at, s, node, address).await?;
+                return Err(Failure::usage(&format!(
+                    "{s}'s removal was refused, and its fence lifted: {}",
+                    f.message()
+                )));
             }
             Err(f) => return Err(fence_left(s, node, address, f.message())),
         }
