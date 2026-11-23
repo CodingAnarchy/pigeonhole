@@ -3001,14 +3001,88 @@ fn a_merge_of_an_unlisted_id_leaves_a_split_marked_file() {
     });
 }
 
+/// A subscription of `users` through node `c` from the oldest, a checkpoint at every
+/// event: `(its client, the last token at a commit of p1)` once the stream goes quiet,
+/// with p1 read to its end (at least `rows` rows of it).
+async fn p1_feed_token(
+    c: u16,
+    rows: usize,
+) -> (
+    crate::serve::proto::feed_client::FeedClient<tonic::transport::Channel>,
+    prost::bytes::Bytes,
+) {
+    use crate::serve::proto::{feed_client::FeedClient, subscribe_request::Start};
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut feed = FeedClient::new(channel);
+    let mut s = feed
+        .subscribe(users_from(Some(Start::FromOldest(true))))
+        .await
+        .unwrap()
+        .into_inner();
+    let (mut token, mut seen) = (None, 0usize);
+    while let Ok(e) = tokio::time::timeout(Duration::from_secs(3), s.message()).await {
+        let e = e.unwrap().expect("the stream ended");
+        if let Some(crate::serve::proto::feed_event::Event::Commit(cm)) = &e.event
+            && e.partition == "p1"
+        {
+            seen += cm.changes.len();
+            if !e.token.is_empty() {
+                token = Some(e.token.clone());
+            }
+        }
+    }
+    assert!(seen >= rows, "p1's commits: {seen} rows");
+    (feed, token.expect("a token at a commit of p1"))
+}
+
+/// `users`' subscription from `start`, a checkpoint at every event.
+fn users_from(
+    start: Option<crate::serve::proto::subscribe_request::Start>,
+) -> crate::serve::proto::SubscribeRequest {
+    crate::serve::proto::SubscribeRequest {
+        tables: vec!["users".into()],
+        start,
+        checkpoint_every: 1,
+        ..Default::default()
+    }
+}
+
+/// How a resume from `token` ends, past the retry-safe answers of a map in flux (30 s at
+/// most): it must not read on.
+async fn resume_ends_with(
+    feed: &mut crate::serve::proto::feed_client::FeedClient<tonic::transport::Channel>,
+    token: &prost::bytes::Bytes,
+) -> tonic::Status {
+    use crate::serve::proto::subscribe_request::Start;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let e = match feed
+            .subscribe(users_from(Some(Start::Resume(token.clone()))))
+            .await
+        {
+            Err(e) => e,
+            Ok(s) => match s.into_inner().message().await {
+                Err(e) => e,
+                Ok(m) => panic!("the resume read on: {m:?}"),
+            },
+        };
+        let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+        if !again || tokio::time::Instant::now() >= deadline {
+            return e;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// The coordinator's ruling on #2131 (feed1248's recommendation, no tombstone): once a
 /// merge removes p1, a feed token naming p1 answers `FeedExpired`, even one taken at p1's
 /// last commit, and the client subscribes again.
 #[test]
 fn a_token_naming_a_removed_source_expires() {
-    use crate::serve::proto::{
-        SubscribeRequest, feed_client::FeedClient, subscribe_request::Start,
-    };
     let t = three();
     let (a, c) = (t.ports[0], t.ports[2]);
     t.rt.block_on(async {
@@ -3016,62 +3090,93 @@ fn a_token_naming_a_removed_source_expires() {
         for i in 0..5 {
             try_put(c, &format!("d{i:02}"), "0").await.unwrap();
         }
-        let req = |start| SubscribeRequest {
-            tables: vec!["users".into()],
-            start,
-            checkpoint_every: 1,
-            ..Default::default()
-        };
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let mut feed = FeedClient::new(channel);
-        let mut s = feed
-            .subscribe(req(Some(Start::FromOldest(true))))
-            .await
-            .unwrap()
-            .into_inner();
-        // The last token at a commit of p1, once the stream has gone quiet: p1 read to its
-        // end.
-        let mut token = None;
-        let mut rows = 0usize;
-        while let Ok(e) = tokio::time::timeout(Duration::from_secs(3), s.message()).await {
-            let e = e.unwrap().expect("the stream ended");
-            if let Some(crate::serve::proto::feed_event::Event::Commit(cm)) = &e.event
-                && e.partition == "p1"
-            {
-                rows += cm.changes.len();
-                if !e.token.is_empty() {
-                    token = Some(e.token.clone());
-                }
-            }
-        }
-        assert!(rows >= 5, "p1's commits: {rows} rows");
-        let token = token.expect("a token at a commit of p1");
-        drop(s);
+        let (mut feed, token) = p1_feed_token(c, 5).await;
         merge_and_prune(&t).await;
         let report = merge_p1(a).await;
         assert_eq!(report.document["source"], serde_json::json!("removed"));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let ended = loop {
-            let e = match feed
-                .subscribe(req(Some(Start::Resume(token.clone()))))
-                .await
-            {
-                Err(e) => e,
-                Ok(s) => match s.into_inner().message().await {
-                    Err(e) => e,
-                    Ok(m) => panic!("the resume read on: {m:?}"),
-                },
-            };
-            let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
-            if !again || tokio::time::Instant::now() >= deadline {
-                break e;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
+        let ended = resume_ends_with(&mut feed, &token).await;
         assert_eq!(code(&ended), "FeedExpired", "{ended}");
+    });
+}
+
+/// The S3 ruling on the D331 PR 6 design (no tombstone): p1's id can be used again. A feed
+/// token naming the old p1 never resumes on the new one (`FeedExpired`), and an old spanning
+/// transaction id homed at the old p1 neither reads nor commits through the new one.
+#[test]
+fn an_old_token_and_xid_naming_a_re_added_source_fail_cleanly() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        with_families(&t).await;
+        for i in 0..5 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        let xid = super::spanning::begin_spanning(c, "d01").await.unwrap();
+        assert!(xid.starts_with("p1:h"), "{xid}");
+        let (mut feed, token) = p1_feed_token(c, 5).await;
+        // The old p1's session ends at its commit point (an emptied home: Conflict).
+        merge_and_prune(&t).await;
+        let e = super::spanning::commit_parts(c, &xid, vec![put_row("zed", "1")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        let report = merge_p1(a).await;
+        assert_eq!(report.document["source"], serde_json::json!("removed"));
+        // A new p1 on node a: a fresh file, listed as the old one first was, then given
+        // users' [d, f) back from p2.
+        test_partition(&t.dirs[0], "p1").close().unwrap();
+        let mut m = map_at(a).await;
+        m.partitions.push(
+            t.v1.partitions
+                .iter()
+                .find(|p| p.id == "p1")
+                .unwrap()
+                .clone(),
+        );
+        m.map_version += 1;
+        push(&t.ports, &m).await;
+        eventually("a serves the new p1", async || {
+            client(a)
+                .await
+                .status(crate::serve::proto::StatusRequest::default())
+                .await
+                .is_ok_and(|s| {
+                    s.into_inner().partitions.iter().any(|lp| {
+                        lp.id == "p1"
+                            && lp.state() == crate::serve::proto::LocalPartitionState::Serving
+                    })
+                })
+        })
+        .await;
+        super::super::range_move::run(
+            &super::backup::args(a),
+            &super::super::range_move::Spec {
+                table: "users".into(),
+                from: "p2".into(),
+                to: "p1".into(),
+                start: Some(b"d".to_vec()),
+                end: Some(b"f".to_vec()),
+            },
+            Some(Duration::from_secs(120)),
+            false,
+        )
+        .await
+        .unwrap();
+        // The old token: never the new p1's history. The new p1's file refuses the old one's
+        // feed token as another database's (its identity check); the cluster feed passes
+        // that on as it is.
+        let ended = resume_ends_with(&mut feed, &token).await;
+        assert!(
+            code(&ended) == "FeedExpired"
+                || (code(&ended) == "InvalidArgument"
+                    && ended.message().contains("the token is another database's")),
+            "{ended}"
+        );
+        // The old xid: no read or commit through the new p1.
+        let e = super::spanning::commit_parts(c, &xid, vec![put_row("d02", "9")])
+            .await
+            .unwrap_err();
+        assert_ne!(code(&e), "Ok", "{e}");
+        assert_eq!(get_row(c, "d02").await.unwrap(), Some(b"0".to_vec()));
     });
 }
