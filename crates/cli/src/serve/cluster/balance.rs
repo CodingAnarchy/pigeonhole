@@ -9,7 +9,7 @@
 //!    replicas. A split whose best halves leave over 80% on one side is a hot key: the range
 //!    is unsplittable, and a whole move is considered instead (perf287's should-fix 1). The
 //!    upper side, from the key to the end of P's range holding it, goes to a new partition
-//!    named `<P>-<n>` ([`split_id`]), and its copy must fit in the dwell at
+//!    named `<P>-<v>` ([`split_id`]), and its copy must fit in the dwell at
 //!    `--move-rate-bytes`, as a move's must.
 //! 2. **Move** one partition off a node over `load_ratio` or `size_ratio` (per unit of
 //!    weight, against the mean of the nodes that answered), to the coldest node: the one
@@ -174,14 +174,13 @@ pub(crate) enum Action {
         to: String,
     },
     /// A split of `partition`'s `table` at `key`: `[key, end)`, the rest of P's range
-    /// holding `key` (`end` `None`: to the table's end), goes to the new partition `new` on
-    /// `node` (D331 PR 5's split driver).
+    /// holding `key` (`end` `None`: to the table's end), goes to a new partition on `node`
+    /// (D331 PR 5's split driver, which names it: [`split_id`]).
     Split {
         partition: String,
         table: String,
         key: Vec<u8>,
         end: Option<Vec<u8>>,
-        new: String,
         node: String,
     },
     /// `from` merged into `into` (D331 PR 6).
@@ -297,15 +296,14 @@ fn split_at(p: &PartView) -> Option<u64> {
         .max()
 }
 
-/// The id of a split of `parent`'s new partition (the coordinator, 2026-11-22): `<P>-<n>`,
-/// `n` the smallest integer from 1 whose id isn't `taken` in the map. `None` if that id
-/// isn't a valid one ([`super::map::id_ok`]: over 64 characters); a longer `n` wouldn't be
-/// either.
-pub(crate) fn split_id(parent: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
-    (1u64..)
-        .map(|n| format!("{parent}-{n}"))
-        .find(|id| !super::map::id_ok(id) || !taken(id))
-        .filter(|id| super::map::id_ok(id))
+/// The id of `parent`'s new partition in a split whose move is first recorded at map
+/// version `version` (the coordinator, 2026-11-22, on simp724's review): `<P>-<v>`. Never
+/// reused, as map versions only grow, so an old feed token or history can't name it.
+/// `None` if it isn't a valid id ([`super::map::id_ok`]: over 64 characters). The split
+/// driver names the partition at the version its start lands at; the balancer checks the
+/// next version's before starting one.
+pub(crate) fn split_id(parent: &str, version: u64) -> Option<String> {
+    Some(format!("{parent}-{version}")).filter(|id| super::map::id_ok(id))
 }
 
 /// Where a split cuts (see [`split_point`]).
@@ -574,15 +572,6 @@ pub(crate) fn decide(
             });
             continue;
         }
-        let Some(new) = split_id(&p.id, |id| parts.iter().any(|q| q.id == id)) else {
-            skip.get_or_insert_with(|| {
-                format!(
-                    "{}'s split has no valid id for its new partition: {}-<n> is over 64 characters",
-                    p.id, p.id
-                )
-            });
-            continue;
-        };
         let Some(node) = coldest(counters, too_hot, &p.node, &p.replicas) else {
             skip.get_or_insert_with(|| {
                 format!("{}'s split has no node free of its replicas", p.id)
@@ -595,7 +584,6 @@ pub(crate) fn decide(
                 table: cut.table,
                 key: cut.key,
                 end: cut.end,
-                new,
                 node,
             },
             format!("{} is too {}", p.id, if too_big { "big" } else { "hot" }),
@@ -1045,12 +1033,7 @@ mod tests {
         };
         p.tablets = vec![tab("", 0.2), tab("g", 0.2), tab("m", 0.3), tab("t", 0.1)];
         p.ranges = vec![span("", None)];
-        // An earlier split took p1-1: the new partition is the next free id.
-        let parts = [
-            p,
-            part("p2", "b", 0.1, 1 << 30),
-            part("p1-1", "b", 0.0, 1 << 20),
-        ];
+        let parts = [p, part("p2", "b", 0.1, 1 << 30)];
         let b = bounds();
         let (mut c, mut t) = (Counters::default(), 0);
         let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
@@ -1062,7 +1045,6 @@ mod tests {
                     table: "users".into(),
                     key: b"m".to_vec(),
                     end: None,
-                    new: "p1-2".into(),
                     node: "b".into()
                 },
                 "p1 is too hot".into()
@@ -1071,23 +1053,16 @@ mod tests {
     }
 
     #[test]
-    fn a_splits_new_id_is_the_parents_with_the_smallest_free_number() {
-        // The coordinator, 2026-11-22: `<P>-<n>`, ids staying `[a-z0-9_-]`, 1-64 characters.
-        let taken = |ids: &'static [&'static str]| move |id: &str| ids.contains(&id);
-        assert_eq!(split_id("p3", taken(&[])).as_deref(), Some("p3-1"));
-        assert_eq!(split_id("p3", taken(&["p3-1"])).as_deref(), Some("p3-2"));
-        assert_eq!(
-            split_id("p3", taken(&["p3-1", "p3-3"])).as_deref(),
-            Some("p3-2")
-        );
+    fn a_splits_new_id_is_the_parent_and_the_map_version_that_records_it() {
+        // The coordinator, 2026-11-22: `<P>-<v>`, never reused; ids stay `[a-z0-9_-]`, 1-64
+        // characters.
+        assert_eq!(split_id("p3", 1742).as_deref(), Some("p3-1742"));
         // A split of a split.
-        assert_eq!(split_id("p3-1", taken(&[])).as_deref(), Some("p3-1-1"));
-        let at_62 = "p".repeat(62);
-        assert_eq!(split_id(&at_62, taken(&[])), Some(format!("{at_62}-1")));
-        // p…-1 to p…-9 taken: p…-10 is 65 characters, so there's no id.
-        let nine: Vec<String> = (1..=9).map(|n| format!("{at_62}-{n}")).collect();
-        assert_eq!(split_id(&at_62, |id| nine.iter().any(|t| t == id)), None);
-        assert_eq!(split_id(&"p".repeat(63), taken(&[])), None);
+        assert_eq!(split_id("p3-1742", 1800).as_deref(), Some("p3-1742-1800"));
+        let at_60 = "p".repeat(60);
+        assert_eq!(split_id(&at_60, 999), Some(format!("{at_60}-999")));
+        // 65 characters: no id.
+        assert_eq!(split_id(&at_60, 1000), None);
     }
 
     #[test]

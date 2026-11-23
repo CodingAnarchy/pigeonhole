@@ -10,11 +10,16 @@
 //!    older reign's, on older samples, and that writer may still be copying (simp724's M1).
 //!    The abort removes the record, sends the target's copy aside, unfences the partition
 //!    on its node and records an ABORT event. From its commit point the move is finished.
+//!    A `bal-` range move or split is the same through D331 PR 5's driver: aborted before
+//!    HANDED_OVER (a split's new partition removed once empty), an ABORTING one's abort
+//!    carried on, and finished from HANDED_OVER (`range_move::resume`).
 //! 2. **Waits** while any move is in flight (one action at a time), or while PAUSED.
 //! 3. **Surveys** every node's `Status` with `open_only` (perf287), and runs the policy.
 //! 4. **Acts:** a whole move runs on a task of its own through `phdb cluster move`'s steps
 //!    (`moving::run_as`, its record `bal-<ms>`), with the writer's cluster token (#2094). A
-//!    pin or an unpin is a map change. A split or a merge waits for D331 PR 5 and PR 6.
+//!    pin or an unpin is a map change. A split runs the same way through D331 PR 5's split
+//!    driver (`range_move::split_as`, a `bal-` record), which names the new partition
+//!    `<P>-<v>`. A merge waits for D331 PR 6.
 //!
 //! A pass that does nothing changes nothing in the map: the current skip is in this
 //! node's `NodeStatus.balancer` only (simp724's M2, perf287's should-fix 1). The counters
@@ -494,6 +499,25 @@ impl Node {
             }
             return;
         }
+        // An earlier writer's balancer range move or split (D332 PR 5's design §5): aborted
+        // before its hand-over, ABORTING carried on, finished from HANDED_OVER.
+        if let Some(rec) = map
+            .moves
+            .iter()
+            .find(|m| !map::node_move(m) && m.id.starts_with("bal-"))
+            .cloned()
+        {
+            if map::committed(map::phase(&rec)) {
+                self.set_balancer_state(format!(
+                    "finishing range move {} of {} into {} (past its commit point)",
+                    rec.id, rec.from, rec.to
+                ));
+                self.spawn_resume(&map, &rec.id);
+            } else {
+                self.abort_balancer_range_move(&map, &rec).await;
+            }
+            return;
+        }
         if let Some(m) = map.moves.first() {
             self.set_balancer_state(format!("waiting: move {} is in flight", m.id));
             return;
@@ -552,10 +576,8 @@ impl Node {
         };
         match decision {
             Decision::Skip(why) => self.set_balancer_state(format!("skip: {why}")),
-            Decision::Act(Action::Split { partition, .. }, why) => {
-                self.set_balancer_state(format!(
-                    "skip: a split of {partition} ({why}) waits for D331 PR 5's driver"
-                ));
+            Decision::Act(a @ Action::Split { .. }, why) => {
+                self.start_split(&map, a, &why, at);
             }
             Decision::Act(Action::Merge { from, into }, why) => {
                 self.set_balancer_state(format!(
@@ -687,6 +709,186 @@ impl Node {
             }
         });
         self.balancing().moving = Some(task);
+    }
+
+    /// Starts the split `a` on a task of its own, through D331 PR 5's split driver with a
+    /// `bal-` record: its SPLIT event and P's history go in the change that records the move
+    /// and adds the new partition, and the dwell starts once that has landed (as a move's).
+    /// The driver names the new partition `<P>-<v>` at the version its start lands at, so
+    /// the name is read from the record, never computed here (ai1249); the check below only
+    /// skips a split whose name couldn't be valid.
+    fn start_split(self: &Arc<Self>, map: &ClusterMap, a: Action, why: &str, at: u64) {
+        let Action::Split {
+            partition,
+            table,
+            key,
+            node: to_node,
+            ..
+        } = &a
+        else {
+            return;
+        };
+        let next = map.map_version.saturating_add(1);
+        let Some(new) = balance::split_id(partition, next) else {
+            self.set_balancer_state(format!(
+                "skip: {why}, but its split's new partition {partition}-{next} would be over 64 \
+                 characters"
+            ));
+            return;
+        };
+        if map.partitions.iter().any(|q| q.id == new) {
+            self.set_balancer_state(format!(
+                "skip: {why}, but its split's new partition {new} is taken"
+            ));
+            return;
+        }
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        self.set_balancer_state(format!(
+            "starting the split of {partition}'s {table} onto node {to_node}: {why}"
+        ));
+        let spec = super::range_move::SplitSpec {
+            table: table.clone(),
+            from: partition.clone(),
+            key: key.clone(),
+            node: to_node.clone(),
+            id: None,
+        };
+        let (why, node, bounds) = (why.to_owned(), Arc::downgrade(self), bounds_of(map));
+        let task = tokio::spawn(async move {
+            let Action::Split {
+                partition,
+                table,
+                key,
+                node: to_node,
+                ..
+            } = &a
+            else {
+                return;
+            };
+            let with = |m: &mut ClusterMap| -> Result<(), crate::exit::Failure> {
+                // The decision's inputs (S4): no other move began meanwhile.
+                if m.moves.iter().any(|r| r.from != *partition) {
+                    return Err(crate::exit::Failure::usage(
+                        "another move started since the balancer decided",
+                    ));
+                }
+                let mut e = event(BalancerEventKind::Split, partition, &why, at);
+                e.to = to_node.clone();
+                e.table = table.clone();
+                e.split_key = Some(map::canonical_key(key));
+                push_event(m, e);
+                // P keeps its history; the new partition starts with none (simp724's M2).
+                push_history(m, partition, BalancerEventKind::Split, at);
+                Ok(())
+            };
+            let started = |id: &str| {
+                let Some(node) = node.upgrade() else { return };
+                {
+                    let mut r = node.balancing();
+                    r.counters.took(&a, at, &bounds);
+                    *r.actions.entry("split").or_insert(0) += 1;
+                }
+                let new = node
+                    .get_map()
+                    .ok()
+                    .and_then(|m| m.moves.iter().find(|r| r.id == id).map(|r| r.to.clone()))
+                    .unwrap_or_default();
+                node.set_balancer_state(format!(
+                    "splitting {partition}'s {table} into {new} on node {to_node} ({id}): {why}"
+                ));
+            };
+            let how = super::moving::Start {
+                prefix: "bal",
+                with: Some(&with),
+                on_started: Some(&started),
+            };
+            let out = super::range_move::split_as(&args, &spec, None, &how).await;
+            if let Err(f) = &out {
+                eprintln!(
+                    "phdb serve: the balancer's split of {partition} stopped: {}",
+                    f.message()
+                );
+                if let Some(node) = node.upgrade() {
+                    node.set_balancer_state(format!(
+                        "the split of {partition} stopped: {}",
+                        f.message()
+                    ));
+                }
+            }
+        });
+        self.balancing().moving = Some(task);
+    }
+
+    /// Finishes an earlier writer's balancer range move or split `id`, past its commit point,
+    /// on a task of its own (D331 PR 5's `resume`: from the record, by its phase).
+    fn spawn_resume(self: &Arc<Self>, map: &ClusterMap, id: &str) {
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        let (id, node) = (id.to_owned(), Arc::downgrade(self));
+        let task = tokio::spawn(async move {
+            if let Err(f) = super::range_move::resume(&args, &id, None).await {
+                eprintln!(
+                    "phdb serve: the balancer finishing move {id} stopped: {}",
+                    f.message()
+                );
+                if let Some(node) = node.upgrade() {
+                    node.set_balancer_state(format!(
+                        "finishing move {id} stopped: {}",
+                        f.message()
+                    ));
+                }
+            }
+        });
+        self.balancing().moving = Some(task);
+    }
+
+    /// Ends an earlier writer's balancer range move or split `rec` before its commit point,
+    /// or carries on its abort (ABORTING): D331 PR 5's abort, which for a split also removes
+    /// its new partition once empty (simp724's M1 on the D332 PR 5 design). Then an ABORT
+    /// event. A target that can't drop its copy within the bound leaves the record
+    /// ABORTING; a later pass tries again.
+    async fn abort_balancer_range_move(self: &Arc<Self>, map: &ClusterMap, rec: &proto::RangeMove) {
+        let Some(args) = self.own_args(map) else {
+            return;
+        };
+        self.set_balancer_state(format!(
+            "aborting an earlier writer's range move {} of {} into {}",
+            rec.id, rec.from, rec.to
+        ));
+        if let Err(f) =
+            super::range_move::abort(&args, &rec.id, Some(Duration::from_secs(60))).await
+        {
+            self.set_balancer_state(format!(
+                "aborting an earlier writer's range move {} of {}: {}",
+                rec.id,
+                rec.from,
+                f.message()
+            ));
+            return;
+        }
+        let Ok(now) = self.get_map() else { return };
+        let mut m = now.clone();
+        m.map_version += 1;
+        let at = wall_ms();
+        let mut e = event(
+            BalancerEventKind::Abort,
+            &rec.from,
+            "an earlier writer's range move, before its hand-over: this writer decides afresh",
+            at,
+        );
+        e.move_id = rec.id.clone();
+        e.to = rec.to.clone();
+        e.table = rec.table.clone();
+        push_event(&mut m, e);
+        let _ = self.balancer_change(&now, m).await;
+        *self.balancing().actions.entry("abort").or_insert(0) += 1;
+        self.set_balancer_state(format!(
+            "aborted an earlier writer's range move {} of {} into {}",
+            rec.id, rec.from, rec.to
+        ));
     }
 
     /// A map change of this writer's own balancer move, set here in process (audit120's M1
