@@ -39,6 +39,7 @@ pub(crate) mod range_fence;
 pub(crate) mod range_follow;
 mod range_merge;
 pub(crate) mod range_move;
+pub(crate) mod range_prune;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -214,6 +215,9 @@ struct Peers {
     /// How often a partition's load averages take a reading ([`load::INTERVAL`]; shorter in
     /// tests).
     load_interval: Duration,
+    /// How often the node prunes its partitions' range-move rows ([`range_prune::INTERVAL`];
+    /// shorter in tests).
+    prune_interval: Duration,
 }
 
 /// A cluster node.
@@ -308,6 +312,8 @@ pub(crate) struct Node {
     device_ceiling: load::DeviceCeiling,
     /// Whether [`Node::watch_device`]'s loop runs.
     watching_device: std::sync::atomic::AtomicBool,
+    /// The range rows' pruning timer runs ([`Node::watch_range_prunes`]).
+    pruning: std::sync::atomic::AtomicBool,
 }
 
 impl Node {
@@ -329,6 +335,7 @@ impl Node {
         Arc::new_cyclic(|me| Self {
             device_ceiling,
             watching_device: std::sync::atomic::AtomicBool::new(false),
+            pruning: std::sync::atomic::AtomicBool::new(false),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),

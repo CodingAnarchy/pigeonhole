@@ -122,7 +122,9 @@ impl Drops {
             let owned = record.is_some_and(|m| {
                 m.to == partition && {
                     let p = map::phase(m);
-                    map::follows(p) || map::target_serves(p)
+                    // A phase this build doesn't know (a newer writer's) counts as owned:
+                    // never drop a range the target may own (cli692's nit on #2130).
+                    p == MovePhase::Unspecified || map::follows(p) || map::target_serves(p)
                 }
             });
             if owned {

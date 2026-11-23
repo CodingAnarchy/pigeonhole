@@ -55,6 +55,7 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             failover_max_lag: None,
             balance_window: Duration::from_secs(300),
             load_interval: Duration::from_millis(500),
+            prune_interval: Duration::from_millis(500),
         },
         state,
         super::read_voted(dir).unwrap(),

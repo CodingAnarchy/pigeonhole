@@ -452,7 +452,22 @@ impl Node {
         }
         let dir = self.dir.clone();
         let part = id.to_owned();
-        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await??;
+        let moved = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await?;
+        // Its operator fence goes with its files, moved now or before (a reconcile's
+        // move-aside): a later partition of the name (a split run again with the same --id)
+        // isn't fenced by it (audit120's S3, cli692's S2 on #2130).
+        // Only once its files are gone: a move that failed part way may leave the main file
+        // (audit120's nit).
+        let gone = match &moved {
+            Ok(_) => true,
+            Err(e) => e
+                .message
+                .contains(&format!("has no files of partition {id}")),
+        };
+        if gone {
+            self.forget_operator_fence(id).await?;
+        }
+        let lp = moved?;
         self.fences.forget_closed(id);
         eprintln!(
             "phdb serve: partition {id}'s files moved to {}: delete it once checked",

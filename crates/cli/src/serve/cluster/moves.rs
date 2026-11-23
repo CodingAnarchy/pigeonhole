@@ -92,6 +92,12 @@ pub(super) fn finish_hand_over(
             at_ms: now_ms(),
             // PR 3b: a cluster component of a table moved away whole reads up to here.
             final_seqno: m.final_seqno,
+            // PR 5: the prune's retention test resumes from it (past `final_seqno`). A table
+            // not in the file has no history here to keep: none.
+            token: match db.table(&m.table).and_then(|b| b.open()) {
+                Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => Vec::new(),
+                _ => hand_over_token(db, &m.table)?.unwrap_or_default(),
+            },
             ..Default::default()
         };
         ranges::write_moved(db, &row)?;

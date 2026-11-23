@@ -51,12 +51,17 @@ const FAMILY: &str = "moved";
 const PREFIX: &[u8] = b"moved/";
 /// The serving rows' prefix (`serving/<move id>`): a target's ranges ([`read_serving`]).
 const SERVING: &[u8] = b"serving/";
+/// The pruned watermarks' rows, one per table (D331 PR 5, simp724's P2 form): `pruned/moved/
+/// <table>` and `pruned/serving/<table>` ([`watermark`]).
+const PRUNED_MOVED: &[u8] = b"pruned/moved/";
+const PRUNED_SERVING: &[u8] = b"pruned/serving/";
 
 /// A range that moved off this partition, as its file records it once the partition takes
 /// the hand-over's map. It outlives the map's move record: M3's conflicts and stale
-/// forwards need it after the move is done. PR 5's writer prunes it at the later of "every
-/// node holds a map at or after the hand-over" and "the transaction lifetime plus the
-/// request timeout since it"; a node that never comes back keeps it. It's a plain logged
+/// forwards need it after the move is done. Its node prunes it ([`crate::serve::cluster::
+/// range_prune`]) once the move is out of the map, every node holds a map at or after the
+/// hand-over, the transaction lifetime plus the request timeout have passed since it, and
+/// its feed retention has passed it; a node that never comes back keeps it. It's a plain logged
 /// write, so it's in the partition's feed and reaches its replica copies, and a promoted
 /// copy keeps answering for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -101,8 +106,9 @@ pub(crate) fn read_moved(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
 ///
 /// **Lifetime (cli692):** a serving row gates the target's serving while its move is in the
 /// map, and afterwards clears the part of an older moved-away row it covers (a move back).
-/// So it lives as long as either holds: PR 5's writer prunes it only once no older
-/// moved-away row here overlaps it, never on the feed's retention.
+/// So it lives as long as either holds: its node prunes it ([`crate::serve::cluster::
+/// range_prune`]) only once its move is out of the map, no older moved-away row here
+/// overlaps it, and its feed retention has passed `t_from`.
 ///
 /// **Copies:** it's a plain logged write, so a replica copy of the target has it once it
 /// has applied past `t_from`. A copy promoted (D330) while the move is in the map can't
@@ -189,9 +195,12 @@ fn write_row(db: &Pigeonhole, prefix: &[u8], m: &Moved) -> Result<(), String> {
         w = w.put(FAMILY, b"final", m.final_seqno.to_string().as_bytes());
     }
     if !m.source.is_empty() {
-        w = w
-            .put(FAMILY, b"source", m.source.as_bytes())
-            .put(FAMILY, b"token", &m.token);
+        w = w.put(FAMILY, b"source", m.source.as_bytes());
+    }
+    // A serving row's token at `t_from`; a moved-away row's at the hand-over (D331 PR 5: the
+    // prune's retention test resumes from it).
+    if !m.token.is_empty() {
+        w = w.put(FAMILY, b"token", &m.token);
     }
     w.commit()
         .map(|_| ())
@@ -1440,6 +1449,58 @@ mod tests {
         );
     }
 
+    /// D331 PR 5 (simp724's P2 form, feed1248's W1, W2): a prune deletes its row and raises
+    /// its table's watermark in one write; the watermark never goes down (a later prune of
+    /// an older move keeps it), is per kind and table, and outlives the table itself.
+    #[test]
+    fn a_prune_raises_its_tables_watermark_only_and_it_outlives_the_table() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db =
+            Pigeonhole::open(dir.join("p.phdb"), pigeonhole::Options::default().shards(1)).unwrap();
+        db.table("users")
+            .and_then(|b| b.family("f", Family::default()).create_if_missing())
+            .unwrap();
+        let row = |id: &str, final_seqno: u64| Moved {
+            id: id.into(),
+            table: "users".into(),
+            final_seqno,
+            seqno: final_seqno / 2,
+            token: b"held".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 0);
+        for r in [row("mv1", 80), row("mv2", 30)] {
+            write_moved(&db, &r).unwrap();
+        }
+        let back = read_moved(&db).unwrap();
+        assert_eq!(back.iter().find(|m| m.id == "mv1").unwrap().token, b"held");
+        prune_row(&db, Pruned::Moved, &row("mv1", 80)).unwrap();
+        assert_eq!(
+            read_moved(&db)
+                .unwrap()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mv2"]
+        );
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 80);
+        // An older move's prune doesn't lower it (W2).
+        prune_row(&db, Pruned::Moved, &row("mv2", 30)).unwrap();
+        assert!(read_moved(&db).unwrap().is_empty());
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 80);
+        // Per kind and table: a serving row's watermark is its `t_from`.
+        assert_eq!(watermark(&db, Pruned::Serving, "users").unwrap(), 0);
+        assert_eq!(watermark(&db, Pruned::Moved, "orders").unwrap(), 0);
+        write_serving(&db, &row("mv3", 90)).unwrap();
+        prune_row(&db, Pruned::Serving, &row("mv3", 90)).unwrap();
+        assert!(read_serving(&db).unwrap().is_empty());
+        assert_eq!(watermark(&db, Pruned::Serving, "users").unwrap(), 45);
+        // The table goes (the reconcile's drop after the last moved-away row): the
+        // watermark stays, in the cluster table (W1).
+        db.drop_table("users").unwrap();
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 80);
+    }
+
     #[test]
     fn moved_away_rows_round_trip_through_the_file() {
         let dir = pigeonhole::doc_support::temp_dir();
@@ -1606,4 +1667,73 @@ mod tests {
             assert_eq!(code(&s, &get("d")), None);
         }
     }
+}
+
+/// Which rows a watermark is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pruned {
+    /// A source's moved-away rows: the largest `final_seqno` pruned (`moved_pruned`).
+    Moved,
+    /// A target's serving rows: the largest `t_from` pruned (`served_pruned`).
+    Serving,
+}
+
+impl Pruned {
+    fn row(self, table: &str) -> Vec<u8> {
+        let prefix = match self {
+            Self::Moved => PRUNED_MOVED,
+            Self::Serving => PRUNED_SERVING,
+        };
+        [prefix, table.as_bytes()].concat()
+    }
+}
+
+/// Table `table`'s pruned watermark in `db` (D331 PR 5, simp724's P2 form; 0: none pruned).
+/// A cluster component's start below it, with no live row of the table covering it, is
+/// `FeedExpired` on every copy of the partition: the watermark is a logged write, so
+/// replicas carry it, whatever their own retention. In `__phdb_cluster`, so it outlives the
+/// table (feed1248's W1).
+pub(crate) fn watermark(db: &Pigeonhole, kind: Pruned, table: &str) -> Result<u64, String> {
+    let t = match db.table(identity::TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(0),
+        Err(e) => return Err(format!("read {}: {e}", identity::TABLE)),
+    };
+    if !t.families().contains(&FAMILY) {
+        return Ok(0);
+    }
+    let cell = t
+        .get(&kind.row(table), FAMILY, b"seqno")
+        .map_err(|e| format!("read the pruned watermark of {table:?}: {e}"))?;
+    Ok(cell
+        .and_then(|c| std::str::from_utf8(c.value()).ok()?.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Prunes row `m` (a moved-away row with [`Pruned::Moved`], a serving one with
+/// [`Pruned::Serving`]) in one logged write that also raises its table's watermark to its
+/// `final_seqno` or `t_from`, never lowering it (feed1248's W2: one write, made from the
+/// node's one pruning pass, so two can't race).
+pub(crate) fn prune_row(db: &Pigeonhole, kind: Pruned, m: &Moved) -> Result<(), String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    let (prefix, at) = match kind {
+        Pruned::Moved => (PREFIX, m.final_seqno),
+        Pruned::Serving => (SERVING, m.seqno),
+    };
+    let mark = watermark(db, kind, &m.table)?.max(at);
+    let mut b = db.write_batch();
+    b.delete_row(&t, &[prefix, m.id.as_bytes()].concat());
+    b.put(
+        &t,
+        &kind.row(&m.table),
+        FAMILY,
+        b"seqno",
+        mark.to_string().as_bytes(),
+    );
+    b.commit()
+        .map(|_| ())
+        .map_err(|e| format!("prune the row of move {:?}: {e}", m.id))
 }

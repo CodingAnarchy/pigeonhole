@@ -249,10 +249,30 @@ impl Node {
                 "a create names its split's move and the map version its change carries",
             ));
         }
-        if self.part_state(&p).is_some() {
+        // Served, closed (its files maybe hashed for a download) or being opened here: not
+        // a new partition (audit120's S1 on #2130).
+        if !matches!(self.fences.now(&p, |_| {}), super::fence::Now::Nothing) {
             return Err(ApiError::failed_precondition(format!(
-                "partition {p:?} is open or closed here already: a split creates a new one"
+                "partition {p:?} is open, closed or opening here already: a split creates a new \
+                 one"
             )));
+        }
+        // This node's cluster, and an id its map doesn't list: the reconcile skips a listed
+        // id, so such a file would stay (audit120's S2).
+        if let Ok(map) = self.get_map() {
+            if req.cluster_id != map.cluster_id {
+                return Err(ApiError::invalid(format!(
+                    "the create is for cluster {:?}; this node is in {:?}",
+                    req.cluster_id, map.cluster_id
+                )));
+            }
+            if map.partitions.iter().any(|q| q.id == p) {
+                return Err(ApiError::failed_precondition(format!(
+                    "the cluster map (version {}) lists partition {p:?} already: a split \
+                     creates a new one",
+                    map.map_version
+                )));
+            }
         }
         if self.replica_open(&p) {
             return Err(ApiError::failed_precondition(format!(
@@ -261,6 +281,10 @@ impl Node {
         }
         let dir = self.dir.clone();
         tokio::task::spawn_blocking(move || create_file(&dir, &req)).await??;
+        // An operator fence left on the id by an earlier partition of that name (an aborted
+        // split's, whose files were moved aside by the reconcile) isn't this one's (audit120's
+        // S3). The stamp holds `changing`.
+        self.forget_operator_fence(&p).await?;
         Ok(Vec::new())
     }
 }
@@ -464,17 +488,19 @@ fn create_file(dir: &Path, req: &StampRequest) -> Result<(), ApiError> {
         );
         return Ok(());
     }
-    // There already: this split's empty file (a rerun), or refused.
-    let db = super::open_retrying(&main, &options)
+    // There already: this split's empty file (a rerun), or refused. Checked read-only; opened
+    // for writes only to refresh the mark (audit120's S1).
+    let db = pigeonhole::Pigeonhole::open(&main, pigeonhole::Options::default().read_only(true))
         .map_err(|e| ApiError::internal(format!("open {}: {e}", main.display())))?;
     let checked = (|| {
         let id = identity::read(&db).map_err(ApiError::internal)?;
         let same = id.as_ref().is_some_and(|id| {
             id.cluster_id == req.cluster_id && id.partition_id == *p && id.epoch == req.to_epoch
         });
+        // This split's mark: the same move (cli692's nit).
         let marked = identity::split_mark(&db)
             .map_err(ApiError::internal)?
-            .is_some();
+            .is_some_and(|m| m.move_id == req.create_move);
         let empty = identity::holds_no_rows(&db).map_err(ApiError::internal)?;
         if !(same && marked && empty) {
             return Err(ApiError::failed_precondition(format!(
@@ -485,10 +511,16 @@ fn create_file(dir: &Path, req: &StampRequest) -> Result<(), ApiError> {
                 req.to_epoch
             )));
         }
-        identity::set_split_mark(&db, &mark).map_err(ApiError::internal)
+        Ok(())
     })();
     let closed = db.close();
     checked?;
+    closed.map_err(|e| ApiError::internal(format!("close {}: {e}", main.display())))?;
+    let db = super::open_retrying(&main, &options)
+        .map_err(|e| ApiError::internal(format!("open {}: {e}", main.display())))?;
+    let marked = identity::set_split_mark(&db, &mark);
+    let closed = db.close();
+    marked.map_err(ApiError::internal)?;
     closed.map_err(|e| ApiError::internal(format!("close {}: {e}", main.display())))?;
     Ok(())
 }

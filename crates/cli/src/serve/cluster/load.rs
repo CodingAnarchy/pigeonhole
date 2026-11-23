@@ -194,6 +194,8 @@ pub(crate) struct Reading {
     pub sync_nanos: u64,
     /// Its device bytes, read plus written.
     pub device_bytes: u64,
+    /// The written ones alone (D331 PR 5's plan, `LocalPartition.write_bytes_rate`).
+    pub written_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +204,7 @@ struct Window {
     start: Option<(Instant, Reading, u64)>,
     cpu: f64,
     device_rate: f64,
+    write_rate: f64,
     intervals: u64,
     /// When the current reservoir began (perf287's nit on #2103: by time, so a fold after a
     /// gap doesn't stretch the window).
@@ -213,6 +216,9 @@ struct Window {
 pub(crate) struct Load {
     pub cpu: f64,
     pub device: f64,
+    /// Its device bytes written a second, the same average: `None` until the first
+    /// interval ends (unknown, where 0 is idle).
+    pub write_rate: Option<f64>,
 }
 
 impl Load {
@@ -333,13 +339,16 @@ impl PartitionLoad {
                 let req = cpu_now.saturating_sub(cpu_then) as f64 / ns;
                 let cpu = (busy.max(sync) + req) / cores.max(1) as f64;
                 let rate = reading.device_bytes.saturating_sub(then.device_bytes) as f64 / secs;
+                let written =
+                    reading.written_bytes.saturating_sub(then.written_bytes) as f64 / secs;
                 if w.intervals == 0 {
-                    (w.cpu, w.device_rate) = (cpu, rate);
+                    (w.cpu, w.device_rate, w.write_rate) = (cpu, rate, written);
                 } else {
                     let k = (secs / interval.as_secs_f64()).floor().max(1.0);
                     let a = 1.0 - (1.0 - alpha).powf(k);
                     w.cpu = a * cpu + (1.0 - a) * w.cpu;
                     w.device_rate = a * rate + (1.0 - a) * w.device_rate;
+                    w.write_rate = a * written + (1.0 - a) * w.write_rate;
                 }
                 w.intervals += 1;
                 w.start = Some((now, reading, cpu_now));
@@ -379,6 +388,7 @@ impl PartitionLoad {
             } else {
                 0.0
             },
+            write_rate: Some(w.write_rate),
         }
     }
 }
@@ -540,6 +550,7 @@ impl super::Node {
             busy_nanos: m.shard_busy_nanos,
             sync_nanos: m.group_sync_nanos,
             device_bytes: read.saturating_add(written),
+            written_bytes: written,
         };
         part.load.fold(
             now,
@@ -631,6 +642,7 @@ mod tests {
             busy_nanos: 2_000_000_000,
             sync_nanos: 1_000_000_000,
             device_bytes: 30 << 20,
+            written_bytes: 15 << 20,
         };
         let t1 = t0 + INTERVAL;
         // Within the interval: nothing yet.
@@ -642,11 +654,15 @@ mod tests {
         assert!((got.cpu - 3.0 / 30.0 / 4.0).abs() < 1e-9, "{got:?}");
         // 1 MiB/s over a 4 MiB/s ceiling.
         assert!((got.device - 0.25).abs() < 1e-9, "{got:?}");
+        // D331 PR 5: half of it written, in bytes a second (no ceiling).
+        assert_eq!(got.write_rate, Some(512.0 * 1024.0), "{got:?}");
         assert_eq!(got.load(), got.device);
         assert_eq!(l.current(ceiling), got);
         // An idle interval pulls the average down by α.
         let idle = fold(t1 + INTERVAL, r, ceiling);
         assert!((idle.device - 0.25 * (1.0 - A)).abs() < 1e-9, "{idle:?}");
+        let w = idle.write_rate.unwrap();
+        assert!((w - 512.0 * 1024.0 * (1.0 - A)).abs() < 1e-6, "{idle:?}");
         // Three idle intervals in one fold weigh as three (simp724's S3), not one.
         let three = fold(t1 + INTERVAL * 4, r, ceiling);
         assert!(

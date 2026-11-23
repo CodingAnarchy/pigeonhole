@@ -801,6 +801,11 @@ message LocalPartition {
   // homed on it, an in-doubt share of it. Empty when it may be removed, and on every
   // partition that holds a range. Free text, not a parsing contract.
   string drop_waits = 33;
+  // D331 PR 5: its device bytes written per second, the same average as `load_device`
+  // (writes only, flushes and compactions included: an over-estimate of what a range move's
+  // change-feed hold keeps), for a move's plan. Absent until the first interval ends (or
+  // from an older node): unknown. 0 is an idle partition.
+  optional uint64 write_bytes_rate = 34;
 }
 
 // A share held in doubt (D329).

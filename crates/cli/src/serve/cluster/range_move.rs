@@ -64,8 +64,8 @@ pub(super) struct Plan {
     pub bound: Bound,
     /// The copy's time at S's node's `--move-rate-bytes`.
     pub copy: Duration,
-    /// S's writes over the copy, which its change-feed hold keeps (its device bytes a
-    /// second, reads included: an over-estimate).
+    /// S's writes over the copy, which its change-feed hold keeps (its device bytes written
+    /// a second, flushes and compactions included: an over-estimate).
     pub retained: u64,
 }
 
@@ -92,8 +92,9 @@ pub(super) enum Skip {
 
 /// Step 0's plan for a move (or a split) out of partition `from` (design §1): pure. The copy
 /// time from `bytes` (else S's whole file) at S's node's `--move-rate-bytes`, and S's writes
-/// over it against `--move-retention-cap`; a `Busy` past `--max-move-followers`, counting
-/// the moves the map has copying from S's node.
+/// over it (`write_bytes_rate`: absent is unknown, 0 idle) against `--move-retention-cap`;
+/// a `Busy` past `--max-move-followers`, counting the moves the map has copying from S's
+/// node.
 pub(super) fn plan(
     m: &ClusterMap,
     statuses: &std::collections::HashMap<String, NodeStatus>,
@@ -135,8 +136,17 @@ pub(super) fn plan(
         Some(b) => (b, Bound::Estimate),
         None => (lp.file_bytes, Bound::WholePartition),
     };
-    let copy = Duration::from_secs_f64(bytes as f64 / st.move_rate_bytes as f64);
-    let retained = (lp.load_device * copy.as_secs_f64()) as u64;
+    let Some(writes) = lp.write_bytes_rate else {
+        return Err(Skip::Unknown(format!(
+            "node {node:?} doesn't report {from}'s write rate yet (its first load interval, \
+             or an older build)"
+        )));
+    };
+    // Capped: a size past a day's copy is refused anyway, and `from_secs_f64` must not
+    // overflow (cli692's nit).
+    let secs = (bytes as f64 / st.move_rate_bytes as f64).min(u32::MAX as f64);
+    let copy = Duration::from_secs_f64(secs);
+    let retained = (writes as f64 * secs) as u64;
     let cap = st.move_retention_cap;
     if cap > 0 && retained > cap {
         let of = match bound {
@@ -166,7 +176,21 @@ pub(super) fn plan(
 /// `--skip-fit-check`, which `fit: false` (the operator's) skips.
 async fn cli_plan(args: &NodeArgs, m: &ClusterMap, from: &str, fit: bool) -> Result<(), Failure> {
     let (node, address) = node_of(m, from)?;
-    let st = At::new(args, node, address).await?.status().await?;
+    let at = At::new(args, node, address).await?;
+    // S's write rate is reported once its first load interval ends (30 s at most, from its
+    // open): wait for it rather than refuse a move just after a start.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    let st = loop {
+        let st = at.status().await?;
+        let rated = st
+            .partitions
+            .iter()
+            .any(|lp| lp.id == from && lp.write_bytes_rate.is_some());
+        if rated || tokio::time::Instant::now() >= deadline {
+            break st;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     let statuses = [(node.to_owned(), st)].into();
     match plan(m, &statuses, from, None) {
         Ok(_) => Ok(()),
@@ -604,8 +628,9 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
             }
             MovePhase::CatchingUp => {
                 let lag = t_lp.as_ref().map_or(u64::MAX, |lp| lp.move_follower_lag_ms);
-                let in_doubt = s_lp.as_ref().map_or(0, |lp| lp.in_doubt);
-                if lag <= CATCH_UP_LAG_MS && in_doubt == 0 {
+                // S not listed is not ready, never "no shares in doubt" (cli692's S4).
+                let clear = s_lp.as_ref().is_some_and(|lp| lp.in_doubt == 0);
+                if lag <= CATCH_UP_LAG_MS && clear {
                     change(args, id, |_, r| {
                         r.set_phase(MovePhase::HandingOver);
                         Ok(())
@@ -614,10 +639,12 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
                     fenced_since = Some(tokio::time::Instant::now());
                     continue;
                 }
-                wait.tick(&format!(
-                    "the catch-up is {lag} ms behind; {in_doubt} shares in doubt on the source"
-                ))
-                .await?;
+                let doubt = s_lp.as_ref().map_or_else(
+                    || "the source unlisted".to_owned(),
+                    |lp| format!("{} shares in doubt on the source", lp.in_doubt),
+                );
+                wait.tick(&format!("the catch-up is {lag} ms behind; {doubt}"))
+                    .await?;
             }
             MovePhase::HandingOver => {
                 let since = *fenced_since.get_or_insert_with(tokio::time::Instant::now);
@@ -794,8 +821,13 @@ async fn abort_record(
         if !m.moves.iter().any(|x| x.id == r.id) {
             return Ok(());
         }
+        // A split's partition closed here was closed by this tail, past its drop: a rerun
+        // after a stop there goes on (audit120's M1 on #2130).
         let dropped = match side(args, &m, &r.to, &r.id).await {
             Ok((_, Some(t))) => t.dropped,
+            Ok((Some(lp), None)) => {
+                split && lp.state() == crate::serve::proto::LocalPartitionState::Closed
+            }
             _ => false,
         };
         if dropped {
@@ -819,7 +851,15 @@ async fn abort_record(
     let m = map_now(args).await?;
     let (node, address) = node_of(&m, &r.to)?;
     let at = At::new(args, node, address).await?;
-    at.call(&r.to, "fence").await?;
+    // A rerun after a stop past the close: a closed partition takes no fence, and needs
+    // none (audit120's M1 on #2130). Close is Ok on a closed one.
+    let closed = at
+        .local(&r.to)
+        .await?
+        .is_some_and(|lp| lp.state() == crate::serve::proto::LocalPartitionState::Closed);
+    if !closed {
+        at.call(&r.to, "fence").await?;
+    }
     at.call(&r.to, "close").await?;
     set_record(args, |now: &ClusterMap| {
         let mut next = now.clone();
@@ -828,16 +868,27 @@ async fn abort_record(
         Ok(next)
     })
     .await?;
-    // The node's reconcile on that map may have moved it aside first: no files is done.
-    match at.call(&r.to, "drop").await {
-        Ok(_) => Ok(()),
-        Err(f)
-            if f.message()
-                .contains(&format!("has no files of partition {}", r.to)) =>
-        {
-            Ok(())
+    // The node's reconcile on that map may have moved it aside first: no files is done. A
+    // node that hasn't installed that map yet refuses the drop while its map still places
+    // the partition: tried again until it has (audit120's S4, cli692's S1 on #2130).
+    let until = tokio::time::Instant::now() + FENCE_BOUND;
+    loop {
+        match at.call(&r.to, "drop").await {
+            Ok(_) => return Ok(()),
+            Err(f)
+                if f.message()
+                    .contains(&format!("has no files of partition {}", r.to)) =>
+            {
+                return Ok(());
+            }
+            Err(f)
+                if f.message().contains("still places partition")
+                    && tokio::time::Instant::now() < until =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(f) => return Err(f),
         }
-        Err(f) => Err(f),
     }
 }
 
@@ -927,6 +978,15 @@ pub(super) async fn resume(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<(), Failure> {
+    // A typo, or a move that ended, isn't "done" (cli692's S3 on #2130).
+    let m = map_now(args).await?;
+    if !m.moves.iter().any(|r| r.id == id && !map::node_move(r)) {
+        return Err(Failure::usage(&format!(
+            "the map (version {}) records no range move {id:?}: it finished, was aborted, or \
+             never started",
+            m.map_version
+        )));
+    }
     drive(args, id, timeout).await
 }
 
@@ -1326,7 +1386,7 @@ mod tests {
             let lp = LocalPartition {
                 id: "p1".into(),
                 file_bytes,
-                load_device: (10u64 << 20) as f64,
+                write_bytes_rate: Some(10 << 20),
                 ..Default::default()
             };
             let st = NodeStatus {
@@ -1380,6 +1440,17 @@ mod tests {
         let mut old = status(GIB, 2);
         old.get_mut("a").unwrap().move_rate_bytes = 0;
         assert!(matches!(plan(&m, &old, "p1", None), Err(Skip::Unknown(_))));
+        // cli692's M3: the write rate is bytes a second. Absent (its first interval, or an
+        // older node) is unknown; a present 0 is idle, and any size fits.
+        let mut unknown = status(GIB, 2);
+        unknown.get_mut("a").unwrap().partitions[0].write_bytes_rate = None;
+        assert!(matches!(
+            plan(&m, &unknown, "p1", None),
+            Err(Skip::Unknown(_))
+        ));
+        let mut idle = status(1000 * GIB, 2);
+        idle.get_mut("a").unwrap().partitions[0].write_bytes_rate = Some(0);
+        assert_eq!(plan(&m, &idle, "p1", None).map(|p| p.retained), Ok(0));
         assert!(matches!(
             plan(&m, &status(GIB, 2), "p7", None),
             Err(Skip::Unknown(_))

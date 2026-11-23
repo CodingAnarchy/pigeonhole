@@ -367,6 +367,7 @@ fn a_failed_hub_is_replaced_and_its_clients_rejoin_the_new_one() {
         visible: false,
         start: Start::Now,
         skip: 0,
+        floor: 0,
         announce: false,
         internal: false,
     };
@@ -669,6 +670,7 @@ fn now_spec(t: &Table) -> Spec {
         visible: false,
         start: Start::Now,
         skip: 0,
+        floor: 0,
         announce: false,
         internal: false,
     }
@@ -1281,6 +1283,7 @@ fn a_hub_with_a_backlog_yields_its_feed_worker() {
             visible: false,
             start: Start::Now,
             skip: 0,
+            floor: 0,
             announce: false,
             internal: false,
         };
@@ -1386,6 +1389,7 @@ fn a_slow_client_that_keeps_taking_outlasts_a_large_events_wait() {
                     visible: false,
                     start: Start::Now,
                     skip: 0,
+                    floor: 0,
                     announce: false,
                     internal: false,
                 },
@@ -1482,6 +1486,7 @@ fn a_client_that_stops_taking_times_out_an_idle_limit_after_its_last_take() {
                     visible: false,
                     start: Start::Now,
                     skip: 0,
+                    floor: 0,
                     announce: false,
                     internal: false,
                 },
@@ -1582,6 +1587,7 @@ fn a_now_start_keeps_a_commit_pushed_before_its_task_first_runs() {
                     visible: false,
                     start: Start::Now,
                     skip: 0,
+                    floor: 0,
                     announce: false,
                     internal: false,
                 },
