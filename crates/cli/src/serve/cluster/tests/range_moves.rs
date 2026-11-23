@@ -2595,12 +2595,27 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
 /// partition, before the map change. Run again, the abort goes on past the closed partition
 /// (no fence on it, which a closed partition refuses): the map drops the record and p1-1,
 /// p1-1's files are moved aside, and the abort's fence leaves no operator fence on the id.
+///
+/// p1-1's range drop is held until it's closed, so the close always cuts it short and its
+/// Status says the drop isn't done: the rerun takes the closed split partition as done
+/// anyway (main's Windows red on 0285e076f, where the drop lost that race by chance).
 #[test]
 fn an_aborted_split_stopped_after_its_close_is_finished_by_a_rerun() {
     let t = three();
     let a = t.ports[0];
     t.rt.block_on(async {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (go, held) = tokio::sync::oneshot::channel();
+        super::super::range_drop::HOLD.lock().unwrap().push((
+            "split-9".into(),
+            std::sync::Arc::clone(&reached),
+            held,
+        ));
         aborting_split_closed_on_c(&t).await;
+        tokio::time::timeout(Duration::from_secs(30), reached.notified())
+            .await
+            .expect("p1-1's drop of split-9's copy started, and is held");
+        let _ = go.send(());
         super::super::range_move::abort(
             &super::backup::args(a),
             "split-9",
