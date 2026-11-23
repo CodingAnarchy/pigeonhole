@@ -1802,8 +1802,11 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
         mut _stops,
         ..
     } = t;
+    // Not released: the held follower goes on only once it sees the stop (`hold_at` waits
+    // for either), so it meets the stop inside the row. A release here raced the stop: when
+    // it won, the follower finished the row before the stop reached it, and the restarted
+    // follower found no partial row to name (#2135's Linux red, Windows on #2131).
     let _ = _stops.swap_remove(1).send(());
-    let _ = release.send(());
     rt.block_on(eventually("b to stop", async || {
         tokio::net::TcpStream::connect(("127.0.0.1", b))
             .await
@@ -1820,8 +1823,7 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
     );
     rt.block_on(async {
         // After the restart the follower retries until b's lease is back, its backoff
-        // doubling to 5 s; its first step then names the row. On a slow runner that step
-        // can come past 5 s (Windows on #2131), so the bound is the restart tests' 30 s.
+        // doubling to 5 s; its first step then names the row: the restart tests' 30 s.
         eventually_within(
             Duration::from_secs(30),
             "b's follower stops, naming the row",
@@ -1835,6 +1837,7 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
         let s = move_status(b, "p2", "mv1").await.unwrap();
         assert!(!s.copy_done, "{s:?}");
     });
+    drop(release);
     let _ = (c, db_a.close(), db_b.close());
 }
 
