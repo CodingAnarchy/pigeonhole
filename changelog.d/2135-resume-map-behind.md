@@ -1,2 +1,0 @@
-### Changed
-- **Cluster feed resumes:** a resume token whose position on a partition is another database's (the partition was dropped and created again under its id) now answers `FeedExpired`, so the client subscribes again, instead of `InvalidArgument`. A resume through a node whose cluster map is older than the token's first pulls a newer map from the other nodes. If none has one yet, it answers `PartitionUnavailable` (retry) rather than expiring a token that names a partition the node hasn't heard of yet, such as a split's new one (D331).
