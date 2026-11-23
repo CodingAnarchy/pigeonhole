@@ -2813,3 +2813,265 @@ fn an_aborted_split_stopped_after_its_close_is_finished_by_a_rerun() {
         assert!(!fenced.contains("p1-1"), "{fenced}");
     });
 }
+
+/// `phdb cluster merge p1 --into p2` through node `a`, as the CLI runs it.
+async fn merge_p1(a: u16) -> crate::output::Report {
+    super::super::range_merge::run(
+        &super::backup::args(a),
+        "p1",
+        "p2",
+        Some(Duration::from_secs(120)),
+        true,
+    )
+    .await
+    .unwrap()
+}
+
+/// Rows `d00`..`d19` in p1, then p1 merged into p2 and its moved-away row pruned (the
+/// prune's own write, as PR 5's feed tests make it): p1 is emptied, listed, and nothing of
+/// its own holds it.
+async fn merged_and_pruned(t: &Three) {
+    with_families(t).await;
+    for i in 0..20 {
+        try_put(t.ports[2], &format!("d{i:02}"), &i.to_string())
+            .await
+            .unwrap();
+    }
+    merge_and_prune(t).await;
+}
+
+/// p1 merged into p2 and its moved-away row pruned, whatever p1 held.
+async fn merge_and_prune(t: &Three) {
+    let first = merge_p1(t.ports[0]).await;
+    assert_eq!(first.document["source"], serde_json::json!("waiting"));
+    for m in crate::serve::ranges::read_moved(&t.db_a).unwrap() {
+        crate::serve::ranges::prune_row(&t.db_a, crate::serve::ranges::Pruned::Moved, &m).unwrap();
+    }
+}
+
+/// The current map, from node `port`.
+async fn map_at(port: u16) -> ClusterMap {
+    client(port)
+        .await
+        .get_map(crate::serve::proto::GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// audit120's M1 (simp724's CAS-loss case): a map change between the removal's re-check
+/// and its map change fails the compare-and-set on v0. The merge lifts its own fence (else
+/// the restart's owner check would stop on it) and starts again from a fresh read, then
+/// removes p1 at a version past the change.
+#[test]
+fn a_map_change_before_the_removal_restarts_it_from_a_fresh_read() {
+    let t = three();
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        merged_and_pruned(&t).await;
+        let args = super::backup::args(a);
+        let (reached, go) = (
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        super::super::range_merge::HOLD.lock().unwrap().push((
+            args.node.clone(),
+            std::sync::Arc::clone(&reached),
+            std::sync::Arc::clone(&go),
+        ));
+        let merge = tokio::spawn(async move { merge_p1(a).await });
+        reached.notified().await;
+        let mut moved = map_at(a).await;
+        moved.map_version += 1;
+        let changed = moved.map_version;
+        push(&t.ports, &moved).await;
+        go.notify_one();
+        let report = merge.await.unwrap();
+        assert_eq!(
+            report.document["source"],
+            serde_json::json!("removed"),
+            "{:?}",
+            report.document
+        );
+        let m = map_at(a).await;
+        assert!(!m.partitions.iter().any(|p| p.id == "p1"));
+        assert!(m.map_version > changed, "{} after {changed}", m.map_version);
+    });
+}
+
+/// simp724's M1 on the design, a node that doesn't answer: the remover can't see whether it
+/// holds a share homed at p1, so p1 waits, naming the node.
+#[test]
+fn an_emptied_source_waits_while_a_node_doesnt_answer() {
+    let mut t = three();
+    let a = t.ports[0];
+    t.rt.block_on(merged_and_pruned(&t));
+    // Node c stops.
+    drop(t._stops.pop());
+    t.rt.block_on(async {
+        let report = merge_p1(a).await;
+        assert_eq!(report.document["source"], serde_json::json!("waiting"));
+        let detail = report.document["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("node c"), "{detail}");
+        assert!(map_at(a).await.partitions.iter().any(|p| p.id == "p1"));
+    });
+}
+
+/// A spanning transaction homed at p1, begun before the merge, holds the emptied p1 (its
+/// node's `drop_waits`); its commit point is refused there (`Conflict`, nothing written),
+/// which ends it; then a rerun removes p1.
+#[test]
+fn a_session_homed_at_the_emptied_source_holds_it_and_cant_commit_there() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        with_families(&t).await;
+        let id = super::spanning::begin_spanning(c, "d05").await.unwrap();
+        assert!(id.starts_with("p1:h"), "{id}");
+        merged_and_pruned(&t).await;
+        let report = merge_p1(a).await;
+        assert_eq!(report.document["source"], serde_json::json!("waiting"));
+        let detail = report.document["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("spanning transaction"), "{detail}");
+        let e = super::spanning::commit_parts(c, &id, vec![put_row("zed", "1")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert!(e.message().contains("no transaction's home"), "{e}");
+        assert_eq!(get_row(c, "zed").await.unwrap(), None);
+        let report = merge_p1(a).await;
+        assert_eq!(
+            report.document["source"],
+            serde_json::json!("removed"),
+            "{:?}",
+            report.document
+        );
+    });
+}
+
+/// audit120's S-a on #2131: a split's new file, created before the change that records it,
+/// is a file the map doesn't list, but Status gives it its own line, so `merge` of its id
+/// leaves it where it is and says so.
+#[test]
+fn a_merge_of_an_unlisted_id_leaves_a_split_marked_file() {
+    let t = three();
+    let a = t.ports[0];
+    let c = t.ports[2];
+    let db = test_partition(&t.dirs[2], "p9");
+    super::super::identity::set_split_mark(
+        &db,
+        &super::super::identity::SplitMark {
+            move_id: "split-9".into(),
+            // Past any version this test's map reaches: the reconcile keeps it.
+            version: 1 << 40,
+        },
+    )
+    .unwrap();
+    db.close().unwrap();
+    t.rt.block_on(async {
+        let st = client(c)
+            .await
+            .status(crate::serve::proto::StatusRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        let lp = st.partitions.iter().find(|lp| lp.id == "p9").unwrap();
+        assert!(
+            lp.error
+                .starts_with("the map has no such partition yet: split \"split-9\""),
+            "{}",
+            lp.error
+        );
+        let report = super::super::range_merge::run(
+            &super::backup::args(a),
+            "p9",
+            "p2",
+            Some(Duration::from_secs(60)),
+            true,
+        )
+        .await
+        .unwrap();
+        let detail = report.document["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("not done") && detail.contains("p9"),
+            "{detail}"
+        );
+        assert!(t.dirs[2].join("p9.phdb").exists());
+        assert!(dropped_files(&t.dirs[2], "p9").is_empty());
+    });
+}
+
+/// The coordinator's ruling on #2131 (feed1248's recommendation, no tombstone): once a
+/// merge removes p1, a feed token naming p1 answers `FeedExpired`, even one taken at p1's
+/// last commit, and the client subscribes again.
+#[test]
+fn a_token_naming_a_removed_source_expires() {
+    use crate::serve::proto::{
+        SubscribeRequest, feed_client::FeedClient, subscribe_request::Start,
+    };
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        with_families(&t).await;
+        for i in 0..5 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        let req = |start| SubscribeRequest {
+            tables: vec!["users".into()],
+            start,
+            checkpoint_every: 1,
+            ..Default::default()
+        };
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut feed = FeedClient::new(channel);
+        let mut s = feed
+            .subscribe(req(Some(Start::FromOldest(true))))
+            .await
+            .unwrap()
+            .into_inner();
+        // The last token at a commit of p1, once the stream has gone quiet: p1 read to its
+        // end.
+        let mut token = None;
+        let mut rows = 0usize;
+        while let Ok(e) = tokio::time::timeout(Duration::from_secs(3), s.message()).await {
+            let e = e.unwrap().expect("the stream ended");
+            if let Some(crate::serve::proto::feed_event::Event::Commit(cm)) = &e.event
+                && e.partition == "p1"
+            {
+                rows += cm.changes.len();
+                if !e.token.is_empty() {
+                    token = Some(e.token.clone());
+                }
+            }
+        }
+        assert!(rows >= 5, "p1's commits: {rows} rows");
+        let token = token.expect("a token at a commit of p1");
+        drop(s);
+        merge_and_prune(&t).await;
+        let report = merge_p1(a).await;
+        assert_eq!(report.document["source"], serde_json::json!("removed"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let ended = loop {
+            let e = match feed
+                .subscribe(req(Some(Start::Resume(token.clone()))))
+                .await
+            {
+                Err(e) => e,
+                Ok(s) => match s.into_inner().message().await {
+                    Err(e) => e,
+                    Ok(m) => panic!("the resume read on: {m:?}"),
+                },
+            };
+            let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+            if !again || tokio::time::Instant::now() >= deadline {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(code(&ended), "FeedExpired", "{ended}");
+    });
+}
