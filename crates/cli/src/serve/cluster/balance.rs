@@ -29,6 +29,9 @@
 //! merges don't count toward a bounce: a split keeps P's history, so it doesn't reset P's
 //! count either, and the new partition starts with none (simp724's M2 on the PR 5 design).
 //! Neither side of a merge split within four dwells, so a split isn't merged straight back.
+//! That also keeps P from merging with any neighbour for four dwells after it splits; P's
+//! SPLIT entry outlives the 8-entry history cap that long, since P rests a dwell after each
+//! action (simp724).
 //!
 //! **Never a candidate** (simp724's S1, ai1249's (4)): a pinned partition; one in any range
 //! move's record, as source or target; one with in-doubt shares; for a split or merge, a
@@ -559,7 +562,10 @@ pub(crate) fn decide(
             continue;
         }
         // The range copy must fit in the dwell, as a move's (perf287's should-fix 2).
-        if move_rate > 0 && cut.moving / move_rate > b.dwell_ms / 1000 {
+        // In bytes, not whole seconds (simp724's nit): a copy just over the dwell is refused.
+        if move_rate > 0
+            && u128::from(cut.moving) * 1000 > u128::from(move_rate) * u128::from(b.dwell_ms)
+        {
             skip.get_or_insert_with(|| {
                 format!(
                     "{}'s split would copy {} bytes, longer than the dwell at the move rate",
