@@ -3790,10 +3790,9 @@ fn an_earlier_writers_split_before_its_hand_over_is_aborted_and_leaves_no_partit
             node: "c".into(),
             id: None,
         };
-        let id = super::super::range_move::begin_split(
+        let (id, new) = super::super::range_move::begin_split(
             &args,
             &spec,
-            "p1-1",
             &super::super::moving::Start {
                 prefix: "bal",
                 ..Default::default()
@@ -3801,13 +3800,6 @@ fn an_earlier_writers_split_before_its_hand_over_is_aborted_and_leaves_no_partit
         )
         .await
         .unwrap();
-        let new = map_of(a)
-            .await
-            .moves
-            .iter()
-            .find(|r| r.id == id)
-            .map(|r| r.to.clone())
-            .expect("recorded");
         balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
         let m = map_until(a, None, Duration::from_secs(60), "the split aborted", |m| {
             m.moves.is_empty()

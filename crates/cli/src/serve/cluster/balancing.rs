@@ -596,7 +596,7 @@ impl Node {
         match decision {
             Decision::Skip(why) => self.set_balancer_state(format!("skip: {why}")),
             Decision::Act(a @ Action::Split { .. }, why) => {
-                self.start_split(&map, a, &why, at);
+                self.start_split(&map, &statuses, a, &why, at);
             }
             Decision::Act(Action::Merge { from, into }, why) => {
                 self.set_balancer_state(format!(
@@ -736,17 +736,49 @@ impl Node {
     /// The driver names the new partition `<P>-<v>` at the version its start lands at, so
     /// the name is read from the record, never computed here (ai1249); the check below only
     /// skips a split whose name couldn't be valid.
-    fn start_split(self: &Arc<Self>, map: &ClusterMap, a: Action, why: &str, at: u64) {
+    fn start_split(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+        statuses: &HashMap<String, NodeStatus>,
+        a: Action,
+        why: &str,
+        at: u64,
+    ) {
         let Action::Split {
             partition,
             table,
             key,
             node: to_node,
+            bytes,
             ..
         } = &a
         else {
             return;
         };
+        // D331's own limits on the source (its followers, its move rate and retention cap),
+        // reckoned on the moving tablets' bytes (the coordinator's amendment), then the
+        // dwell, which is the balancer's own (simp724, perf287's should-fix 2).
+        let plan = match super::range_move::plan(map, statuses, partition, Some(*bytes)) {
+            Ok(plan) => plan,
+            Err(
+                super::range_move::Skip::Busy(s)
+                | super::range_move::Skip::Fit(s)
+                | super::range_move::Skip::Unknown(s),
+            ) => {
+                self.set_balancer_state(format!("skip: {why}, but its split can't start: {s}"));
+                return;
+            }
+        };
+        let bounds = bounds_of(map);
+        if !balance::copy_fits_dwell(plan.copy, &bounds) {
+            self.set_balancer_state(format!(
+                "skip: {why}, but its split's copy of {} bytes would take {} s at the source's \
+                 move rate, longer than the dwell",
+                plan.bytes,
+                plan.copy.as_secs()
+            ));
+            return;
+        }
         let next = map.map_version.saturating_add(1);
         let Some(new) = balance::split_id(partition, next) else {
             self.set_balancer_state(format!(
@@ -774,7 +806,7 @@ impl Node {
             node: to_node.clone(),
             id: None,
         };
-        let (why, node, bounds) = (why.to_owned(), Arc::downgrade(self), bounds_of(map));
+        let (why, node) = (why.to_owned(), Arc::downgrade(self));
         let task = tokio::spawn(async move {
             let Action::Split {
                 partition,

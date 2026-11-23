@@ -9,8 +9,9 @@
 //!    replicas. A split whose best halves leave over 80% on one side is a hot key: the range
 //!    is unsplittable, and a whole move is considered instead (perf287's should-fix 1). The
 //!    upper side, from the key to the end of P's range holding it, goes to a new partition
-//!    named `<P>-<v>` ([`split_id`]), and its copy must fit in the dwell at
-//!    `--move-rate-bytes`, as a move's must.
+//!    named `<P>-<v>` ([`split_id`]). The loop then asks D331's `range_move::plan` whether
+//!    the copy fits the source's move limits, with the moving tablets' bytes, and its copy
+//!    time must also fit in the dwell ([`copy_fits_dwell`]), as a move's must.
 //! 2. **Move** one partition off a node over `load_ratio` or `size_ratio` (per unit of
 //!    weight, against the mean of the nodes that answered), to the coldest node: the one
 //!    whose move brings both nodes closest to the mean without pushing the target over the
@@ -182,6 +183,9 @@ pub(crate) enum Action {
         key: Vec<u8>,
         end: Option<Vec<u8>>,
         node: String,
+        /// The surveyed bytes of the tablets in `[key, end)`: the copy's estimate for
+        /// `range_move::plan`.
+        bytes: u64,
     },
     /// `from` merged into `into` (D331 PR 6).
     Merge { from: String, into: String },
@@ -285,6 +289,13 @@ fn auto_pin_expired(p: &PartView, now: u64, b: &Bounds) -> bool {
             .map(|(_, at)| *at)
             .max()
             .is_some_and(|at| now >= at.saturating_add(b.bounce_window_ms))
+}
+
+/// Whether a balancer split's copy, `copy` long at its source's move rate (D331's
+/// `range_move::plan`), ends within the dwell (perf287's should-fix 2 on #2103; simp724 on
+/// the PR 5 split: a balancer setting, so the balancer checks it, not the split driver).
+pub(crate) fn copy_fits_dwell(copy: std::time::Duration, b: &Bounds) -> bool {
+    copy.as_millis() <= u128::from(b.dwell_ms)
 }
 
 /// When `p` split last, if it did.
@@ -560,18 +571,6 @@ pub(crate) fn decide(
             continue;
         }
         // The range copy must fit in the dwell, as a move's (perf287's should-fix 2).
-        // In bytes, not whole seconds (simp724's nit): a copy just over the dwell is refused.
-        if move_rate > 0
-            && u128::from(cut.moving) * 1000 > u128::from(move_rate) * u128::from(b.dwell_ms)
-        {
-            skip.get_or_insert_with(|| {
-                format!(
-                    "{}'s split would copy {} bytes, longer than the dwell at the move rate",
-                    p.id, cut.moving
-                )
-            });
-            continue;
-        }
         let Some(node) = coldest(counters, too_hot, &p.node, &p.replicas) else {
             skip.get_or_insert_with(|| {
                 format!("{}'s split has no node free of its replicas", p.id)
@@ -585,6 +584,7 @@ pub(crate) fn decide(
                 key: cut.key,
                 end: cut.end,
                 node,
+                bytes: cut.moving,
             },
             format!("{} is too {}", p.id, if too_big { "big" } else { "hot" }),
         );
@@ -1045,7 +1045,8 @@ mod tests {
                     table: "users".into(),
                     key: b"m".to_vec(),
                     end: None,
-                    node: "b".into()
+                    node: "b".into(),
+                    bytes: 2 << 20
                 },
                 "p1 is too hot".into()
             )
@@ -1066,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn a_split_moves_the_rest_of_the_range_holding_its_key_and_its_copy_fits_the_dwell() {
+    fn a_split_moves_the_rest_of_the_range_holding_its_key_and_counts_its_bytes() {
         // P holds users' [, p) and [x, ): a cut at m moves [m, p) only, and only the tablets
         // there are copied.
         let nodes = [node("a"), node("b")];
@@ -1083,7 +1084,7 @@ mod tests {
             tab("x", 0.2, 5 << 20),
         ];
         p.ranges = vec![span("", Some("p")), span("x", None)];
-        let parts = [p.clone(), part("p2", "b", 0.1, 1 << 30)];
+        let parts = [p, part("p2", "b", 0.1, 1 << 30)];
         let b = bounds();
         let (mut c, mut t) = (Counters::default(), 0);
         let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
@@ -1098,17 +1099,18 @@ mod tests {
             panic!("no cut")
         };
         assert_eq!(cut.moving, 3 << 20);
-        // The same range at 200 GiB, at 64 MiB/s: its copy outlasts the 30 min dwell (and
-        // P's, so it doesn't move whole either).
-        p.tablets[1].bytes = 200 << 30;
-        p.bytes = 201 << 30;
-        let parts = [p, part("p2", "b", 0.1, 1 << 30)];
-        let (mut c, mut t) = (Counters::default(), 0);
-        let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
-        let Decision::Skip(why) = d else {
+        let Decision::Act(Action::Split { bytes, .. }, _) = &d else {
             panic!("{d:?}")
         };
-        assert!(why.contains("longer than the dwell"), "{why}");
+        assert_eq!(*bytes, 3 << 20);
+        // The dwell bounds the copy plan() reckons, to the millisecond.
+        let b = bounds();
+        let dwell = std::time::Duration::from_millis(b.dwell_ms);
+        assert!(copy_fits_dwell(dwell, &b));
+        assert!(!copy_fits_dwell(
+            dwell + std::time::Duration::from_millis(1),
+            &b
+        ));
     }
 
     #[test]
