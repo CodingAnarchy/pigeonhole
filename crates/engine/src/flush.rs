@@ -779,6 +779,10 @@ impl FlushTask {
                         );
                         return TaskPoll::Blocked;
                     }
+                    #[cfg(feature = "test-hooks")]
+                    if self.held_before_commit(waker) {
+                        return TaskPoll::Blocked;
+                    }
                     crate::shard::trace!("flush task shard {}: submitting", self.shard.0);
                     match self.submit_commit() {
                         Ok(rx) => self.stage = Stage::Commit(rx),
@@ -819,6 +823,27 @@ impl FlushTask {
                 Stage::Done => return TaskPoll::Done,
             }
         }
+    }
+
+    /// Test hook: whether `Engine::hold_flush_commits` holds this task before its manifest
+    /// commit, its waker kept for the release. Rechecked under the lock the release takes,
+    /// as `parked_after_report` is, so no task waits after a release. A task woken while
+    /// still held keeps waiting, its waker pushed again.
+    #[cfg(feature = "test-hooks")]
+    fn held_before_commit(&self, waker: &TaskWaker) -> bool {
+        let hooks = &self.shared.hooks;
+        if !hooks.flush_commit_hold.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut held = hooks
+            .flush_commit_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !hooks.flush_commit_hold.load(Ordering::Acquire) {
+            return false;
+        }
+        held.push(waker.clone());
+        true
     }
 
     /// Test hook: whether `Engine::park_finished_flushes` holds this finished task alive,
