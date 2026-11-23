@@ -1515,6 +1515,7 @@ fn move_range_moves_a_range_under_writes_end_to_end() {
             &super::backup::args(a),
             &spec,
             Some(Duration::from_secs(120)),
+            true,
         )
         .await
         .unwrap();
@@ -2122,6 +2123,7 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
             &super::backup::args(a),
             &spec,
             Some(Duration::from_secs(120)),
+            true,
         )
         .await
         .unwrap();
@@ -2279,7 +2281,8 @@ fn a_split_stopped_at_handed_over_is_finished_by_resume() {
             .unwrap()
             .push((args.node.clone(), MovePhase::HandedOver));
         let stopped =
-            super::super::range_move::split(&args, &spec, Some(Duration::from_secs(120))).await;
+            super::super::range_move::split(&args, &spec, Some(Duration::from_secs(120)), true)
+                .await;
         assert!(stopped.is_err(), "the split ran past HANDED_OVER");
         let map = async || {
             client(a)

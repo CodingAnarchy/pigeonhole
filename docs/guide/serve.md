@@ -1316,8 +1316,15 @@ Once a table's ranges hold data, its split keys change only through a range move
 
 ### Moving and splitting ranges
 From 1.3.0 (D331), a key range of a table moves from one partition to another while both serve:
-- **`phdb cluster move-range TABLE --from S --to T [--start K] [--end K]`** moves `[K_start, K_end)` of `TABLE` from partition `S` to partition `T`. The range must lie inside one of `S`'s ranges of the table; without `--start` or `--end` it runs from that range's start or to its end.
-- **`phdb cluster split TABLE --from S --key K --to N [--id ID]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N` (`--node` is the URL of the node the command talks to, as for every `phdb cluster` command). The new partition's id is `ID`, or by default `S-<v>`, where v is the map version of the change that records the split (`p3-41`, say). It's fixed for the split's life, and never reused. If that id is taken or isn't a valid partition id, the split is refused: give one with `--id`. `N` creates its file empty first, then the map adds it. `K` can't be the range's start: that's a move of the whole range.
+- **`phdb cluster move-range TABLE --from S --to T [--start K] [--end K] [--skip-fit-check]`** moves `[K_start, K_end)` of `TABLE` from partition `S` to partition `T`. The range must lie inside one of `S`'s ranges of the table; without `--start` or `--end` it runs from that range's start or to its end.
+- **`phdb cluster split TABLE --from S --key K --to N [--id ID] [--skip-fit-check]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N` (`--node` is the URL of the node the command talks to, as for every `phdb cluster` command). The new partition's id is `ID`, or by default `S-<v>`, where v is the map version of the change that records the split (`p3-41`, say). It's fixed for the split's life, and never reused. If that id is taken or isn't a valid partition id, the split is refused: give one with `--id`. `N` creates its file empty first, then the map adds it. `K` can't be the range's start: that's a move of the whole range.
+
+**Before it starts, each one checks that the copy fits** on `S`'s node:
+- **The copy time** is the range's bytes at `S`'s node's `--move-rate-bytes`. The command can't measure one range's bytes, so it counts the whole of `S`'s file (an upper bound).
+- **The writes during the copy** are `S`'s device bytes a second over that time, an overestimate since it includes reads. `S`'s change-feed hold keeps them.
+- **If they pass `--move-retention-cap`, the command refuses**, and the message says it used the whole-partition bound. A small range in a big partition fits anyway: run it again with `--skip-fit-check`. The cluster balancer measures the range's own bytes and never skips the check.
+- **If `S`'s node is already copying `--max-move-followers` moves, the command refuses with `Busy`.** That's safe to retry once one of them finishes.
+- **A command run again for a move the map already records** skips the check and goes on.
 
 Both run on the map's writer, through its own map changes, and print each phase as it starts:
 1. **COPYING:** `T` copies the range from snapshots of `S`, at most `--move-rate-bytes` from `S`'s node, while `S` serves it as before.

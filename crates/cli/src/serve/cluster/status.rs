@@ -277,7 +277,15 @@ impl Node {
                 )
             },
         );
+        let (move_rate_bytes, move_retention_cap, max_move_followers) =
+            self.range_copies().map_or((0, 0, 0), |s| {
+                let (rate, cap, followers) = s.limits();
+                (rate, cap, u32::try_from(followers).unwrap_or(u32::MAX))
+            });
         NodeStatus {
+            move_rate_bytes,
+            move_retention_cap,
+            max_move_followers,
             balancer: self.balancer_state(),
             writer,
             writer_term,

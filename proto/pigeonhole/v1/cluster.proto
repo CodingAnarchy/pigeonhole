@@ -705,6 +705,12 @@ message NodeStatus {
   // none, and how many passes the next action has waited. For people to read, not a format
   // to parse. Empty on any other node, or with the balancer off.
   string balancer = 14;
+  // D331 PR 5: this node's range-move limits, as a move's plan reads them for a source on
+  // it: `--move-rate-bytes`, `--move-retention-cap` and `--max-move-followers`. 0: unknown
+  // (an older node).
+  uint64 move_rate_bytes = 15;
+  uint64 move_retention_cap = 16;
+  uint32 max_move_followers = 17;
 }
 
 // A partition file in the node's directory, as its identity row says.

@@ -33,7 +33,9 @@ use super::map;
 use super::moving::{At, Start, Waiting, map_now, set_record};
 use crate::exit::Failure;
 use crate::output::Report;
-use crate::serve::proto::{ClusterMap, LocalPartition, MoveKind, MovePhase, MoveStatus, RangeMove};
+use crate::serve::proto::{
+    ClusterMap, LocalPartition, MoveKind, MovePhase, MoveStatus, NodeStatus, RangeMove,
+};
 
 /// The most a source's fence may take to report its seqno (its drain, and the shares in
 /// doubt on the range) before the move aborts and lifts it (simp724's bounded wait).
@@ -54,12 +56,146 @@ pub(super) struct Spec {
     pub end: Option<Vec<u8>>,
 }
 
-/// `phdb cluster move-range`, the CLI's (record ids `range-<ms>`).
+/// A move's plan ([`plan`]): what it would copy, and for how long.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Plan {
+    /// The bytes it copies: the caller's estimate, else S's whole file ([`Bound`]).
+    pub bytes: u64,
+    pub bound: Bound,
+    /// The copy's time at S's node's `--move-rate-bytes`.
+    pub copy: Duration,
+    /// S's writes over the copy, which its change-feed hold keeps (its device bytes a
+    /// second, reads included: an over-estimate).
+    pub retained: u64,
+}
+
+/// What a plan's bytes are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Bound {
+    /// The caller's estimate of the range's own bytes (the balancer's tablets survey).
+    Estimate,
+    /// S's whole file, an upper bound: nothing reports one range's bytes (the coordinator's
+    /// ruling for 1.3.0).
+    WholePartition,
+}
+
+/// Why a move isn't started now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Skip {
+    /// S's node is at its `--max-move-followers`: retry-safe, later.
+    Busy(String),
+    /// The copy would outrun S's `--move-retention-cap`.
+    Fit(String),
+    /// S, its node or its numbers aren't known (no status, an older node).
+    Unknown(String),
+}
+
+/// Step 0's plan for a move (or a split) out of partition `from` (design §1): pure. The copy
+/// time from `bytes` (else S's whole file) at S's node's `--move-rate-bytes`, and S's writes
+/// over it against `--move-retention-cap`; a `Busy` past `--max-move-followers`, counting
+/// the moves the map has copying from S's node.
+pub(super) fn plan(
+    m: &ClusterMap,
+    statuses: &std::collections::HashMap<String, NodeStatus>,
+    from: &str,
+    bytes: Option<u64>,
+) -> Result<Plan, Skip> {
+    let node = m
+        .partitions
+        .iter()
+        .find(|p| p.id == from)
+        .map(|p| p.node.as_str())
+        .ok_or_else(|| Skip::Unknown(format!("the map has no partition {from:?}")))?;
+    let st = statuses
+        .get(node)
+        .ok_or_else(|| Skip::Unknown(format!("node {node:?}, {from}'s, gave no status")))?;
+    let lp = st
+        .partitions
+        .iter()
+        .find(|lp| lp.id == from)
+        .ok_or_else(|| Skip::Unknown(format!("node {node:?} doesn't list {from}")))?;
+    if st.move_rate_bytes == 0 {
+        return Err(Skip::Unknown(format!(
+            "node {node:?} doesn't report its range-move limits (an older build)"
+        )));
+    }
+    let on_node = |p: &str| m.partitions.iter().any(|q| q.id == p && q.node == node);
+    let copying = m
+        .moves
+        .iter()
+        .filter(|r| !map::node_move(r) && map::follows(map::phase(r)) && on_node(&r.from))
+        .count();
+    let max = st.max_move_followers as usize;
+    if max > 0 && copying >= max {
+        return Err(Skip::Busy(format!(
+            "node {node:?} copies {copying} range moves already, its --max-move-followers"
+        )));
+    }
+    let (bytes, bound) = match bytes {
+        Some(b) => (b, Bound::Estimate),
+        None => (lp.file_bytes, Bound::WholePartition),
+    };
+    let copy = Duration::from_secs_f64(bytes as f64 / st.move_rate_bytes as f64);
+    let retained = (lp.load_device * copy.as_secs_f64()) as u64;
+    let cap = st.move_retention_cap;
+    if cap > 0 && retained > cap {
+        let of = match bound {
+            Bound::Estimate => format!("the range's estimated {bytes} bytes"),
+            Bound::WholePartition => format!(
+                "{from}'s whole file, {bytes} bytes (an upper bound: nothing reports one \
+                 range's bytes)"
+            ),
+        };
+        return Err(Skip::Fit(format!(
+            "copying {of} at {} bytes/s takes {}s, over which {from} writes about {retained} \
+             bytes: past node {node:?}'s --move-retention-cap of {cap}",
+            st.move_rate_bytes,
+            copy.as_secs()
+        )));
+    }
+    Ok(Plan {
+        bytes,
+        bound,
+        copy,
+        retained,
+    })
+}
+
+/// The CLI's plan for a move out of `from` not yet recorded: S's node's status, then
+/// [`plan`] with the whole-partition bound. A `Busy` is retry-safe; a fit names
+/// `--skip-fit-check`, which `fit: false` (the operator's) skips.
+async fn cli_plan(args: &NodeArgs, m: &ClusterMap, from: &str, fit: bool) -> Result<(), Failure> {
+    let (node, address) = node_of(m, from)?;
+    let st = At::new(args, node, address).await?.status().await?;
+    let statuses = [(node.to_owned(), st)].into();
+    match plan(m, &statuses, from, None) {
+        Ok(_) => Ok(()),
+        Err(Skip::Busy(why)) => Err(Failure::coded(
+            pigeonhole::ErrorCode::Busy,
+            format!("{why}: run it again once one finishes"),
+        )),
+        Err(Skip::Fit(_)) if !fit => Ok(()),
+        Err(Skip::Fit(why)) => Err(Failure::usage(&format!(
+            "{why}. A small range in a big partition fits: move it with --skip-fit-check"
+        ))),
+        Err(Skip::Unknown(why)) => Err(Failure::usage(&why)),
+    }
+}
+
+/// `phdb cluster move-range`, the CLI's (record ids `range-<ms>`): [`plan`]ned first
+/// (`fit: false` skips its fit check) unless the map records the move already.
 pub(super) async fn run(
     args: &NodeArgs,
     spec: &Spec,
     timeout: Option<Duration>,
+    fit: bool,
 ) -> Result<Report, Failure> {
+    let m = map_now(args).await?;
+    if let Ok(range) = resolve(&m, spec)
+        && record_for(&m, spec, &range).is_ok_and(|r| r.is_none())
+    {
+        cli_plan(args, &m, &spec.from, fit).await?;
+    }
     run_as(
         args,
         spec,
@@ -728,13 +864,19 @@ pub(super) struct SplitSpec {
 const SPLIT_EPOCH: u64 = 1;
 
 /// `phdb cluster split` (D331 PR 5): a range move of `[key, end)` of `from`'s range into a
-/// new, empty partition on `--to`, created there before the map change that adds it. Run
-/// again, it goes on with the split's record (record ids `split-<ms>`).
+/// new, empty partition on `--to`, created there before the map change that adds it,
+/// [`plan`]ned first as [`run`]'s. Run again, it goes on with the split's record (record ids
+/// `split-<ms>`).
 pub(super) async fn split(
     args: &NodeArgs,
     spec: &SplitSpec,
     timeout: Option<Duration>,
+    fit: bool,
 ) -> Result<Report, Failure> {
+    let m = map_now(args).await?;
+    if split_record(&m, spec).is_ok_and(|r| r.is_none()) {
+        cli_plan(args, &m, &spec.from, fit).await?;
+    }
     split_as(
         args,
         spec,
@@ -1171,5 +1313,76 @@ mod tests {
         let mut moved = m;
         moved.partitions[1].epoch = 2;
         assert_eq!(abort_reason(&moved, &old, None, None), None);
+    }
+
+    /// D331 PR 5's plan: the copy time at S's node's rate, S's writes over it against its
+    /// retention cap, by the caller's estimate or else S's whole file (and a fit skip says
+    /// which); a full `--max-move-followers` is Busy, counting only moves still copying from
+    /// S's node; no status or an older node's is Unknown.
+    #[test]
+    fn a_plan_reckons_the_copy_at_the_sources_rate_and_its_writes_against_its_cap() {
+        const GIB: u64 = 1 << 30;
+        let status = |file_bytes: u64, max: u32| {
+            let lp = LocalPartition {
+                id: "p1".into(),
+                file_bytes,
+                load_device: (10u64 << 20) as f64,
+                ..Default::default()
+            };
+            let st = NodeStatus {
+                partitions: vec![lp],
+                move_rate_bytes: 64 << 20,
+                move_retention_cap: 4 * GIB,
+                max_move_followers: max,
+                ..Default::default()
+            };
+            std::collections::HashMap::from([("a".to_owned(), st)])
+        };
+        let m = map();
+        let p = plan(&m, &status(GIB, 2), "p1", None).unwrap();
+        assert_eq!(p.bound, Bound::WholePartition);
+        assert_eq!((p.bytes, p.copy.as_secs()), (GIB, 16));
+        assert_eq!(p.retained, 160 << 20);
+        // A 100 GiB file reckons a copy of 1600 s and 16000 MiB of writes: past 4 GiB.
+        let big = status(100 * GIB, 2);
+        match plan(&m, &big, "p1", None) {
+            Err(Skip::Fit(why)) => assert!(why.contains("whole file"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // The balancer's estimate of the range's own bytes fits.
+        let p = plan(&m, &big, "p1", Some(GIB)).unwrap();
+        assert_eq!((p.bound, p.copy.as_secs()), (Bound::Estimate, 16));
+        match plan(&m, &big, "p1", Some(50 * GIB)) {
+            Err(Skip::Fit(why)) => assert!(why.contains("estimated"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Followers: a move copying from a's p2 fills a cap of 1; an aborting one doesn't.
+        let mut busy = m.clone();
+        let mut r = RangeMove {
+            id: "mv1".into(),
+            kind: MoveKind::Range as i32,
+            from: "p2".into(),
+            to: "p9".into(),
+            ..Default::default()
+        };
+        r.set_phase(MovePhase::Aborting);
+        busy.moves.push(r.clone());
+        assert!(plan(&busy, &status(GIB, 1), "p1", None).is_ok());
+        busy.moves[0].set_phase(MovePhase::Copying);
+        assert!(matches!(
+            plan(&busy, &status(GIB, 1), "p1", None),
+            Err(Skip::Busy(_))
+        ));
+        assert!(plan(&busy, &status(GIB, 2), "p1", None).is_ok());
+        // Unknown: no status from S's node, or an older node's (no limits).
+        let none = std::collections::HashMap::new();
+        assert!(matches!(plan(&m, &none, "p1", None), Err(Skip::Unknown(_))));
+        let mut old = status(GIB, 2);
+        old.get_mut("a").unwrap().move_rate_bytes = 0;
+        assert!(matches!(plan(&m, &old, "p1", None), Err(Skip::Unknown(_))));
+        assert!(matches!(
+            plan(&m, &status(GIB, 2), "p7", None),
+            Err(Skip::Unknown(_))
+        ));
     }
 }

@@ -350,6 +350,11 @@ pub(crate) enum ClusterCommand {
             conflicts_with_all = ["table", "from", "to", "start", "end"]
         )]
         abort: Option<String>,
+        /// Start the move though its plan says the copy would outrun the source's
+        /// `--move-retention-cap`. The plan reckons with the source's whole file, since
+        /// nothing reports one range's bytes: a small range in a big partition fits anyway.
+        #[arg(long, conflicts_with = "abort")]
+        skip_fit_check: bool,
         #[command(flatten)]
         node: NodeArgs,
         /// Give up waiting for the move after SECS (at least 1): the error names the phase
@@ -376,9 +381,14 @@ pub(crate) enum ClusterCommand {
         /// The node id the new partition is created on.
         #[arg(long, value_name = "ID")]
         to: String,
-        /// The new partition's id: by default the smallest free `<from>-<n>`, n ≥ 1.
+        /// The new partition's id: by default `<from>-<v>`, v the map version of the change
+        /// that records the split. Refused if taken or not a partition id: give one here.
         #[arg(long, value_name = "ID")]
         id: Option<String>,
+        /// Start the split though its plan says the copy would outrun the source's
+        /// `--move-retention-cap`, as `move-range`'s.
+        #[arg(long)]
+        skip_fit_check: bool,
         #[command(flatten)]
         node: NodeArgs,
         /// Give up waiting for the split after SECS (at least 1), as `move-range`'s.
@@ -537,6 +547,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             to,
             start,
             end,
+            skip_fit_check,
             node,
             timeout,
             ..
@@ -550,6 +561,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 end: end.as_ref().map(|s| s.as_bytes().to_vec()),
             },
             timeout.map(Duration::from_secs),
+            !skip_fit_check,
         )),
         ClusterCommand::Split {
             table,
@@ -557,6 +569,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             key,
             to,
             id,
+            skip_fit_check,
             node,
             timeout,
         } => runtime()?.block_on(super::range_move::split(
@@ -569,6 +582,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 id: id.clone(),
             },
             timeout.map(Duration::from_secs),
+            !skip_fit_check,
         )),
         ClusterCommand::DropPartition { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Drop))
