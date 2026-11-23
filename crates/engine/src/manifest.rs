@@ -868,10 +868,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 return own;
             }
             // A flush covers every slot of its shard: a table dropped while it ran loses
-            // its outputs only, and the other slots' commit goes ahead (F7-3). Only a
-            // dropped table's: a tablet a split or merge retired keeps its data in the
-            // flushed memtable, so its edits must not vanish while the checkpoint passes
-            // them (the request is refused below instead).
+            // its outputs only, and the other slots' commit goes ahead (F7-3). So does a
+            // tablet a range drop retired (D331): its rows are the drop's, written below
+            // its seqno, since the drop's caller joins every writer of the range first.
+            // Only those: a tablet a split or merge retired keeps its data in the flushed
+            // memtable, so its edits must not vanish while the checkpoint passes them (the
+            // request is refused below instead).
             let table_gone = |e: &Edit| {
                 let tablet = match e {
                     Edit::AddSst { tablet, .. } | Edit::SetFlushed { tablet, .. } => *tablet,
@@ -883,10 +885,13 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                     .dropped_ok
                     .iter()
                     .find(|(t, _)| *t == tablet)
-                    .is_some_and(|(_, table)| catalog.table(*table).is_none());
+                    .is_some_and(|(_, table)| {
+                        catalog.table(*table).is_none() || catalog.range_dropped(tablet)
+                    });
                 debug_assert!(
                     gone || !orphaned(&catalog, e, &[]),
-                    "a flush names tablet {tablet:?}, retired while its table lives"
+                    "a flush names tablet {tablet:?}, retired by a split or merge while its \
+                     table lives"
                 );
                 gone && orphaned(&catalog, e, &[])
             };

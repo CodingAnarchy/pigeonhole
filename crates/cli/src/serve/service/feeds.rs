@@ -76,6 +76,28 @@ impl Service {
         } else {
             Vec::new()
         };
+        // D331 PR 5 (simp724's and feed1248's must on #2130): a cluster component from the
+        // oldest position starts no lower than its tables' pruned watermarks here, moved and
+        // served: a copy with longer retention would otherwise replay a range's history from
+        // before a pruned move, whose barrier is gone, out of per-key order.
+        let floor = match (&r.start, self.part_opt()) {
+            (Some(S::FromOldest(true)), Some(part)) if announce => {
+                let mut floor = 0;
+                for name in &names {
+                    for kind in [
+                        super::super::ranges::Pruned::Moved,
+                        super::super::ranges::Pruned::Serving,
+                    ] {
+                        floor = floor.max(
+                            super::super::ranges::watermark(&part.db, kind, name)
+                                .map_err(ApiError::internal)?,
+                        );
+                    }
+                }
+                floor
+            }
+            _ => 0,
+        };
         let start = match r.start {
             None | Some(S::FromOldest(false)) => Start::Now,
             Some(S::FromOldest(true)) => Start::Oldest,
@@ -100,6 +122,7 @@ impl Service {
                     visible: r.visible,
                     start,
                     skip,
+                    floor,
                     announce,
                     internal,
                 },
@@ -153,6 +176,30 @@ impl Service {
             .filter(|m| !m.token.is_empty() && tables.contains(&m.table))
             .collect();
         if from_hand_over {
+            // A pruned move into this partition of these tables may have been the earliest
+            // hand-over: its start is gone, and this partition's seqnos can't be compared
+            // with the resume's position elsewhere, so it fails closed (D331 PR 5,
+            // feed1248's M1 on #2130).
+            if let Some(part) = self.part_opt() {
+                for table in tables {
+                    let mark = super::super::ranges::watermark(
+                        &part.db,
+                        super::super::ranges::Pruned::Serving,
+                        table,
+                    )
+                    .map_err(ApiError::internal)?;
+                    if mark > 0 {
+                        return Err(ApiError::from_code(
+                            pigeonhole::ErrorCode::FeedExpired,
+                            &format!(
+                                "a range of table {table:?} moved to this partition before, and \
+                                 that move's record here is pruned: this resume's hand-over \
+                                 start is gone. Subscribe again"
+                            ),
+                        ));
+                    }
+                }
+            }
             // A move into this partition that hasn't reached CLEANING (or whose serving row
             // isn't here yet) is no gap: it serves none of the range yet, so the resume asks
             // again shortly (cli692's M1 on PR 3b). No move at all is one.
@@ -175,6 +222,31 @@ impl Service {
                 )
             })?;
             r.start = Some(S::Resume(first.token.clone().into()));
+        }
+        // D331 PR 5 (simp724's P2 form): a resume below a table's pruned watermark has lost a
+        // hand-over's barrier: expired, on every copy, whatever its own retention, and
+        // whatever rows of the table are live (another range's row doesn't cover the pruned
+        // one: feed1248's M1 on #2130).
+        if let (Some(S::Resume(t)), Some(part)) = (r.start.as_ref(), self.part_opt()) {
+            let from = super::super::cluster::token::token_seqno(t).unwrap_or(0);
+            for table in tables {
+                let mark = super::super::ranges::watermark(
+                    &part.db,
+                    super::super::ranges::Pruned::Serving,
+                    table,
+                )
+                .map_err(ApiError::internal)?;
+                if from < mark {
+                    return Err(ApiError::from_code(
+                        pigeonhole::ErrorCode::FeedExpired,
+                        &format!(
+                            "a range of table {table:?} moved to this partition past this \
+                             resume's position, and that move's record here is pruned: \
+                             subscribe again"
+                        ),
+                    ));
+                }
+            }
         }
         Ok(barriers_for(rows, r.start.as_ref()))
     }

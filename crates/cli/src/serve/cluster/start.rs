@@ -116,6 +116,7 @@ pub(crate) fn run(
                 .then(|| Duration::from_millis(args.cluster_failover_max_lag_ms)),
             balance_window: Duration::from_secs(args.balance_window),
             load_interval: load::INTERVAL,
+            prune_interval: super::range_prune::INTERVAL,
         },
         state,
         voted,

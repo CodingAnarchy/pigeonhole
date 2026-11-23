@@ -7417,12 +7417,6 @@ pub struct RangeMove {
     /// compared.
     #[prost(uint64, tag = "14")]
     pub to_epoch: u64,
-    /// D331 PR 5 / D332: the move is a split. Its target is a partition the split created
-    /// (phdb cluster split, or a balancer split), which an abort removes with the record.
-    /// Set by the change that first records the move; never inferred from the id or the
-    /// target's shape.
-    #[prost(bool, tag = "15")]
-    pub split: bool,
 }
 /// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7912,6 +7906,12 @@ pub struct LocalPartition {
     /// WAL included), for the balancer. Open partitions only; 0 when closed.
     #[prost(uint64, tag = "32")]
     pub file_bytes: u64,
+    /// D331 PR 5: its device bytes written per second, the same average as `load_device`
+    /// (writes only, flushes and compactions included: an over-estimate of what a range move's
+    /// change-feed hold keeps), for a move's plan. Absent until the first interval ends (or
+    /// from an older node): unknown. 0 is an idle partition.
+    #[prost(uint64, optional, tag = "34")]
+    pub write_bytes_rate: ::core::option::Option<u64>,
 }
 /// A share held in doubt (D329).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

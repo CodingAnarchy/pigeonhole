@@ -2385,6 +2385,19 @@ async fn move_orders_to(
     final_seqno: u64,
     last: crate::serve::proto::MovePhase,
 ) {
+    move_range_to(ports, "orders", "mvo", start, None, final_seqno, last).await;
+}
+
+/// [`move_orders_to`] for `[start, end)` of `table`, as move `id`, from p1 to p2.
+async fn move_range_to(
+    ports: &[u16],
+    table: &str,
+    id: &str,
+    start: &str,
+    end: Option<&str>,
+    final_seqno: u64,
+    last: crate::serve::proto::MovePhase,
+) {
     use crate::serve::proto::{GetMapRequest, MoveKind, MovePhase, PushMapRequest, RangeMove};
     let base = client(ports[0])
         .await
@@ -2408,8 +2421,8 @@ async fn move_orders_to(
         m.map_version = version;
         let handed = super::super::map::committed(phase);
         if handed {
-            let t = m.tables.iter_mut().find(|t| t.name == "orders").unwrap();
-            *t = super::super::map::handed_over(t, start.as_bytes(), None, "p2");
+            let t = m.tables.iter_mut().find(|t| t.name == table).unwrap();
+            *t = super::super::map::handed_over(t, start.as_bytes(), end.map(str::as_bytes), "p2");
             m.partitions
                 .iter_mut()
                 .find(|p| p.id == "p1")
@@ -2417,11 +2430,11 @@ async fn move_orders_to(
                 .epoch += 1;
         }
         m.moves = vec![RangeMove {
-            id: "mvo".into(),
+            id: id.into(),
             kind: MoveKind::Range as i32,
-            table: "orders".into(),
+            table: table.into(),
             start: (!start.is_empty()).then(|| text(start)),
-            end: None,
+            end: end.map(text),
             from: "p1".into(),
             to: "p2".into(),
             phase: phase as i32,
@@ -2572,6 +2585,413 @@ fn a_token_from_before_a_whole_table_move_resumes_through_the_source_then_the_ta
                 "a barrier reached the client"
             );
         });
+    });
+}
+
+/// D331 PR 5 (simp724's P2 form; feed1248's W1, W3): once the source's moved-away row of a
+/// table moved off it whole is pruned, a token from before the move is `FeedExpired` there,
+/// not left out by the "neither" branch: the table's pruned watermark answers for it, read
+/// from the file as a copy that never had the row would read it. The prune is the pass's
+/// own write ([`ranges::prune_row`]); its rules are `range_prune`'s, tested there. The node
+/// restarts so its gate takes the file's rows, as a promoted copy's does.
+///
+/// [`ranges::prune_row`]: crate::serve::ranges::prune_row
+#[test]
+fn a_token_from_before_a_pruned_whole_table_move_expires() {
+    use crate::serve::ranges::{self, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        let req = |start| SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            start,
+            ..Default::default()
+        };
+        let token = t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            put_order(c, "k1").await;
+            let (first, _) = commits(&mut s, 1).await;
+            let token = first[0].token.clone().unwrap();
+            let last = put_order(c, "k2").await;
+            drop(s);
+            move_orders(&ports, "", last).await;
+            token
+        });
+        let db = t.dbs[0].clone().unwrap();
+        let row = ranges::read_moved(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .expect("p1's moved-away row");
+        ranges::prune_row(&db, Pruned::Moved, &row).unwrap();
+        assert!(ranges::watermark(&db, Pruned::Moved, "orders").unwrap() >= row.final_seqno);
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let ended = loop {
+                let e = match subscribe(c, req(Some(Start::Resume(token.clone())))).await {
+                    Err(e) => e,
+                    Ok(mut s) => match s.message().await {
+                        Err(e) => e,
+                        Ok(m) => panic!("the resume read on: {m:?}"),
+                    },
+                };
+                let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+                if !again || tokio::time::Instant::now() >= deadline {
+                    break e;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+        });
+    });
+}
+
+/// How a resume of `req` through `port` ends, once its partitions answer: the first error
+/// that isn't a retry-safe wait. Panics if it reads on.
+async fn resume_ends(port: u16, req: SubscribeRequest) -> tonic::Status {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let e = match subscribe(port, req.clone()).await {
+            Err(e) => e,
+            Ok(mut s) => match s.message().await {
+                Err(e) => e,
+                Ok(m) => panic!("the resume read on: {m:?}"),
+            },
+        };
+        let again = matches!(code(&e).as_str(), "PartitionUnavailable" | "WrongPartition");
+        if !again || tokio::time::Instant::now() >= deadline {
+            return e;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `orders` on p1 alone, a subscription's token after "k1", then "k2", and `orders` moved to
+/// p2 from `start` to CLEANING: the token, from before the move.
+async fn token_before_an_orders_move(ports: &[u16], start: &str) -> Bytes {
+    let (a, c) = (ports[0], ports[2]);
+    orders_on_p1(a).await;
+    let mut s = subscribe(
+        c,
+        SubscribeRequest {
+            tables: vec!["orders".into()],
+            checkpoint_every: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    put_order(c, "k1").await;
+    let (first, _) = commits(&mut s, 1).await;
+    let token = first[0].token.clone().unwrap();
+    let last = put_order(c, "k2").await;
+    drop(s);
+    move_orders(ports, start, last).await;
+    token
+}
+
+fn orders_from(start: Option<Start>) -> SubscribeRequest {
+    SubscribeRequest {
+        tables: vec!["orders".into()],
+        checkpoint_every: 1,
+        start,
+        ..Default::default()
+    }
+}
+
+/// simp724 on feed1248's M1 (#2130), the source's side: a table's moved watermark answers
+/// a resume below it whatever moved-away rows of the table are live. p1 holds another
+/// move's live row of `orders` beside the pruned one; the resume still expires.
+#[test]
+fn a_live_moved_away_row_of_another_range_doesnt_cover_a_pruned_one() {
+    use crate::serve::ranges::{self, Moved, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let token = t.rt.block_on(token_before_an_orders_move(&ports, ""));
+        let db = t.dbs[0].clone().unwrap();
+        let row = ranges::read_moved(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .unwrap();
+        ranges::write_moved(
+            &db,
+            &Moved {
+                id: "mvx".into(),
+                start: b"zz".to_vec(),
+                ..row.clone()
+            },
+        )
+        .unwrap();
+        ranges::prune_row(&db, Pruned::Moved, &row).unwrap();
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            let ended = resume_ends(ports[2], orders_from(Some(Start::Resume(token)))).await;
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+        });
+    });
+}
+
+/// feed1248's M1 (#2130), the target's side: a resume that gains p2 through a move starts at
+/// its earliest live serving row; with an earlier move of the table into p2 pruned, that
+/// start would skip it, so it fails closed. p2 holds another move's live row of `orders`.
+#[test]
+fn a_resume_gaining_a_target_with_a_pruned_move_into_it_expires() {
+    use crate::serve::ranges::{self, Moved, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let token = t.rt.block_on(token_before_an_orders_move(&ports, ""));
+        let db = t.dbs[1].clone().unwrap();
+        let row = ranges::read_serving(&db)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.table == "orders")
+            .expect("p2's serving row");
+        // A later move's live row: its hand-over past the pruned one's, so only the
+        // fail-closed rule, not the watermark against its start, expires the resume.
+        let later = db
+            .table("orders")
+            .and_then(|b| b.open())
+            .and_then(|o| o.feed().open())
+            .unwrap()
+            .token()
+            .as_bytes()
+            .to_vec();
+        ranges::write_serving(
+            &db,
+            &Moved {
+                id: "mvy".into(),
+                start: b"zz".to_vec(),
+                seqno: db.visible_seqno(),
+                token: later,
+                ..row.clone()
+            },
+        )
+        .unwrap();
+        ranges::prune_row(&db, Pruned::Serving, &row).unwrap();
+        t.stop(1);
+        t.restart(1);
+        t.rt.block_on(async {
+            let ended = resume_ends(ports[2], orders_from(Some(Start::Resume(token)))).await;
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+            assert!(
+                ended.message().contains("hand-over start is gone"),
+                "{ended}"
+            );
+        });
+    });
+}
+
+/// feed1248's T1 (#2130): the target's own resume check, not `from_hand_over`. A
+/// subscription of `users` holds a component on p2. Then a move of `users` [c, f) from p1
+/// into p2 reaches CLEANING (move 2: p2's serving row is live in its gate), and p2 holds an
+/// earlier move's pruned watermark of `users` (move 1), past the token's p2 position. The
+/// token's resume of p2 is below it: `FeedExpired`, though move 2's live row is there.
+#[test]
+fn a_targets_resume_below_a_pruned_move_in_expires_beside_a_live_one() {
+    use crate::serve::proto::MovePhase;
+    use crate::serve::ranges::{self, Moved, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let c = ports[2];
+        let db = t.dbs[1].clone().unwrap();
+        t.rt.block_on(async {
+            let mut s = subscribe(
+                c,
+                SubscribeRequest {
+                    tables: vec!["users".into()],
+                    checkpoint_every: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            put(c, "zed", "1").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            assert_eq!(seen[0].partition, "p2");
+            let token = seen[0].token.clone().unwrap();
+            drop(s);
+            let last = put_in(c, "users", "d01").await;
+            move_range_to(
+                &ports,
+                "users",
+                "mv2",
+                "c",
+                Some("f"),
+                last,
+                MovePhase::Cleaning,
+            )
+            .await;
+            eventually("p2's serving row of move 2", async || {
+                ranges::read_serving(&db)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.id == "mv2")
+            })
+            .await;
+            for i in 0..3 {
+                put(c, &format!("zz{i}"), "2").await;
+            }
+            // Move 1's pruned serving row: its `t_from` past the token's p2 position.
+            ranges::prune_row(
+                &db,
+                Pruned::Serving,
+                &Moved {
+                    id: "mv1".into(),
+                    table: "users".into(),
+                    start: b"n".to_vec(),
+                    end: Some(b"p".to_vec()),
+                    seqno: db.visible_seqno(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let req = SubscribeRequest {
+                tables: vec!["users".into()],
+                checkpoint_every: 1,
+                start: Some(Start::Resume(token)),
+                ..Default::default()
+            };
+            let ended = resume_ends(c, req).await;
+            assert_eq!(code(&ended), "FeedExpired", "{ended}");
+            assert!(
+                ended.message().contains("moved to this partition past"),
+                "{ended}"
+            );
+        });
+    });
+}
+
+/// simp724's and feed1248's must (#2130): a partial move ([m, end) of `orders` from p1 to
+/// p2), both rows pruned. A subscription from the oldest position reads each partition
+/// from no lower than its watermarks: p1's history of the moved range from before the
+/// move ("n1"'s first write) isn't replayed beside p2's later write of it.
+#[test]
+fn a_subscription_from_the_oldest_starts_past_a_pruned_partial_move() {
+    use crate::serve::ranges::{self, Pruned};
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let c = ports[2];
+        t.rt.block_on(async {
+            orders_on_p1(ports[0]).await;
+            put_order(c, "n1").await;
+            let last = put_order(c, "a1").await;
+            move_orders(&ports, "m", last).await;
+        });
+        for (i, kind) in [(0, Pruned::Moved), (1, Pruned::Serving)] {
+            let db = t.dbs[i].clone().unwrap();
+            let rows = match kind {
+                Pruned::Moved => ranges::read_moved(&db),
+                Pruned::Serving => ranges::read_serving(&db),
+            }
+            .unwrap();
+            let row = rows.into_iter().find(|m| m.table == "orders").unwrap();
+            ranges::prune_row(&db, kind, &row).unwrap();
+            t.stop(i);
+            t.restart(i);
+        }
+        t.rt.block_on(async {
+            // p2 serves [m, end) now: "n1" again, there.
+            eventually("p2 takes n1", async || {
+                data(c)
+                    .await
+                    .mutate(MutateRequest {
+                        writes: Some({
+                            let mut w = put_row("n1", "after");
+                            w.row.as_mut().unwrap().table = "orders".into();
+                            w
+                        }),
+                        durability: 0,
+                    })
+                    .await
+                    .is_ok()
+            })
+            .await;
+            let mut s = subscribe_when_leased(c, orders_from(Some(Start::FromOldest(true)))).await;
+            let mut seen = Vec::new();
+            while let Ok(Ok(Some(e))) =
+                tokio::time::timeout(Duration::from_secs(3), s.message()).await
+            {
+                if let Some(Event::Commit(ch)) = &e.event {
+                    for change in &ch.changes {
+                        seen.push((
+                            e.partition.clone(),
+                            String::from_utf8(change.row.to_vec()).unwrap(),
+                        ));
+                    }
+                }
+            }
+            assert!(
+                seen.contains(&("p2".to_owned(), "n1".to_owned())),
+                "p2's write of n1: {seen:?}"
+            );
+            assert!(
+                !seen.contains(&("p1".to_owned(), "n1".to_owned())),
+                "p1 replayed n1 from before the pruned move: {seen:?}"
+            );
+        });
+    });
+}
+
+/// Move `id`'s status on partition `p` at node `port`, if it lists it.
+async fn move_on(port: u16, p: &str, id: &str) -> Option<crate::serve::proto::MoveStatus> {
+    client(port)
+        .await
+        .status(crate::serve::proto::StatusRequest::default())
+        .await
+        .ok()?
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == p)?
+        .moves
+        .into_iter()
+        .find(|m| m.id == id)
+}
+
+/// cli692's test gap on #2130: a source restarted at CLEANING after its drop. Its drop row
+/// runs again at the open, a no-op on a range (here a whole table) already gone, and it
+/// reports the drop done again; it serves none of the moved table.
+#[test]
+fn a_source_restarted_at_cleaning_after_its_drop_reports_it_done_again() {
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let a = ports[0];
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let last = put_order(ports[2], "k1").await;
+            move_orders(&ports, "", last).await;
+            eventually("p1 drops the moved table", async || {
+                move_on(a, "p1", "mvo").await.is_some_and(|m| m.dropped)
+            })
+            .await;
+        });
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            eventually("p1 reports the drop done after its restart", async || {
+                move_on(a, "p1", "mvo").await.is_some_and(|m| m.dropped)
+            })
+            .await;
+        });
+        let db = t.dbs[0].clone().unwrap();
+        let gone = db
+            .table("orders")
+            .and_then(|b| b.open())
+            .map(|o| o.get(b"k1", "f", b"q").unwrap().is_none())
+            .unwrap_or(true);
+        assert!(gone, "p1 serves the moved table's row again");
     });
 }
 

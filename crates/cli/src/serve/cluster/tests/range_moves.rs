@@ -1236,6 +1236,36 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
     let _ = (db_a.close(), db_b.close());
 }
 
+/// cli692's M1 on #2130: a spanning transaction's branch on S wrote a row of the moving
+/// range while S still served it (CATCHING_UP). Once S fences the range (HANDING_OVER) the
+/// branch's prepare is refused, as a local commit open across the fence is, so its share
+/// can't land above the fence's seqno: the transaction writes nothing anywhere.
+#[test]
+fn a_branch_that_wrote_the_range_before_the_fence_cant_prepare_after_it() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::CatchingUp))).await;
+        // Home p2 (by "zed"); a branch on p1 writes "d05", inside the moving [c, f).
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        txn_write(a, &id, vec![put_row("d05", "1")], None)
+            .await
+            .unwrap();
+        txn_write(c, &id, vec![put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        push(&t.ports, &moving(&t.v1, 3, Some(MovePhase::HandingOver))).await;
+        let refused = super::spanning::commit_parts(c, &id, Vec::new()).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(get_row(c, "zed").await.unwrap(), None, "the home wrote");
+    });
+    let users = t.db_a.table("users").unwrap().open().unwrap();
+    assert!(
+        users.get(b"d05", "f", b"q").unwrap().is_none(),
+        "the branch wrote on the source past its fence"
+    );
+}
+
 /// Three nodes as the PR 4b tests run them: p1 on a, p2 on b, c routing. The databases of a
 /// and b, the map, the ports, the directories and the stop senders.
 struct Three {
@@ -2091,7 +2121,7 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
     let t = three();
     let (a, c) = (t.ports[0], t.ports[2]);
     let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
-    t.rt.block_on(async {
+    let new = t.rt.block_on(async {
         with_families(&t).await;
         for i in 0..50 {
             try_put(c, &format!("d{i:02}"), "0").await.unwrap();
@@ -2174,6 +2204,13 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
             Some(b"d"),
             "p1"
         ));
+        // The next map, on which c's reconcile clears a finished split's mark (cli692's
+        // test gap), if the removal's didn't.
+        let mut next = m.clone();
+        next.map_version += 1;
+        push(&t.ports, &next).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        new
     });
     let src = t.db_a.table("users").unwrap().open().unwrap();
     assert!(
@@ -2181,10 +2218,27 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
         "p1 dropped its copy"
     );
     assert!(src.get(b"a", "f", b"q").unwrap().is_some());
+    // Once c stops (its writer lock gone), the file shows the mark cleared: the partition is
+    // like any other (cli692's test gap on #2130).
+    let file = t.dirs[2].join(format!("{new}.phdb"));
+    drop(src);
+    drop(t);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mark = loop {
+        match pigeonhole::Pigeonhole::open(&file, pigeonhole::Options::default().read_only(true)) {
+            Ok(db) => break super::super::identity::split_mark(&db).unwrap(),
+            Err(e) if std::time::Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(mark, None, "the finished split's mark");
 }
 
 /// D331 PR 5 (cli692's Must 5): a split aborted before its commit point takes its new
-/// partition with it: the record (flagged `split`) stays ABORTING until the new partition
+/// partition with it: the record (of kind PARTITION) stays ABORTING until the new partition
 /// p1-<v> dropped what it copied, then the map drops the record and it together, and its
 /// file is moved aside on c. p1 serves
 /// the range as before.
@@ -2230,7 +2284,10 @@ fn an_aborted_split_removes_its_new_partition_and_moves_its_file_aside() {
             .unwrap()
             .into_inner();
         let r = recorded.moves.iter().find(|r| r.id == id).unwrap();
-        assert!(r.split && r.to == new, "{r:?}");
+        assert!(
+            super::super::range_move::is_split(r) && r.to == new,
+            "{r:?}"
+        );
         super::super::range_move::abort(&args, &id, Some(Duration::from_secs(60)))
             .await
             .unwrap();
@@ -2315,6 +2372,81 @@ fn a_split_stopped_at_handed_over_is_finished_by_resume() {
     });
 }
 
+/// D331 PR 5 (Must 3, never-both before CLEANING): a move whose source is cut off from its
+/// peers right after the hand-over can't acknowledge it, so the driver sets CLEANING only
+/// once the source's lease ran out on the majority (the lease bound): by then the cut-off
+/// source no longer serves, and the target does. Joined again, it drops its copy and the
+/// move ends. p2's range of `users` ([m, end), on b) moves into p1 (on a, the map's writer,
+/// which stays with the majority).
+#[test]
+fn a_source_cut_off_at_the_hand_over_stops_serving_before_the_target_serves() {
+    let t = three();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, &format!("n{i:02}"), "0").await.unwrap();
+        }
+        let args = super::backup::args(a);
+        let spec = super::super::range_move::Spec {
+            table: "users".into(),
+            from: "p2".into(),
+            to: "p1".into(),
+            start: None,
+            end: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandedOver));
+        let stopped =
+            super::super::range_move::run(&args, &spec, Some(Duration::from_secs(120)), true).await;
+        assert!(stopped.is_err(), "the move ran past HANDED_OVER");
+        let map = async || {
+            client(a)
+                .await
+                .get_map(crate::serve::proto::GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let id = map().await.moves[0].id.clone();
+        let cut = |off: bool| {
+            super::super::cut_node(&t.dirs[1], &format!("127.0.0.1:{b}"), &t.dirs, off);
+        };
+        cut(true);
+        // The driver can't hear b: it waits out b's lease, sets CLEANING, then waits for
+        // b's drop, which can't come while b is cut off.
+        let waited =
+            super::super::range_move::resume(&args, &id, Some(Duration::from_secs(20))).await;
+        assert!(waited.is_err(), "the move ended with its source cut off");
+        let m = map().await;
+        assert_eq!(super::super::map::phase(&m.moves[0]), MovePhase::Cleaning);
+        let p2 = client(b)
+            .await
+            .status(crate::serve::proto::StatusRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == "p2")
+            .unwrap();
+        assert_ne!(
+            p2.state(),
+            crate::serve::proto::LocalPartitionState::Serving,
+            "the cut-off source still serves at CLEANING: {p2:?}"
+        );
+        assert_eq!(get_row(a, "n05").await.unwrap(), Some(b"0".to_vec()));
+        cut(false);
+        super::super::range_move::resume(&args, &id, Some(Duration::from_secs(120)))
+            .await
+            .unwrap();
+        assert!(map().await.moves.is_empty());
+        assert_eq!(get_row(c, "n05").await.unwrap(), Some(b"0".to_vec()));
+    });
+    let _ = (&t.db_a, &t.db_b);
+}
+
 /// D331 PR 5 (audit120's point 1, simp724's case): a split's create whose COPYING change
 /// never lands leaves a marked, empty file no map places. The node moves it aside only once
 /// it holds a map past the version the change would have carried; a map at that version
@@ -2349,55 +2481,104 @@ fn a_split_created_file_whose_map_never_landed_is_moved_aside_past_its_version()
     });
 }
 
+/// cli692's test gap on #2130: the reconcile never moves aside a marked, unmapped file that
+/// holds a row: it isn't a split's empty file. (One whose mark's move is still in the map
+/// can't be unmapped: a move naming a partition the map doesn't list is refused.)
+#[test]
+fn the_reconcile_leaves_a_marked_file_that_holds_a_row() {
+    let t = three();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        create(c, "p1-1", "split-9", 2).await.unwrap();
+        // A row in p1-1, written into its closed file directly.
+        {
+            let db = pigeonhole::Pigeonhole::open(
+                t.dirs[2].join("p1-1.phdb"),
+                pigeonhole::Options::default().shards(1),
+            )
+            .unwrap();
+            db.table("users")
+                .and_then(|b| {
+                    b.family("f", pigeonhole::Family::default())
+                        .create_if_missing()
+                })
+                .unwrap()
+                .mutate(b"d01")
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+            db.close().unwrap();
+        }
+        let passes = super::super::open::missing_passes(&t.dirs[2]);
+        let mut v5 = t.v1.clone();
+        v5.map_version = 5;
+        push(&t.ports, &v5).await;
+        eventually("c's pass on v5", async || {
+            super::super::open::missing_passes(&t.dirs[2]) > passes
+        })
+        .await;
+        assert!(t.dirs[2].join("p1-1.phdb").exists(), "a file with a row");
+        assert!(dropped_files(&t.dirs[2], "p1-1").is_empty());
+    });
+}
+
+/// An aborted split's state as its CLI's tail leaves it once it fenced and closed the new
+/// partition (the real order): `split-9` ABORTING into p1-1 on c, p1-1 created there,
+/// opened, then fenced and closed.
+async fn aborting_split_closed_on_c(t: &Three) {
+    let c = t.ports[2];
+    create(c, "p1-1", "split-9", 2).await.unwrap();
+    let mut v2 = t.v1.clone();
+    v2.map_version = 2;
+    v2.partitions.push(crate::serve::proto::Partition {
+        id: "p1-1".into(),
+        node: "c".into(),
+        epoch: 1,
+        ..Default::default()
+    });
+    let mut r = RangeMove {
+        id: "split-9".into(),
+        kind: MoveKind::Partition as i32,
+        table: "users".into(),
+        start: Some(super::super::map::canonical_key(b"d")),
+        end: Some(super::super::map::canonical_key(b"m")),
+        from: "p1".into(),
+        to: "p1-1".into(),
+        from_epoch: 1,
+        to_epoch: 1,
+        ..RangeMove::default()
+    };
+    r.set_phase(MovePhase::Aborting);
+    v2.moves.push(r);
+    push(&t.ports, &v2).await;
+    eventually("c opens p1-1", async || {
+        client(c)
+            .await
+            .status(crate::serve::proto::StatusRequest::default())
+            .await
+            .is_ok_and(|s| s.into_inner().partitions.iter().any(|lp| lp.id == "p1-1"))
+    })
+    .await;
+    let req = || PartitionRequest {
+        partition: "p1-1".into(),
+        force: false,
+    };
+    // Fenced once it's open (listed comes first, while it opens).
+    eventually("c fences p1-1", async || {
+        client(c).await.fence(req()).await.is_ok()
+    })
+    .await;
+    client(c).await.close(req()).await.unwrap();
+}
+
 /// D331 PR 5 (cli692's Must 5's test): the CLI stops between the map that drops an aborted
 /// split's record and partition, and its drop-partition. The node's reconcile moves the
 /// marked, empty, unmapped file aside on that map.
 #[test]
 fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
     let t = three();
-    let c = t.ports[2];
     t.rt.block_on(async {
-        create(c, "p1-1", "split-9", 2).await.unwrap();
-        let mut v2 = t.v1.clone();
-        v2.map_version = 2;
-        v2.partitions.push(crate::serve::proto::Partition {
-            id: "p1-1".into(),
-            node: "c".into(),
-            epoch: 1,
-            ..Default::default()
-        });
-        let mut r = RangeMove {
-            id: "split-9".into(),
-            kind: MoveKind::Range as i32,
-            table: "users".into(),
-            start: Some(super::super::map::canonical_key(b"d")),
-            end: Some(super::super::map::canonical_key(b"m")),
-            from: "p1".into(),
-            to: "p1-1".into(),
-            from_epoch: 1,
-            to_epoch: 1,
-            split: true,
-            ..RangeMove::default()
-        };
-        r.set_phase(MovePhase::Aborting);
-        v2.moves.push(r);
-        push(&t.ports, &v2).await;
-        eventually("c opens p1-1", async || {
-            client(c)
-                .await
-                .status(crate::serve::proto::StatusRequest::default())
-                .await
-                .is_ok_and(|s| s.into_inner().partitions.iter().any(|lp| lp.id == "p1-1"))
-        })
-        .await;
-        client(c)
-            .await
-            .close(PartitionRequest {
-                partition: "p1-1".into(),
-                force: false,
-            })
-            .await
-            .unwrap();
+        aborting_split_closed_on_c(&t).await;
         // The removal map; the CLI stops before its drop-partition.
         let mut v3 = t.v1.clone();
         v3.map_version = 3;
@@ -2407,5 +2588,38 @@ fn an_aborted_splits_file_left_by_a_stopped_cli_is_moved_aside() {
         })
         .await;
         assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+    });
+}
+
+/// audit120's M1 on #2130: an abort's CLI stopped after it fenced and closed the split's
+/// partition, before the map change. Run again, the abort goes on past the closed partition
+/// (no fence on it, which a closed partition refuses): the map drops the record and p1-1,
+/// p1-1's files are moved aside, and the abort's fence leaves no operator fence on the id.
+#[test]
+fn an_aborted_split_stopped_after_its_close_is_finished_by_a_rerun() {
+    let t = three();
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        aborting_split_closed_on_c(&t).await;
+        super::super::range_move::abort(
+            &super::backup::args(a),
+            "split-9",
+            Some(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert!(!m.partitions.iter().any(|p| p.id == "p1-1"));
+        assert!(!t.dirs[2].join("p1-1.phdb").exists());
+        assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+        let fenced = std::fs::read_to_string(t.dirs[2].join(super::super::fence::FENCED_FILE))
+            .unwrap_or_default();
+        assert!(!fenced.contains("p1-1"), "{fenced}");
     });
 }
