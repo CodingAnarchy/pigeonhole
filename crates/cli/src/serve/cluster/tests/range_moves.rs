@@ -2121,7 +2121,7 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
     let t = three();
     let (a, c) = (t.ports[0], t.ports[2]);
     let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
-    t.rt.block_on(async {
+    let new = t.rt.block_on(async {
         with_families(&t).await;
         for i in 0..50 {
             try_put(c, &format!("d{i:02}"), "0").await.unwrap();
@@ -2204,6 +2204,13 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
             Some(b"d"),
             "p1"
         ));
+        // The next map, on which c's reconcile clears a finished split's mark (cli692's
+        // test gap), if the removal's didn't.
+        let mut next = m.clone();
+        next.map_version += 1;
+        push(&t.ports, &next).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        new
     });
     let src = t.db_a.table("users").unwrap().open().unwrap();
     assert!(
@@ -2211,6 +2218,23 @@ fn split_moves_a_range_into_a_new_partition_under_writes_end_to_end() {
         "p1 dropped its copy"
     );
     assert!(src.get(b"a", "f", b"q").unwrap().is_some());
+    // Once c stops (its writer lock gone), the file shows the mark cleared: the partition is
+    // like any other (cli692's test gap on #2130).
+    let file = t.dirs[2].join(format!("{new}.phdb"));
+    drop(src);
+    drop(t);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mark = loop {
+        match pigeonhole::Pigeonhole::open(&file, pigeonhole::Options::default().read_only(true)) {
+            Ok(db) => break super::super::identity::split_mark(&db).unwrap(),
+            Err(e) if std::time::Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(mark, None, "the finished split's mark");
 }
 
 /// D331 PR 5 (cli692's Must 5): a split aborted before its commit point takes its new
@@ -2454,6 +2478,47 @@ fn a_split_created_file_whose_map_never_landed_is_moved_aside_past_its_version()
         })
         .await;
         assert_eq!(dropped_files(&t.dirs[2], "p1-1").len(), 1);
+    });
+}
+
+/// cli692's test gap on #2130: the reconcile never moves aside a marked, unmapped file that
+/// holds a row: it isn't a split's empty file. (One whose mark's move is still in the map
+/// can't be unmapped: a move naming a partition the map doesn't list is refused.)
+#[test]
+fn the_reconcile_leaves_a_marked_file_that_holds_a_row() {
+    let t = three();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        create(c, "p1-1", "split-9", 2).await.unwrap();
+        // A row in p1-1, written into its closed file directly.
+        {
+            let db = pigeonhole::Pigeonhole::open(
+                t.dirs[2].join("p1-1.phdb"),
+                pigeonhole::Options::default().shards(1),
+            )
+            .unwrap();
+            db.table("users")
+                .and_then(|b| {
+                    b.family("f", pigeonhole::Family::default())
+                        .create_if_missing()
+                })
+                .unwrap()
+                .mutate(b"d01")
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+            db.close().unwrap();
+        }
+        let passes = super::super::open::missing_passes(&t.dirs[2]);
+        let mut v5 = t.v1.clone();
+        v5.map_version = 5;
+        push(&t.ports, &v5).await;
+        eventually("c's pass on v5", async || {
+            super::super::open::missing_passes(&t.dirs[2]) > passes
+        })
+        .await;
+        assert!(t.dirs[2].join("p1-1.phdb").exists(), "a file with a row");
+        assert!(dropped_files(&t.dirs[2], "p1-1").is_empty());
     });
 }
 

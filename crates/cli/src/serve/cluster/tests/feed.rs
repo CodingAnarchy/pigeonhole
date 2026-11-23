@@ -2943,6 +2943,58 @@ fn a_subscription_from_the_oldest_starts_past_a_pruned_partial_move() {
     });
 }
 
+/// Move `id`'s status on partition `p` at node `port`, if it lists it.
+async fn move_on(port: u16, p: &str, id: &str) -> Option<crate::serve::proto::MoveStatus> {
+    client(port)
+        .await
+        .status(crate::serve::proto::StatusRequest::default())
+        .await
+        .ok()?
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == p)?
+        .moves
+        .into_iter()
+        .find(|m| m.id == id)
+}
+
+/// cli692's test gap on #2130: a source restarted at CLEANING after its drop. Its drop row
+/// runs again at the open, a no-op on a range (here a whole table) already gone, and it
+/// reports the drop done again; it serves none of the moved table.
+#[test]
+fn a_source_restarted_at_cleaning_after_its_drop_reports_it_done_again() {
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let a = ports[0];
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let last = put_order(ports[2], "k1").await;
+            move_orders(&ports, "", last).await;
+            eventually("p1 drops the moved table", async || {
+                move_on(a, "p1", "mvo").await.is_some_and(|m| m.dropped)
+            })
+            .await;
+        });
+        t.stop(0);
+        t.restart(0);
+        t.rt.block_on(async {
+            eventually("p1 reports the drop done after its restart", async || {
+                move_on(a, "p1", "mvo").await.is_some_and(|m| m.dropped)
+            })
+            .await;
+        });
+        let db = t.dbs[0].clone().unwrap();
+        let gone = db
+            .table("orders")
+            .and_then(|b| b.open())
+            .map(|o| o.get(b"k1", "f", b"q").unwrap().is_none())
+            .unwrap_or(true);
+        assert!(gone, "p1 serves the moved table's row again");
+    });
+}
+
 /// D331 PR 3b (cli692's M1): between a move's HANDED_OVER and CLEANING the target serves none
 /// of the range yet and has no hand-over position: a subscription isn't rerouted then, and a
 /// resume that would gain the target is refused retry-safe (`PartitionUnavailable`), not
