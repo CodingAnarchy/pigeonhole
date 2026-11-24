@@ -1,6 +1,6 @@
 # Data modeling
 
-> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes 1.3; the [status page](../status.md) names the current release. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole is a sorted map. Good models make the reads you do most **one point get or one contiguous scan**. Everything below follows from three facts:
 

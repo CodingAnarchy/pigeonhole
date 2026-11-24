@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release.
+> **Status:** this guide describes 1.3; the [status page](../status.md) names the current release.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
