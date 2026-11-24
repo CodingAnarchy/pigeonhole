@@ -1,6 +1,6 @@
 # Serving a database: `phdb serve`
 
-> **Status:** this page describes 1.2. `phdb serve` is new in 1.2.0 (D313, #1397), behind the `serve` feature. [ICR 0112](../design/icr/0112-network-api.md) is the full contract.
+> **Status:** this page describes 1.3. `phdb serve` is new in 1.2.0 (D313, #1397), behind the `serve` feature. [ICR 0112](../design/icr/0112-network-api.md) is the full contract.
 
 `phdb serve` owns one database file and serves it to other processes and hosts:
 - gRPC and HTTP/JSON on one port;
@@ -582,7 +582,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Its limits,** detailed in the sections below:
   - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Vectors.BulkLoad`, `Text.Search`, `Text.Rebuild` and both kinds' `Verify` across an index's partitions ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys change only through a range move once its ranges hold data ([Moving and splitting ranges](#moving-and-splitting-ranges));
-  - at feed saturation (256 subscribers at 55,000 puts/s), a cluster's writers no longer wait much longer than a single node's. The [Performance](#performance) table's 0.55–1.46 s of put p99 came before shared merges (#1798), batched hand-off (#2012, #2020) and its yield to puts (#2031); the latest AX102 run measured a one-node cluster's at 13–55 ms (g150). Its 55,000 × 256 rows are re-measured at the release candidate;
+  - at feed saturation (256 subscribers at 55,000 puts/s), a cluster's writers no longer wait much longer than a single node's. The [Performance](#performance) table's 256-subscriber rows at 55,000 puts/s, measured at the 1.3.0 release candidate, have a one-node cluster's put p99 at 16–64 ms against a single file's 32–42 ms. Before shared merges (#1798), batched hand-off (#2012, #2020) and its yield to puts (#2031), it was 0.55–1.46 s;
   - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve reads that allow staleness, across partitions too. A replica is made the owner by hand (`phdb cluster promote`), or by the cluster itself once you turn failover on ([Automatic failover](#automatic-failover)). A cluster node refuses `--replica-of` and `Admin.Promote`.
 
 ### How a cluster is laid out
@@ -1416,7 +1416,8 @@ These numbers are for `phdb serve` on one machine, serving a single database fil
 - **Subscribers:**
   - `Feed.Subscribe` streams use the durable feed, 64 streams per connection.
   - "256 subscribers" means 16 subscriptions to different table sets with 16 streams each. "32 subscribers" means 16 subscriptions with 2 streams each.
-- **Duration:** each row is a 30 s put loop, except the 256-subscriber row at 55,000 puts/s, which is 90 s.
+- **Duration:** each row is a 30 s put loop, except the 256-subscriber rows at 55,000 puts/s, which are 90 s.
+- **Versions:** the two 256-subscriber rows at 55,000 puts/s are the 1.3.0 release candidate's: three runs each, alternating between the cluster and the single file, in one session. Every other row was measured on 1.2, in an earlier session.
 
 **Mutate latency and feed delivery**
 
@@ -1434,8 +1435,8 @@ These numbers are for `phdb serve` on one machine, serving a single database fil
 | 55,000 | 1 | one-node cluster | 0.17 ms | 0.30–0.31 ms | 5.6–5.8 ms | all | 0.2 ms | 0.3 ms |
 | 55,000 | 32 | single file | 0.17–0.18 ms | 0.71–1.1 ms | 11–14 ms | 56–58% within the run | 4–6 s | 11–17 s |
 | 55,000 | 32 | one-node cluster | 0.18 ms | 0.67–1.1 ms | 9.4–13 ms | 51–52% within the run | 6–7 s | 18 s |
-| 55,000 | 256 | single file | 0.21–0.86 ms | 45–90 ms | 59–118 ms | 41–52% within the run | 13–18 s | 52–73 s |
-| 55,000 | 256 | one-node cluster | 0.31–2.2 ms | 550–1,460 ms | 610–1,500 ms | 53–54% within the run | 8–11 s | 47–49 s |
+| 55,000 | 256 | single file | 0.20 ms | 32–42 ms | 53–100 ms | 50–51% within the run | 17 s | 52 s |
+| 55,000 | 256 | one-node cluster | 0.20–0.21 ms | 16–64 ms | 44–122 ms | 52–55% within the run | 10–17 s | 49–52 s |
 
 **Reading the table**
 
@@ -1445,7 +1446,7 @@ These numbers are for `phdb serve` on one machine, serving a single database fil
   - Delivery trails the writes by seconds, so each subscriber received only about half of the run's commits before it ended.
   - Subscribers that fall behind catch up from the log rather than being dropped.
 - **A one-node cluster matches a single file** up to 32 subscribers at 55,000 puts/s.
-- **With 256 subscribers at 55,000 puts/s, the cluster's writers waited much longer in these runs:** p99 of 0.55–1.46 s, against 45–90 ms for a single file. That gap is fixed in 1.3.0 (#1798, #2012, #2020, #2031): the latest AX102 run measured a one-node cluster's put p99 at 13–55 ms (g150). *(Draft: the two 55,000 × 256 rows are replaced by the 1.3.0 release candidate's run, measured in one session.)*
+- **With 256 subscribers at 55,000 puts/s, the cluster's writers wait about as long as a single file's:** put p99 of 16–64 ms against 32–42 ms, and p99.9 of 44–122 ms against 53–100 ms, over three runs each. The cluster's runs spread wider. Before 1.3.0 the cluster's put p99 at this load was 0.55–1.46 s; shared merges (#1798), batched hand-off (#2012, #2020) and its yield to puts (#2031) closed that gap.
 - **Feed lag** is measured from a put's send time to its arrival at a subscriber, so it includes the put's own latency.
 
 ## Next

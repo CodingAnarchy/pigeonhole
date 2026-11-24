@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status:** describes 1.2; the [status page](../status.md) names the current release. Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
+> **Status:** describes 1.3; the [status page](../status.md) names the current release. Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 
