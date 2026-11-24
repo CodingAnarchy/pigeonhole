@@ -1,6 +1,0 @@
-### Added
-- `phdb serve --cluster`: `/mcp` is served by every node that holds a partition, and its tools reach every partition as the RPCs do: scans and nearest searches fan out, a write across partitions is refused with `CrossPartition`, and a `feed_poll` token resumes through any node. The memory tools are listed on a node started with `--memory` (#1915).
-- `phdb serve`: `Memory.Remember` takes `supersedes`, the memory the new one corrects: near dedup is skipped and the old memory superseded, with `supersede_error` set if that last step failed (the new memory is stored either way). `Recall` answers `truncated` and each kept hit's `superseded_by`, and `MarkUsed` and `Forget` the ids the store doesn't hold (`missing`). On a cluster mid-upgrade, `/mcp`'s memory tools and a `Remember` with `supersedes` are refused with `FailedPrecondition` while a node they reach runs an older build; a plain RPC's new fields from such a node are empty (#1915).
-
-### Changed
-- `phdb serve`: `/mcp`'s memory tools run as `Memory` calls through the router, each taking its memory place as the RPC does. A `memory_forget` that fails part-way answers the error, as `Memory.Forget` does, rather than a partial list (#1915).

@@ -1,3 +1,0 @@
-### Fixed
-- **A partition failover left pending no longer blocks the partition for good** (#2070, unreleased). If the writer died after stamping the promoted copy, and the old owner then came back and served the partition, the promote stayed pending forever, and every range move of the partition was refused. The writer now abandons it once the old owner serves again, and `phdb cluster status` names the copy that promote stamped, to drop.
-- **No move gives a partition an epoch a promote stamped a copy at** (#2070, unreleased). A relocation, a move and a range move's hand-over now go above it, so an abandoned promote's copy is never taken for the partition's new history.

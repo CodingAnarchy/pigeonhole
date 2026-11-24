@@ -1,6 +1,6 @@
 # Status
 
-> **Maturity: 1.x.** [1.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.3) is on [crates.io](https://crates.io/crates/pigeonhole) (after [1.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.2), [1.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.1), [1.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.0), [1.1.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.3), [1.1.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.2), [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1), [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0), [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) and [1.0.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0); [0.3.4](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.4) and [0.2.6](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.6) were the last 0.x releases). The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver ([D282](design/decisions/phase-3.md#d282)), behind a snapshot check (#1050), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). All four phases are complete; the gaps 1.0 ships with are listed under each phase's gate results below. Keep this note in sync with each release.
+> **Maturity: 1.x.** [1.3.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.3.0) is on [crates.io](https://crates.io/crates/pigeonhole) (after [1.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.3), [1.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.2), [1.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.1), [1.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.0), [1.1.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.3), [1.1.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.2), [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1), [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0), [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) and [1.0.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0); [0.3.4](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.4) and [0.2.6](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.6) were the last 0.x releases). The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver ([D282](design/decisions/phase-3.md#d282)), behind a snapshot check (#1050), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). All four phases are complete; the gaps 1.0 ships with are listed under each phase's gate results below. Keep this note in sync with each release.
 
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
 
@@ -15,7 +15,7 @@ The decision log is a [phase file plus an index](design/decisions/README.md) (`d
 | 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | done. Every crate merged, tablets on by default ([#168](https://github.com/CodingAnarchy/pigeonhole/pull/168)), the pre-gate edge-case review ([#90](https://github.com/CodingAnarchy/pigeonhole/issues/90)) and all its Phase 1 fixes landed. **Phase 1 gate passed on 2026-10-08** at `3abef59`: the milestone was empty and the 1–300 fault-injection sweeps (engine model/crash with tablets on, the fast balancer and in-flight I/O, engine tablets, public model) and full CI were green. Published as [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0) (15 crates). |
 
 ## Capabilities
-What the public API does, and the first release with each piece. The [README's list](../README.md#what-you-can-do) links each one to its guide page. "1.0.0" includes everything that 0.x already had. **On `main`, 1.3.0** means merged but not yet released.
+What the public API does, and the first release with each piece. The [README's list](../README.md#what-you-can-do) links each one to its guide page. "1.0.0" includes everything that 0.x already had. An entry marked **on `main`** is merged but not yet released.
 
 | Capability | Calls | State |
 |---|---|---|
@@ -35,18 +35,18 @@ What the public API does, and the first release with each piece. The [README's l
 | | async walks within a row and async key-set cells | released, 1.2.0 |
 | Vectors | `Family::vector`, `nearest_f32`; `pigeonhole-vector`'s IVF `Index` | released, 1.1.0 |
 | Full-text search | `pigeonhole-text`'s `Index` (`put_in`, `search`) | released, 1.1.0 |
-| | `Index::rebuild_with` and `resume_rebuild_with`: a rebuild that stops and resumes (#1756) | on `main`, 1.3.0 |
-| | faster phrase and common-word searches, results unchanged (#1586, #1585) | on `main`, 1.3.0 |
-| | packed indexes: `Index::pack`, `pack_with`, `PackOptions`; `Index::list` (#1585, ICR 0143) | on `main`, 1.3.0 |
-| | a collection split across indexes: `Search::query_stats`, `QueryStats::merge`, `Search::stats` (#1722, ICR 0138) | on `main`, 1.3.0 |
+| | `Index::rebuild_with` and `resume_rebuild_with`: a rebuild that stops and resumes (#1756) | released, 1.3.0 |
+| | faster phrase and common-word searches, results unchanged (#1586, #1585) | released, 1.3.0 |
+| | packed indexes: `Index::pack`, `pack_with`, `PackOptions`; `Index::list` (#1585, ICR 0143) | released, 1.3.0 |
+| | a collection split across indexes: `Search::query_stats`, `QueryStats::merge`, `Search::stats` (#1722, ICR 0138) | released, 1.3.0 |
 | Agent memory | `pigeonhole-memory`'s `Store` (`remember`, `recall`, `consolidate`) | released, 1.1.0 |
 | | local embeddings, `pigeonhole-embed` (its own 0.N line) | released, 1.2.0 |
 | Change feeds | `Options::change_feed`, `Table::feed()`, `Feed::next`, `FeedToken` | released, 1.1.0 |
 | | a feed of every table, `Pigeonhole::feed()` | released, 1.2.0 |
 | Durability | `Durability::{None, Buffered, GroupSync, Sync}`, `commit_with`, `Options::durability` | released, 1.0.0 |
-| | SST output starts its writeback as it is written, so `GroupSync` put latency holds through a long session (D334, #1991) | on `main`, 1.3.0 |
-| | blob files' output too (#2023) | on `main`, 1.3.0 |
-| Disk space | the data file's free space is given back to the filesystem by a background punch pass, on by default: `Options::punch_freed` (D333, ICR 0144, #2013) | on `main`, 1.3.0 |
+| | SST output starts its writeback as it is written, so `GroupSync` put latency holds through a long session (D334, #1991) | released, 1.3.0 |
+| | blob files' output too (#2023) | released, 1.3.0 |
+| Disk space | the data file's free space is given back to the filesystem by a background punch pass, on by default: `Options::punch_freed` (D333, ICR 0144, #2013) | released, 1.3.0 |
 | Snapshots, backups, reader processes | `snapshot`, `durable_snapshot`, `backup`, `open_reader` | released, 1.0.0 |
 | | `Options::read_only` (an open that writes nothing to the files) | released, 1.1.0 |
 | | `backup_at`; read-only opens of read-only files (#1348) | released, 1.2.0 |
@@ -57,35 +57,35 @@ What the public API does, and the first release with each piece. The [README's l
 | | `phdb mcp` | released, 1.1.0 |
 | `phdb serve` | gRPC, HTTP/JSON and `/mcp` on one port; tokens, TLS, sessions, the change feed, agent memory, backups, `/metrics` | released, 1.2.0 |
 | | read replicas: `--replica-of`, `phdb promote` | released, 1.2.0 |
-| | `--text-pack`: the text indexes packed in the background, off by default (#1585) | on `main`, 1.3.0 |
-| | feed subscribers' events handed over in batches (#1737) | on `main`, 1.3.0 |
-| | `Text.Rebuild` stops at a shutdown or a fence and resumes on its own (#1756) | on `main`, 1.3.0 |
+| | `--text-pack`: the text indexes packed in the background, off by default (#1585) | released, 1.3.0 |
+| | feed subscribers' events handed over in batches (#1737) | released, 1.3.0 |
+| | `Text.Rebuild` stops at a shutdown or a fence and resumes on its own (#1756) | released, 1.3.0 |
 | Metrics | `pigeonhole-otel` (its own 0.N line) | released, 1.2.0 |
 | Clusters | `phdb serve --cluster`, `phdb cluster` | released, 1.2.0 |
-| | read replicas of a partition: copies in the map's `replicas` (D328, #1851) | on `main`, 1.3.0 |
-| | reads from a replica within a staleness bound: `Get`, `ReadRow`, `MultiGet`, `Scan`, `Vectors.Nearest`, `Graph.Traverse` (`x-pigeonhole-read-replica-max-lag-ms`) | on `main`, 1.3.0 |
-| | promoting a replica to owner by hand: `phdb cluster promote` (#2007) | on `main`, 1.3.0 |
-| | a partition serves only under a majority's lease: `--cluster-lease-ms` (D326) | on `main`, 1.3.0 |
-| | agent memory on a cluster node: `--memory`, a `memory` placement; `Recall`, `Watch`, `MarkUsed`, `Forget` across partitions (#1915, ICR 0139) | on `main`, 1.3.0 |
-| | `/mcp` on a cluster node (#1915) | on `main`, 1.3.0 |
-| | `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852) | on `main`, 1.3.0 |
-| | `phdb cluster restore --partition`: one partition back from a cluster backup (#1832) | on `main`, 1.3.0 |
-| | vector and text indexes on a cluster: `Vectors.CreateIndex`, `Text.CreateIndex`, writes routed by id (#1994, ICR 0138) | on `main`, 1.3.0 |
-| | `Vectors.Search`, `Vectors.Verify` and `Text.Verify` across an index's partitions (#2016) | on `main`, 1.3.0 |
-| | `Text.Search` across an index's partitions, scored as one index (#2029) | on `main`, 1.3.0 |
-| | `Text.Rebuild` across an index's partitions, its counts summed (#2041) | on `main`, 1.3.0 |
-| | `Vectors.BulkLoad` across an index's partitions, split by id (#2045) | on `main`, 1.3.0 |
-| | feed subscriptions' events handed over in batches on a cluster too (#2014) | on `main`, 1.3.0 |
-| | transactions across partitions (D329, #1483): the engine's part, transactions prepared and aborted for an external coordinator (#2000, ICR 0140) | on `main`, 1.3.0 |
-| | the cluster side: `BeginRequest.spans_partitions`, two-phase commit across partitions (#2062); the resolver for shares in doubt, `Transactions.Outcome`, `phdb cluster txn decide` and the transaction's id on the feed (#2076) | on `main`, 1.3.0 |
-| | automatic failover, off by default (D330, #1484): the map's writer under a lease with terms, and elections (#2056); partition failover to the freshest replica (#2069) | on `main`, 1.3.0 |
-| | online split and range move (D331, #1499): range moves in the map and their gates (#2075), replica copies and restore across a move (#2080), the change feed across a move (#2084) | on `main`, 1.3.0 |
-| | the range's copy and catch-up on the target (#2089, #2107) | on `main`, 1.3.0 |
-| | the move's driver, `phdb cluster move-range` (with `--resume` and `--abort`) and `phdb cluster split` (#2130) | on `main`, 1.3.0 |
-| | `phdb cluster merge S --into T`, and the removal of the emptied partition (#2131, #2133) | on `main`, 1.3.0 |
-| | a balancer (D332, #1485): what it measures, per-partition CPU and device load (#2063, ICR 0142); `phdb cluster move` recorded in the map, with `--abort` (#2092) | on `main`, 1.3.0 |
-| | the balancer itself, off by default: the map's writer moves whole partitions between nodes (#2103) | on `main`, 1.3.0 |
-| | the balancer's splits and merges, through the online split and merge (#2137) | on `main`, 1.3.0 |
+| | read replicas of a partition: copies in the map's `replicas` (D328, #1851) | released, 1.3.0 |
+| | reads from a replica within a staleness bound: `Get`, `ReadRow`, `MultiGet`, `Scan`, `Vectors.Nearest`, `Graph.Traverse` (`x-pigeonhole-read-replica-max-lag-ms`) | released, 1.3.0 |
+| | promoting a replica to owner by hand: `phdb cluster promote` (#2007) | released, 1.3.0 |
+| | a partition serves only under a majority's lease: `--cluster-lease-ms` (D326) | released, 1.3.0 |
+| | agent memory on a cluster node: `--memory`, a `memory` placement; `Recall`, `Watch`, `MarkUsed`, `Forget` across partitions (#1915, ICR 0139) | released, 1.3.0 |
+| | `/mcp` on a cluster node (#1915) | released, 1.3.0 |
+| | `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852) | released, 1.3.0 |
+| | `phdb cluster restore --partition`: one partition back from a cluster backup (#1832) | released, 1.3.0 |
+| | vector and text indexes on a cluster: `Vectors.CreateIndex`, `Text.CreateIndex`, writes routed by id (#1994, ICR 0138) | released, 1.3.0 |
+| | `Vectors.Search`, `Vectors.Verify` and `Text.Verify` across an index's partitions (#2016) | released, 1.3.0 |
+| | `Text.Search` across an index's partitions, scored as one index (#2029) | released, 1.3.0 |
+| | `Text.Rebuild` across an index's partitions, its counts summed (#2041) | released, 1.3.0 |
+| | `Vectors.BulkLoad` across an index's partitions, split by id (#2045) | released, 1.3.0 |
+| | feed subscriptions' events handed over in batches on a cluster too (#2014) | released, 1.3.0 |
+| | transactions across partitions (D329, #1483): the engine's part, transactions prepared and aborted for an external coordinator (#2000, ICR 0140) | released, 1.3.0 |
+| | the cluster side: `BeginRequest.spans_partitions`, two-phase commit across partitions (#2062); the resolver for shares in doubt, `Transactions.Outcome`, `phdb cluster txn decide` and the transaction's id on the feed (#2076) | released, 1.3.0 |
+| | automatic failover, off by default (D330, #1484): the map's writer under a lease with terms, and elections (#2056); partition failover to the freshest replica (#2069) | released, 1.3.0 |
+| | online split and range move (D331, #1499): range moves in the map and their gates (#2075), replica copies and restore across a move (#2080), the change feed across a move (#2084) | released, 1.3.0 |
+| | the range's copy and catch-up on the target (#2089, #2107) | released, 1.3.0 |
+| | the move's driver, `phdb cluster move-range` (with `--resume` and `--abort`) and `phdb cluster split` (#2130) | released, 1.3.0 |
+| | `phdb cluster merge S --into T`, and the removal of the emptied partition (#2131, #2133) | released, 1.3.0 |
+| | a balancer (D332, #1485): what it measures, per-partition CPU and device load (#2063, ICR 0142); `phdb cluster move` recorded in the map, with `--abort` (#2092) | released, 1.3.0 |
+| | the balancer itself, off by default: the map's writer moves whole partitions between nodes (#2103) | released, 1.3.0 |
+| | the balancer's splits and merges, through the online split and merge (#2137) | released, 1.3.0 |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
@@ -199,8 +199,22 @@ Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/
   - **Still owed:** §7's box measurement of the hub case (common neighbours of two 2M-element sets, ≤ 2 ms), #1319.
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
 
+## 1.3.0
+Everything below shipped in [1.3.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.3.0) (2026-11-24), on `main` since 1.2.0. The per-change list, with the upgrade and rollback notes, is the [changelog](../CHANGELOG.md). The internal crates' line is at 3.1.0 ([D295](design/decisions/phase-3.md#d295)), the public crates at 1.3.0, and `pigeonhole-otel` and `pigeonhole-embed` at 0.1.1. Files stay in format 4; a database that used a transaction across partitions or a range move sets `incompat` bit 2 or 3, which 1.2 refuses.
+- **Clusters** ([Clusters](guide/serve.md#clusters)):
+  - **Leases:** a partition serves only under a lease from a majority of the map's nodes ([D326](design/decisions/phase-3.md#d326), #1760), through a rolling upgrade from 1.2 (#2047).
+  - **Failover**, off by default: the map's writer under a lease with terms, and a down partition's freshest replica promoted on its own ([D330](design/decisions/phase-3.md#d330), #1484).
+  - **Read replicas of a partition**, reads within a staleness bound, and `phdb cluster promote` ([D328](design/decisions/phase-3.md#d328), #1851, #2007).
+  - **Transactions across partitions** ([D329](design/decisions/phase-3.md#d329), #1483, ICR 0140), with in-doubt shares resolved on their own and `Transactions.Outcome`.
+  - **Agent memory, vector and text indexes on a cluster** (#1915, #1722, ICR 0138, ICR 0139): placed in the map, written by routing, and searched, recalled, verified, bulk-loaded and rebuilt across partitions.
+  - **Online range moves, splits and merges** ([D331](design/decisions/phase-3.md#d331), #1499, ICR 0141): `phdb cluster move-range`, `split` and `merge`, each recorded in the map.
+  - **Operations:** the balancer, off by default, with whole-partition moves, splits and merges ([D332](design/decisions/phase-3.md#d332), #1485, ICR 0142); `phdb cluster move` recorded in the map; `phdb cluster restore --partition` (#1832); `Admin.Info`, `Flush` and `Compact` on a node (#1852); `/mcp` on every node.
+- **Full-text search:** packed indexes, `Index::pack` and `phdb serve --text-pack` (#1585, ICR 0143); faster phrase and common-word searches (#1586); a collection split across indexes (#1722); rebuilds that stop and resume (#1756).
+- **Change feeds:** readers read only new bytes, hubs batch their wakes and hand events over in batches (#1737, #2014), and a far-behind drain is linear.
+- **Disk and latency:** the data file's free space punched back to the filesystem ([D333](design/decisions/phase-3.md#d333), ICR 0144, #2013), and SST and blob output that starts its writeback as it's written ([D334](design/decisions/phase-3.md#d334), #1991, #2023).
+
 ## 1.2.0
-Everything below shipped in [1.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.0) (2026-11-13), on `main` since 1.1.0. The per-change list is the [changelog](../CHANGELOG.md). The internal crates' line moved to 3.0.0 ([D295](design/decisions/phase-3.md#d295)); the public crates are at 1.2.0, and `pigeonhole-otel` and `pigeonhole-embed` start their own lines at 0.1.0.
+Everything below shipped in [1.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.0) (2026-11-13), on `main` since 1.1.0. The per-change list is the [changelog](../CHANGELOG.md). The internal crates' line moved to 3.0.0 ([D295](design/decisions/phase-3.md#d295)); the public crates are at 1.2.0, and `pigeonhole-otel` and `pigeonhole-embed` start their own lines at 0.1.0. From `release/1.2.x`: [1.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.1) (2026-11-14) fixed a feed of every table and `--replica-of` after a rollback to 1.1.x, and reads 1.3's version 3 feed tokens (#1853, #1874); [1.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.2) (2026-11-15) two change feed fixes (#1926, #1937); and [1.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.3) (2026-11-15) `phdb cluster close` retrying a failed hash (#1956).
 - **`phdb serve`** ([D313](design/decisions/phase-3.md#d313), #1397, [ICR 0112](design/icr/0112-network-api.md)), behind the `pigeonhole-cli` crate's `serve` feature; the guide is [Serving a database](guide/serve.md):
   - **The API:** gRPC and HTTP/JSON on one port, and remote MCP at `/mcp`. It covers data, schema and admin, sessions with transactions and pinned snapshots, graphs and nearest search, the IVF vector index with bulk loads, full-text search, and agent memory with `--memory` (and `--embed-local`).
   - **Security:** TLS, and `read`, `write` and `admin` tokens, optionally limited to namespaces.

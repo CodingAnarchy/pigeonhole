@@ -1,0 +1,4 @@
+text documents 5
+text terms 26
+text postings 33
+text consistent true

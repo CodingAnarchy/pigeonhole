@@ -1,2 +1,0 @@
-### Added
-- `phdb serve` clusters: a `Get` or `ReadRow` sent with `x-pigeonhole-read-replica-max-lag-ms: N` may be served by a replica of its partition that is fresh within N ms, falling back to the next replica and then the owner (D328, #1851). With `x-pigeonhole-min-primary-seqno` it reads your own writes. The reply's `x-pigeonhole-served-by` and `x-pigeonhole-served-seqno` say what served it and at which seqno; send the seqno back for reads that never go back in time. Writes, transactions, snapshots, subscriptions and reads across partitions stay the owners'.

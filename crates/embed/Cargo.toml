@@ -3,7 +3,7 @@ name = "pigeonhole-embed"
 description = "Local text embeddings for pigeonhole-memory: a pinned open model, run on the CPU in-process."
 # Its own 0.N line (owner, 2026-11-05: D318 Q1), as pigeonhole-otel has, until the API has
 # been used for a while.
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

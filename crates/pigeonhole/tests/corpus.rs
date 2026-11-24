@@ -39,7 +39,7 @@ fn corpus_dir() -> PathBuf {
 
 /// The release corpora: written by each release's build, then frozen. A directory holding
 /// only its README is a placeholder until that release writes it.
-const RELEASE_CORPORA: [&str; 3] = ["1.0.0", "1.1.0", "1.2.0"];
+const RELEASE_CORPORA: [&str; 4] = ["1.0.0", "1.1.0", "1.2.0", "1.3.0"];
 
 /// Entries only a build with a feature has, each with whether this build has it: `replica`
 /// and `range_move` need `__unstable-replication`, and `spanning_txn` needs
