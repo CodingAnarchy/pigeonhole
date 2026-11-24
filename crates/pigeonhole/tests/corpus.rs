@@ -42,10 +42,15 @@ fn corpus_dir() -> PathBuf {
 const RELEASE_CORPORA: [&str; 4] = ["1.0.0", "1.1.0", "1.2.0", "1.3.0"];
 
 /// Entries only a build with a feature has, each with whether this build has it: `replica`
-/// needs `__unstable-replication`, which `scripts/release-corpus.sh` writes the release corpus
+/// and `range_move` need `__unstable-replication`, and `spanning_txn` needs
+/// `__unstable-txn-prepare`, which `scripts/release-corpus.sh` writes the release corpus
 /// with. A build without the feature still checks such an entry's files against `frozen.txt`,
 /// but skips opening it; a build with it must open it (ai1249's N1 on #1790).
-const FEATURE_ENTRIES: [(&str, bool); 1] = [("replica", cfg!(feature = "__unstable-replication"))];
+const FEATURE_ENTRIES: [(&str, bool); 3] = [
+    ("replica", cfg!(feature = "__unstable-replication")),
+    ("range_move", cfg!(feature = "__unstable-replication")),
+    ("spanning_txn", cfg!(feature = "__unstable-txn-prepare")),
+];
 
 /// The frozen hash list's name inside a release corpus.
 const FROZEN: &str = "frozen.txt";
@@ -491,6 +496,19 @@ fn entries() -> Vec<Entry> {
             read_only_by: 0,
         },
         Entry {
+            name: "text_packed",
+            shards: 1,
+            options: same,
+            write: write_text_packed,
+            crash: false,
+            refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
+            extra: Some(text_packed_extra),
+            then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
+        },
+        Entry {
             name: "feed_root_intent",
             shards: 2,
             options: same,
@@ -520,7 +538,322 @@ fn entries() -> Vec<Entry> {
         feed_resumes_by_1_1: false,
         read_only_by: pigeonhole_format::manifest::RO_COMPAT_REPLICA,
     });
+    // Transactions prepared for an external coordinator and decided (D329, ICR 0140):
+    // `incompat` bit 2, which every release before 1.3 lacks.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    entries.push(Entry {
+        name: "spanning_txn",
+        shards: 2,
+        options: feed_options,
+        write: write_spanning_txn,
+        crash: true,
+        refused_by_1_0_0: pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE,
+        extra: Some(feed_extra),
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: 0,
+    });
+    // What a range move leaves on its partitions (D331, ICR 0141): `incompat` bit 3, which
+    // every release before 1.3 lacks.
+    #[cfg(feature = "__unstable-replication")]
+    entries.push(Entry {
+        name: "range_move",
+        shards: 2,
+        options: feed_options,
+        write: write_range_move,
+        crash: true,
+        refused_by_1_0_0: pigeonhole_format::wal::INCOMPAT_FEED_SILENT,
+        extra: Some(feed_extra),
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: 0,
+    });
     entries
+}
+
+/// The feed entries' tables: `events`, followed, and [`FEED_TOKEN`]'s table, with a table
+/// feed's token from before the first commit stored in it.
+#[cfg(any(feature = "__unstable-txn-prepare", feature = "__unstable-replication"))]
+fn events_with_token(db: &Pigeonhole) -> (pigeonhole::Table, pigeonhole::Table) {
+    let events = db
+        .table("events")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let tokens = db
+        .table(FEED_TOKEN.0)
+        .unwrap()
+        .family("t", Family::default())
+        .create()
+        .unwrap();
+    let token = events.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    (events, tokens)
+}
+
+/// D329 (ICR 0140, `incompat` bit 2), over 2 shards with the change feed on, left by a
+/// process crash so a reopen replays the records themselves: External Prepare (type 5),
+/// Decision (type 4) and External Abort (type 6), and an xid-tagged batch (`count` bit 30).
+/// - `xid-commit`: reads two rows and writes rows on both shards (`events` and `ledger`,
+///   whose tablets the generator checks are on different shards), prepared, then committed;
+/// - `xid-abort`: writes on both shards, prepared, then aborted, so none of it is applied;
+/// - `xid-read`: reads and no writes (a spanning transaction's read-only branch), prepared,
+///   then committed: it applies nothing;
+/// - `xid-home`: an ordinary commit tagged with its xid, as a spanning commit's home share.
+///
+/// So the committed and aborted transactions each have an External Prepare on both streams,
+/// and their Decision and External Abort name both, as a spanning transaction's shares on a
+/// multi-shard partition do (perf2's M1 on #2144; [`assert_two_stream_shares`] checks the
+/// files). None is left in doubt: a frozen file in doubt would bind every later build to keep
+/// it decidable. The check resumes a table feed from a token stored before the first commit:
+/// the committed shares' changes with their xids, and nothing of the aborted one.
+#[cfg(feature = "__unstable-txn-prepare")]
+fn write_spanning_txn(db: &Pigeonhole) {
+    // Created first: a new table's tablet goes to shard `tablet % shards`, so `ledger` and
+    // `events` (the next) are on different shards.
+    let ledger = db
+        .table("ledger")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let (events, tokens) = events_with_token(db);
+    assert_ne!(
+        events.shard_of(b"r00"),
+        ledger.shard_of(b"l00"),
+        "spanning_txn needs `events` and `ledger` on different shards"
+    );
+    for i in 0..8u64 {
+        events
+            .mutate(format!("r{i:02}").as_bytes())
+            .put_at("e", b"v", T0 + i, format!("base {i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let mut txn = db.transaction().unwrap();
+    assert!(txn.get(&events, b"r00", "e", b"v").unwrap().is_some());
+    assert!(txn.get(&events, b"r05", "e", b"v").unwrap().is_some());
+    for (i, row) in [&b"r00"[..], b"r03", b"r05", b"r07"]
+        .into_iter()
+        .enumerate()
+    {
+        txn.put_at(&events, row, "e", b"v", T0 + 100 + i as u64, b"committed");
+    }
+    txn.put_at(&ledger, b"l00", "e", b"v", T0 + 110, b"committed");
+    txn.put_at(&ledger, b"l01", "e", b"v", T0 + 111, b"committed");
+    txn.prepare(b"xid-commit", Durability::GroupSync).unwrap();
+    assert!(db.decide(b"xid-commit", true).unwrap().is_some());
+
+    let mut txn = db.transaction().unwrap();
+    for (i, row) in [&b"r01"[..], b"r06"].into_iter().enumerate() {
+        txn.put_at(&events, row, "e", b"v", T0 + 200 + i as u64, b"aborted");
+    }
+    txn.put_at(&ledger, b"l02", "e", b"v", T0 + 210, b"aborted");
+    txn.prepare(b"xid-abort", Durability::GroupSync).unwrap();
+    assert!(db.decide(b"xid-abort", false).unwrap().is_some());
+
+    let mut txn = db.transaction().unwrap();
+    assert!(txn.get(&events, b"r02", "e", b"v").unwrap().is_some());
+    txn.prepare(b"xid-read", Durability::GroupSync).unwrap();
+    assert!(db.decide(b"xid-read", true).unwrap().is_some());
+
+    let mut txn = db.transaction().unwrap();
+    txn.put_at(&events, b"r04", "e", b"v", T0 + 300, b"home");
+    txn.tag_xid(b"xid-home");
+    let last = txn.commit().unwrap().seqno;
+    assert!(db.in_doubt().is_empty());
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
+}
+
+/// `spanning_txn`'s files hold genuinely two-participant transactions (perf2's M1 on #2144):
+/// `xid-commit` and `xid-abort` each have an External Prepare on both WAL streams, naming
+/// both, and `xid-commit`'s Decision and `xid-abort`'s External Abort name both. Read from
+/// the WAL itself, so a placement change can't silently leave the entry single-stream.
+#[cfg(feature = "__unstable-txn-prepare")]
+fn assert_two_stream_shares(vfs: &Arc<SimVfs>, path: &str) {
+    use pigeonhole_format::wal::WalRecord;
+    let vfs_ref: pigeonhole_io::VfsRef = Arc::clone(vfs) as pigeonhole_io::VfsRef;
+    let path = Path::new(path);
+    let f = vfs.open(path, OpenOptions::read()).unwrap();
+    let mut page = vec![0u8; 4096];
+    f.read_at(&mut page, 0).unwrap();
+    let db_id = pigeonhole_format::superblock::Superblock::decode(&page)
+        .unwrap()
+        .db_id;
+    let both = vec![0u32, 1];
+    // Per xid: the streams holding its External Prepares, and the participants each names;
+    // the decision's (Decision or External Abort) participants.
+    let mut prepared: BTreeMap<Vec<u8>, Vec<(u32, Vec<u32>)>> = BTreeMap::new();
+    let mut decided: BTreeMap<Vec<u8>, (&str, Vec<u32>)> = BTreeMap::new();
+    let mut xid_of: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut decisions = Vec::new();
+    for stream in pigeonhole_wal::discover_streams(&vfs_ref, path).unwrap() {
+        let mut rec = pigeonhole_wal::Recovery::open_read_only(
+            &vfs_ref,
+            path,
+            stream,
+            db_id,
+            Default::default(),
+        )
+        .unwrap();
+        while let Some((_, record)) = rec.next_record().unwrap() {
+            match record {
+                WalRecord::ExternalPrepare { seqno, share, .. } => {
+                    let names = share.participants().iter().map(|s| s.0).collect();
+                    xid_of.insert(seqno, share.xid().to_vec());
+                    prepared
+                        .entry(share.xid().to_vec())
+                        .or_default()
+                        .push((stream.0, names));
+                }
+                WalRecord::ExternalAbort { share, .. } => {
+                    let names = share.participants().iter().map(|s| s.0).collect();
+                    decided.insert(share.xid().to_vec(), ("abort", names));
+                }
+                WalRecord::Decision {
+                    seqno,
+                    participants,
+                    ..
+                } => decisions.push((seqno, participants.iter().map(|s| s.0).collect())),
+                _ => {}
+            }
+        }
+    }
+    for (seqno, names) in decisions {
+        let xid = xid_of
+            .get(&seqno)
+            .expect("a Decision for an External Prepare");
+        decided.insert(xid.clone(), ("commit", names));
+    }
+    for (xid, how) in [(&b"xid-commit"[..], "commit"), (b"xid-abort", "abort")] {
+        let mut shares = prepared.remove(xid).unwrap_or_default();
+        shares.sort();
+        let want: Vec<(u32, Vec<u32>)> = both.iter().map(|&s| (s, both.clone())).collect();
+        assert_eq!(
+            shares,
+            want,
+            "{}: an External Prepare on each stream, naming both",
+            String::from_utf8_lossy(xid)
+        );
+        assert_eq!(
+            decided.get(xid),
+            Some(&(how, both.clone())),
+            "{}: its decision names both streams",
+            String::from_utf8_lossy(xid)
+        );
+    }
+}
+
+/// `spanning_txn` as the generator writes it holds two-participant transactions: CI checks
+/// the placement the frozen entry relies on, not only the generator.
+#[cfg(feature = "__unstable-txn-prepare")]
+#[test]
+fn spanning_txn_shares_are_on_both_streams() {
+    let (seed, e) = entries()
+        .into_iter()
+        .enumerate()
+        .find(|(_, e)| e.name == "spanning_txn")
+        .unwrap();
+    let path = format!("/db/{DB}");
+    let vfs = write_entry(&e, 9_000 + seed as u64, &path, Duration::ZERO);
+    assert_two_stream_shares(&vfs, &path);
+}
+
+/// D331 (ICR 0141, `incompat` bit 3), over 2 shards with the change feed on, left by a
+/// process crash so a reopen replays the records themselves: what a range move leaves on its
+/// partitions. Ordinary commits, flushed, and more unflushed; then feed-silent batches
+/// (`count` bit 31), as a move's copy writes on its target: two of values, and one through
+/// [`LoggedBatch`](pigeonhole::LoggedBatch), as the copy writes, carrying tombstones (a
+/// column delete with a newer value after it, and a cell delete; simp724 on #2144); the
+/// timestamp floor raised past them, as the target does before it serves; Range Drops
+/// (type 7) of flushed and unflushed rows, one bounded and one open-ended (a move to the
+/// table's end), as the source's cleanup; then more ordinary commits. The check resumes a
+/// table feed from a token stored before the first commit: the ordinary commits only, since
+/// silent ones are passed over.
+#[cfg(feature = "__unstable-replication")]
+fn write_range_move(db: &Pigeonhole) {
+    let (events, tokens) = events_with_token(db);
+    let put = |row: String, ts: u64, value: String| {
+        events
+            .mutate(row.as_bytes())
+            .put_at("e", b"v", ts, value.as_bytes())
+            .commit()
+            .unwrap()
+            .seqno
+    };
+    for i in 0..20u64 {
+        put(format!("r{i:02}"), T0 + i, format!("before {i}"));
+    }
+    for i in 0..3u64 {
+        put(format!("z{i:02}"), T0 + 30 + i, format!("tail {i}"));
+    }
+    db.flush().unwrap();
+    for i in 15..25u64 {
+        put(format!("r{i:02}"), T0 + 50 + i, format!("unflushed {i}"));
+    }
+    for i in 3..5u64 {
+        put(format!("z{i:02}"), T0 + 80 + i, format!("tail {i}"));
+    }
+    for chunk in 0..2u64 {
+        let mut batch = db.write_batch();
+        for i in 0..5u64 {
+            let n = chunk * 5 + i;
+            batch.put_at(
+                &events,
+                format!("m{n:02}").as_bytes(),
+                "e",
+                b"v",
+                T0 + 500 + n,
+                format!("copied {n}").as_bytes(),
+            );
+        }
+        batch.mark_feed_silent();
+        batch.commit().unwrap();
+    }
+    // The copy's tombstones, as it logs them (a stored value's tag byte first; empty for a
+    // delete): `m02`'s column deleted and a newer value after it, in one batch; `m04`'s
+    // copied version deleted.
+    use pigeonhole::ChangeKind::{DeleteCell, DeleteColumn, Put};
+    let mut batch = db.logged_batch();
+    batch.push(&events, b"m02", "e", DeleteColumn, b"v", T0 + 502, b"");
+    batch.push(&events, b"m02", "e", Put, b"v", T0 + 503, b"\x00recopied 2");
+    batch.push(&events, b"m04", "e", DeleteCell, b"v", T0 + 504, b"");
+    batch.mark_feed_silent();
+    batch.commit().unwrap();
+    db.raise_ts_floor(T0 + 1_000).unwrap();
+    let drop_rows = |start: &[u8], end: Option<&[u8]>| loop {
+        match db.drop_range(&events, start, end) {
+            Ok(()) => break,
+            Err(e) if e.code() == pigeonhole::ErrorCode::Busy => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("drop_range: {e}"),
+        }
+    };
+    drop_rows(b"r10", Some(b"r20"));
+    drop_rows(b"z", None);
+    let mut last = 0;
+    for i in 0..5u64 {
+        last = put(format!("after{i}"), T0 + 2_000 + i, "after the move".into());
+    }
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
 }
 
 /// A replica of a small primary (D315 PR 3): the primary's feed of every table applied with
@@ -1124,6 +1457,89 @@ fn write_text(db: &Pigeonhole) {
     txn.commit().unwrap();
 }
 
+/// A packed `pigeonhole-text` index (#1585, ICR 0143: layout version 2, which 1.2 refuses
+/// to open) with positions: 300 documents over a small vocabulary, so common terms fill
+/// blocks of postings; packed; then a rewrite, a delete and new documents, which are posting
+/// cells again beside the blocks. Its statistics family is an aggregate kind, so 1.0.0
+/// refuses the file (`incompat` bit 0).
+fn write_text_packed(db: &Pigeonhole) {
+    let docs = db
+        .table("docs")
+        .unwrap()
+        .family("d", Family::default())
+        .create()
+        .unwrap();
+    let index = pigeonhole_text::Index::create(
+        db,
+        "docs_text",
+        pigeonhole_text::Source::new(&docs, "d", b"body"),
+        pigeonhole_text::IndexOptions::new().positions(true),
+    )
+    .unwrap();
+    let words = [
+        "the", "brown", "fox", "lazy", "dog", "jumps", "over", "quick", "a",
+    ];
+    let put = |i: u64, text: &str| {
+        let doc = format!("doc{i:03}");
+        let mut txn = db.transaction().unwrap();
+        txn.put(&docs, doc.as_bytes(), "d", b"body", text.as_bytes());
+        index.put_in(&mut txn, doc.as_bytes(), text).unwrap();
+        txn.commit().unwrap();
+    };
+    for i in 0..300u64 {
+        let text: Vec<&str> = (0..8u64)
+            .map(|j| words[((i * 7 + j * 3) % 9) as usize])
+            .collect();
+        put(i, &format!("the quick brown fox {}", text.join(" ")));
+    }
+    db.flush().unwrap();
+    let stats = index.pack().unwrap();
+    assert!(!stats.stopped && stats.postings > 0, "{stats:?}");
+    put(
+        7,
+        "a lazy dog and a quick brown fox, rewritten after the pack",
+    );
+    let mut txn = db.transaction().unwrap();
+    assert!(index.delete_in(&mut txn, b"doc011").unwrap());
+    txn.delete_column(&docs, b"doc011", "d", b"body");
+    txn.commit().unwrap();
+    for i in 300..305u64 {
+        put(i, "written after the pack: the lazy dog");
+    }
+}
+
+/// The packed index's `verify`, and the ids a phrase search and a term search return (ids
+/// only: scores are floating point).
+fn text_packed_extra(db: &Pigeonhole) -> String {
+    let index = pigeonhole_text::Index::open(db, "docs_text").unwrap();
+    let mut out = text_extra(db);
+    // The packed layout itself (perf2's S1 on #2144): postings in blocks, and the post-pack
+    // delete's tombstones. Not in `text_extra`, whose listing the frozen `text` entries use.
+    let stats = index.verify().unwrap();
+    out.push_str(&format!(
+        "text packed {}\ntext tombstones {}\n",
+        stats.packed, stats.tombstones
+    ));
+    for (name, query) in [
+        (
+            "phrase",
+            pigeonhole_text::Query::new().phrase(["quick", "brown", "fox"]),
+        ),
+        ("term", pigeonhole_text::Query::new().term("lazy")),
+    ] {
+        let mut ids: Vec<String> = index
+            .search(query, 1_000)
+            .run()
+            .unwrap()
+            .iter()
+            .map(|h| String::from_utf8_lossy(&h.id).into_owned())
+            .collect();
+        ids.sort();
+        out.push_str(&format!("text {name} {} {}\n", ids.len(), ids.join(",")));
+    }
+    out
+}
+
 /// The text index's `verify`: its counts and whether every check agreed.
 fn text_extra(db: &Pigeonhole) -> String {
     let stats = pigeonhole_text::Index::open(db, "docs_text")
@@ -1386,6 +1802,11 @@ fn feed_extra(db: &Pigeonhole) -> String {
                     }
                 )
             ));
+        }
+        // A spanning commit's share carries its transaction's id (D329 2b).
+        #[cfg(feature = "__unstable-txn-prepare")]
+        if let Some(xid) = c.xid() {
+            out.push_str(&format!("{}\txid\t{}\n", c.seqno(), hex(xid)));
         }
         if c.seqno() >= last {
             break;
@@ -1819,6 +2240,10 @@ fn generate_corpus() {
     for (seed, e) in entries().into_iter().enumerate() {
         let path = format!("/db/{DB}");
         let vfs = write_entry(&e, 9_000 + seed as u64, &path, Duration::ZERO);
+        #[cfg(feature = "__unstable-txn-prepare")]
+        if e.name == "spanning_txn" {
+            assert_two_stream_shares(&vfs, &path);
+        }
         let files = sim_files(&vfs);
         // What the files hold, as this build reads them (a reopen replays a crashed entry).
         let db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();
