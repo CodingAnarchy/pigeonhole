@@ -4,7 +4,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
-## [1.3.0] - 2026-11-20
+## [1.3.0] - 2026-11-24
 
 Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Upgrading from 1.2.x" below before upgrading, especially if you run a cluster. It adds:
 - **Clusters that stay safe through a network split:** a partition serves (reads, writes and change feeds) only under a lease from a majority of the map's nodes (D326), and a node waits for a majority to hold a new map before serving a partition it moved or restarted with.
