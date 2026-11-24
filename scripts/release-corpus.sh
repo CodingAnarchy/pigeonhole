@@ -18,9 +18,10 @@ if [ ! -f "$dir/README.md" ]; then
   echo "error: $dir/README.md is missing: add the placeholder and its RELEASE_CORPORA entry first" >&2
   exit 1
 fi
-# With `__unstable-replication`, so the corpus has the `replica` entry: `phdb serve
-# --replica-of` writes replicas, and FORMAT.md §13 promises their files.
-features=(--features __unstable-replication)
+# With `__unstable-replication`, so the corpus has the `replica` and `range_move` entries,
+# and `__unstable-txn-prepare`, so it has `spanning_txn`: `phdb serve` writes replicas,
+# range moves and spanning transactions, and FORMAT.md §13 promises their files.
+features=(--features __unstable-replication,__unstable-txn-prepare)
 PIGEONHOLE_CORPUS_RELEASE=$version cargo test -p pigeonhole "${features[@]}" --test corpus -- \
   --ignored --exact generate_corpus --nocapture
 cargo test -p pigeonhole "${features[@]}" --test corpus -- --exact release_corpus_entries_open_read_check_and_write

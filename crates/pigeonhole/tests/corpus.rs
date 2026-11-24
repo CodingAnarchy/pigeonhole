@@ -42,10 +42,15 @@ fn corpus_dir() -> PathBuf {
 const RELEASE_CORPORA: [&str; 3] = ["1.0.0", "1.1.0", "1.2.0"];
 
 /// Entries only a build with a feature has, each with whether this build has it: `replica`
-/// needs `__unstable-replication`, which `scripts/release-corpus.sh` writes the release corpus
+/// and `range_move` need `__unstable-replication`, and `spanning_txn` needs
+/// `__unstable-txn-prepare`, which `scripts/release-corpus.sh` writes the release corpus
 /// with. A build without the feature still checks such an entry's files against `frozen.txt`,
 /// but skips opening it; a build with it must open it (ai1249's N1 on #1790).
-const FEATURE_ENTRIES: [(&str, bool); 1] = [("replica", cfg!(feature = "__unstable-replication"))];
+const FEATURE_ENTRIES: [(&str, bool); 3] = [
+    ("replica", cfg!(feature = "__unstable-replication")),
+    ("range_move", cfg!(feature = "__unstable-replication")),
+    ("spanning_txn", cfg!(feature = "__unstable-txn-prepare")),
+];
 
 /// The frozen hash list's name inside a release corpus.
 const FROZEN: &str = "frozen.txt";
@@ -491,6 +496,19 @@ fn entries() -> Vec<Entry> {
             read_only_by: 0,
         },
         Entry {
+            name: "text_packed",
+            shards: 1,
+            options: same,
+            write: write_text_packed,
+            crash: false,
+            refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
+            extra: Some(text_packed_extra),
+            then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
+        },
+        Entry {
             name: "feed_root_intent",
             shards: 2,
             options: same,
@@ -520,7 +538,192 @@ fn entries() -> Vec<Entry> {
         feed_resumes_by_1_1: false,
         read_only_by: pigeonhole_format::manifest::RO_COMPAT_REPLICA,
     });
+    // Transactions prepared for an external coordinator and decided (D329, ICR 0140):
+    // `incompat` bit 2, which every release before 1.3 lacks.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    entries.push(Entry {
+        name: "spanning_txn",
+        shards: 2,
+        options: feed_options,
+        write: write_spanning_txn,
+        crash: true,
+        refused_by_1_0_0: pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE,
+        extra: Some(feed_extra),
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: 0,
+    });
+    // What a range move leaves on its partitions (D331, ICR 0141): `incompat` bit 3, which
+    // every release before 1.3 lacks.
+    #[cfg(feature = "__unstable-replication")]
+    entries.push(Entry {
+        name: "range_move",
+        shards: 2,
+        options: feed_options,
+        write: write_range_move,
+        crash: true,
+        refused_by_1_0_0: pigeonhole_format::wal::INCOMPAT_FEED_SILENT,
+        extra: Some(feed_extra),
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: 0,
+    });
     entries
+}
+
+/// The feed entries' tables: `events`, followed, and [`FEED_TOKEN`]'s table, with a table
+/// feed's token from before the first commit stored in it.
+#[cfg(any(feature = "__unstable-txn-prepare", feature = "__unstable-replication"))]
+fn events_with_token(db: &Pigeonhole) -> (pigeonhole::Table, pigeonhole::Table) {
+    let events = db
+        .table("events")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let tokens = db
+        .table(FEED_TOKEN.0)
+        .unwrap()
+        .family("t", Family::default())
+        .create()
+        .unwrap();
+    let token = events.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    (events, tokens)
+}
+
+/// D329 (ICR 0140, `incompat` bit 2), over 2 shards with the change feed on, left by a
+/// process crash so a reopen replays the records themselves: External Prepare (type 5),
+/// Decision (type 4) and External Abort (type 6), and an xid-tagged batch (`count` bit 30).
+/// - `xid-commit`: reads two rows and writes rows on both shards, prepared, then committed;
+/// - `xid-abort`: writes, prepared, then aborted, so none of it is applied;
+/// - `xid-read`: reads and no writes (a spanning transaction's read-only branch), prepared,
+///   then committed: it applies nothing;
+/// - `xid-home`: an ordinary commit tagged with its xid, as a spanning commit's home share.
+///
+/// None is left in doubt: a frozen file in doubt would bind every later build to keep it
+/// decidable. The check resumes a table feed from a token stored before the first commit:
+/// the committed shares' changes with their xids, and nothing of the aborted one.
+#[cfg(feature = "__unstable-txn-prepare")]
+fn write_spanning_txn(db: &Pigeonhole) {
+    let (events, tokens) = events_with_token(db);
+    for i in 0..8u64 {
+        events
+            .mutate(format!("r{i:02}").as_bytes())
+            .put_at("e", b"v", T0 + i, format!("base {i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let mut txn = db.transaction().unwrap();
+    assert!(txn.get(&events, b"r00", "e", b"v").unwrap().is_some());
+    assert!(txn.get(&events, b"r05", "e", b"v").unwrap().is_some());
+    for (i, row) in [&b"r00"[..], b"r03", b"r05", b"r07"]
+        .into_iter()
+        .enumerate()
+    {
+        txn.put_at(&events, row, "e", b"v", T0 + 100 + i as u64, b"committed");
+    }
+    txn.prepare(b"xid-commit", Durability::GroupSync).unwrap();
+    assert!(db.decide(b"xid-commit", true).unwrap().is_some());
+
+    let mut txn = db.transaction().unwrap();
+    for (i, row) in [&b"r01"[..], b"r06"].into_iter().enumerate() {
+        txn.put_at(&events, row, "e", b"v", T0 + 200 + i as u64, b"aborted");
+    }
+    txn.prepare(b"xid-abort", Durability::GroupSync).unwrap();
+    assert!(db.decide(b"xid-abort", false).unwrap().is_some());
+
+    let mut txn = db.transaction().unwrap();
+    assert!(txn.get(&events, b"r02", "e", b"v").unwrap().is_some());
+    txn.prepare(b"xid-read", Durability::GroupSync).unwrap();
+    assert!(db.decide(b"xid-read", true).unwrap().is_some());
+
+    let mut txn = db.transaction().unwrap();
+    txn.put_at(&events, b"r04", "e", b"v", T0 + 300, b"home");
+    txn.tag_xid(b"xid-home");
+    let last = txn.commit().unwrap().seqno;
+    assert!(db.in_doubt().is_empty());
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
+}
+
+/// D331 (ICR 0141, `incompat` bit 3), over 2 shards with the change feed on, left by a
+/// process crash so a reopen replays the records themselves: what a range move leaves on its
+/// partitions. Ordinary commits, flushed, and more unflushed; then feed-silent batches
+/// (`count` bit 31), as a move's copy writes on its target; the timestamp floor raised past
+/// them, as the target does before it serves; a Range Drop (type 7) of flushed and unflushed
+/// rows, as the source's cleanup; then more ordinary commits. The check resumes a table feed
+/// from a token stored before the first commit: the ordinary commits only, since silent ones
+/// are passed over.
+#[cfg(feature = "__unstable-replication")]
+fn write_range_move(db: &Pigeonhole) {
+    let (events, tokens) = events_with_token(db);
+    for i in 0..20u64 {
+        events
+            .mutate(format!("r{i:02}").as_bytes())
+            .put_at("e", b"v", T0 + i, format!("before {i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    for i in 15..25u64 {
+        events
+            .mutate(format!("r{i:02}").as_bytes())
+            .put_at("e", b"v", T0 + 50 + i, format!("unflushed {i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    for chunk in 0..2u64 {
+        let mut batch = db.write_batch();
+        for i in 0..5u64 {
+            let n = chunk * 5 + i;
+            batch.put_at(
+                &events,
+                format!("m{n:02}").as_bytes(),
+                "e",
+                b"v",
+                T0 + 500 + n,
+                format!("copied {n}").as_bytes(),
+            );
+        }
+        batch.mark_feed_silent();
+        batch.commit().unwrap();
+    }
+    db.raise_ts_floor(T0 + 1_000).unwrap();
+    loop {
+        match db.drop_range(&events, b"r10", Some(b"r20")) {
+            Ok(()) => break,
+            Err(e) if e.code() == pigeonhole::ErrorCode::Busy => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("drop_range: {e}"),
+        }
+    }
+    let mut last = 0;
+    for i in 0..5u64 {
+        last = events
+            .mutate(format!("after{i}").as_bytes())
+            .put_at("e", b"v", T0 + 2_000 + i, b"after the move")
+            .commit()
+            .unwrap()
+            .seqno;
+    }
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
 }
 
 /// A replica of a small primary (D315 PR 3): the primary's feed of every table applied with
@@ -1124,6 +1327,82 @@ fn write_text(db: &Pigeonhole) {
     txn.commit().unwrap();
 }
 
+/// A packed `pigeonhole-text` index (#1585, ICR 0143: layout version 2, which 1.2 refuses
+/// to open) with positions: 300 documents over a small vocabulary, so common terms fill
+/// blocks of postings; packed; then a rewrite, a delete and new documents, which are posting
+/// cells again beside the blocks. Its statistics family is an aggregate kind, so 1.0.0
+/// refuses the file (`incompat` bit 0).
+fn write_text_packed(db: &Pigeonhole) {
+    let docs = db
+        .table("docs")
+        .unwrap()
+        .family("d", Family::default())
+        .create()
+        .unwrap();
+    let index = pigeonhole_text::Index::create(
+        db,
+        "docs_text",
+        pigeonhole_text::Source::new(&docs, "d", b"body"),
+        pigeonhole_text::IndexOptions::new().positions(true),
+    )
+    .unwrap();
+    let words = [
+        "the", "brown", "fox", "lazy", "dog", "jumps", "over", "quick", "a",
+    ];
+    let put = |i: u64, text: &str| {
+        let doc = format!("doc{i:03}");
+        let mut txn = db.transaction().unwrap();
+        txn.put(&docs, doc.as_bytes(), "d", b"body", text.as_bytes());
+        index.put_in(&mut txn, doc.as_bytes(), text).unwrap();
+        txn.commit().unwrap();
+    };
+    for i in 0..300u64 {
+        let text: Vec<&str> = (0..8u64)
+            .map(|j| words[((i * 7 + j * 3) % 9) as usize])
+            .collect();
+        put(i, &format!("the quick brown fox {}", text.join(" ")));
+    }
+    db.flush().unwrap();
+    let stats = index.pack().unwrap();
+    assert!(!stats.stopped && stats.postings > 0, "{stats:?}");
+    put(
+        7,
+        "a lazy dog and a quick brown fox, rewritten after the pack",
+    );
+    let mut txn = db.transaction().unwrap();
+    assert!(index.delete_in(&mut txn, b"doc011").unwrap());
+    txn.delete_column(&docs, b"doc011", "d", b"body");
+    txn.commit().unwrap();
+    for i in 300..305u64 {
+        put(i, "written after the pack: the lazy dog");
+    }
+}
+
+/// The packed index's `verify`, and the ids a phrase search and a term search return (ids
+/// only: scores are floating point).
+fn text_packed_extra(db: &Pigeonhole) -> String {
+    let index = pigeonhole_text::Index::open(db, "docs_text").unwrap();
+    let mut out = text_extra(db);
+    for (name, query) in [
+        (
+            "phrase",
+            pigeonhole_text::Query::new().phrase(["quick", "brown", "fox"]),
+        ),
+        ("term", pigeonhole_text::Query::new().term("lazy")),
+    ] {
+        let mut ids: Vec<String> = index
+            .search(query, 1_000)
+            .run()
+            .unwrap()
+            .iter()
+            .map(|h| String::from_utf8_lossy(&h.id).into_owned())
+            .collect();
+        ids.sort();
+        out.push_str(&format!("text {name} {} {}\n", ids.len(), ids.join(",")));
+    }
+    out
+}
+
 /// The text index's `verify`: its counts and whether every check agreed.
 fn text_extra(db: &Pigeonhole) -> String {
     let stats = pigeonhole_text::Index::open(db, "docs_text")
@@ -1386,6 +1665,11 @@ fn feed_extra(db: &Pigeonhole) -> String {
                     }
                 )
             ));
+        }
+        // A spanning commit's share carries its transaction's id (D329 2b).
+        #[cfg(feature = "__unstable-txn-prepare")]
+        if let Some(xid) = c.xid() {
+            out.push_str(&format!("{}\txid\t{}\n", c.seqno(), hex(xid)));
         }
         if c.seqno() >= last {
             break;
