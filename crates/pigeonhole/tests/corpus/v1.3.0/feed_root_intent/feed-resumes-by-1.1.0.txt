@@ -1,0 +1,1 @@
+compat-reader-1.1 resumes this entry's stored table feed token (D315 amendment)
