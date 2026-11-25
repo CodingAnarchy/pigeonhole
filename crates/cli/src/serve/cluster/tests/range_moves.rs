@@ -94,6 +94,16 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
             push(&ports, &moving(&v1, version, Some(phase))).await;
             try_put(c, "d", "2").await.unwrap();
             assert_eq!(get_row(c, "d").await.unwrap(), Some(b"2".to_vec()));
+            // CATCHING_UP only once b's copy is done, as the driver steps it: a source past
+            // COPYING refuses a copy, so b would never copy the range (#2209's linux red).
+            if phase == MovePhase::Copying {
+                eventually("b's follower to copy mv1", async || {
+                    move_status(b, "p2", "mv1")
+                        .await
+                        .is_some_and(|s| s.copy_done)
+                })
+                .await;
+            }
         }
         // A transaction that writes, begun before the fence.
         let early = begin(c, "alice", None).await.unwrap();
@@ -149,8 +159,12 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
         })
         .await;
         try_put(c, "zed", "2").await.unwrap();
-        // p2 serves the range as b's follower copied it (D331 PR 4b).
-        assert_eq!(get_row(c, "d").await.unwrap(), Some(b"2".to_vec()));
+        // p2 serves the range as b's follower copied it (D331 PR 4b). The hand-built map has
+        // no final seqno, so the catch-up may still be applying `d`'s last write.
+        eventually("p2 serves d as copied", async || {
+            get_row(c, "d").await.ok().flatten() == Some(b"2".to_vec())
+        })
+        .await;
         try_put(c, "d", "5").await.unwrap();
         // Done: the record goes, and the range stays p2's.
         push(&ports, &moving(&v1, 7, None)).await;
