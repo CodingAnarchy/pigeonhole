@@ -37,8 +37,11 @@ impl Service {
             && let Some(ranges) = &*gate.ranges().load()
         {
             ranges.check(&op, op.writes())?;
-            // #2160: a read's keys, for the check again past its snapshot. Only while a
-            // move names the partition, so other reads copy nothing.
+            // #2160: a read's keys, for the check again past its snapshot. Only while the
+            // partition has range state (a move names it, or a range moved off it and its
+            // rows aren't pruned yet), so other reads copy nothing. A read admitted before
+            // the state reached this node isn't checked again; that needs a stall through a
+            // whole move (audit120's point 3 on #2218).
             if read.is_some() {
                 touched = Some(crate::serve::ranges::Touched::of(&op));
             }

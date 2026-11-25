@@ -219,7 +219,8 @@ struct Peers {
     /// shorter in tests).
     prune_interval: Duration,
     /// How long the writer lets a range move sit at HANDING_OVER before it aborts it as
-    /// orphaned ([`range_move::ORPHANED_HAND_OVER`]; shorter in tests).
+    /// orphaned ([`range_move::ORPHANED_HAND_OVER`]; an hour in tests, where many hold a
+    /// hand-built move there, and a second in the test of the duty itself).
     orphaned_hand_over: Duration,
 }
 

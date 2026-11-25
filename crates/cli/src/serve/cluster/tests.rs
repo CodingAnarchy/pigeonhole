@@ -27,6 +27,12 @@ pub(super) const TEST_LEASE: Duration = Duration::from_millis(1500);
 /// An hour, in nanoseconds on a lease clock: a test node's lease that won't run out.
 pub(super) const HOUR_NS: u64 = 3_600_000_000_000;
 
+/// The writer's HANDING_OVER bound for nodes over these directories, where a test sets one
+/// (#2160's duty, audit120's point 1 on #2218); every other node takes an hour, since many
+/// tests hold a hand-built move at HANDING_OVER.
+pub(super) static ORPHANED_HAND_OVER: std::sync::Mutex<Vec<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// A node over `dir` (its persisted map loaded, as `run` loads it), without tokens or TLS.
 pub(super) fn node(dir: &Path, id: &str) -> Arc<Node> {
     node_with(dir, id, "")
@@ -56,9 +62,12 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             balance_window: Duration::from_secs(300),
             load_interval: Duration::from_millis(500),
             prune_interval: Duration::from_millis(500),
-            // Long: many tests hold a hand-built move at HANDING_OVER (#2160's duty has its
-            // own unit test).
-            orphaned_hand_over: Duration::from_secs(3600),
+            orphaned_hand_over: ORPHANED_HAND_OVER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|(d, _)| d == dir)
+                .map_or(Duration::from_secs(3600), |(_, b)| *b),
         },
         state,
         super::read_voted(dir).unwrap(),

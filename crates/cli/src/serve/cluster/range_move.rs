@@ -533,6 +533,15 @@ async fn change(
     .await
 }
 
+/// An abort of move `id` that found it past its commit point: it goes on to CLEANING, so
+/// the range is the target's, and nothing is undone.
+fn past_commit(id: &str) -> Failure {
+    Failure::usage(&format!(
+        "move {id} is past its commit point (its hand-over committed): it can't be aborted, \
+         and it goes on to CLEANING; run phdb cluster move-range --resume {id} to drive it"
+    ))
+}
+
 /// Removes record `id` in the next map (done, or an abort finished).
 async fn remove(args: &NodeArgs, id: &str) -> Result<(), Failure> {
     set_record(args, |now: &ClusterMap| {
@@ -816,15 +825,21 @@ async fn never_both(args: &NodeArgs, m: &ClusterMap, r: &RangeMove) -> Result<bo
 /// An abort before the commit point: the record to ABORTING, then gone once T has dropped
 /// its copy (its reconcile, which also runs at T's next open if T is down: so the record
 /// goes after `timeout` anyway, and T cleans up when it's back).
-async fn abort_record(
+pub(super) async fn abort_record(
     args: &NodeArgs,
     r: &RangeMove,
     timeout: Option<Duration>,
 ) -> Result<(), Failure> {
     if map::before_commit(map::phase(r)) {
-        change(args, &r.id, |_, r| {
-            if map::before_commit(map::phase(r)) {
-                r.set_phase(MovePhase::Aborting);
+        // The record as the map has it now: a driver may have committed the hand-over since
+        // the caller read it (audit120's point 2 on #2218, with the writer's duty an automatic
+        // caller). Past the commit point the move can't be aborted, and nothing below runs.
+        change(args, &r.id, |_, now| {
+            if map::committed(map::phase(now)) {
+                return Err(past_commit(&r.id));
+            }
+            if map::before_commit(map::phase(now)) {
+                now.set_phase(MovePhase::Aborting);
             }
             Ok(())
         })
@@ -873,7 +888,19 @@ async fn abort_record(
         }
     }
     if !split {
-        return remove(args, &r.id).await;
+        // Only a record still ABORTING goes (or one already gone): never one past its commit
+        // point, whatever this caller read (audit120's point 2 on #2218).
+        return set_record(args, |now: &ClusterMap| {
+            if let Some(x) = now.moves.iter().find(|x| x.id == r.id)
+                && map::committed(map::phase(x))
+            {
+                return Err(past_commit(&r.id));
+            }
+            let mut next = now.clone();
+            next.moves.retain(|x| x.id != r.id);
+            Ok(next)
+        })
+        .await;
     }
     // The split's partition: fenced and closed on its node, then the map drops it with the
     // record, then its file is moved aside. A stop between the map and the drop leaves a
