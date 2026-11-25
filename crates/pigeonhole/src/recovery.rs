@@ -44,7 +44,8 @@ const DEADLINE_STALLS: u32 = 4;
 #[repr(u8)]
 #[non_exhaustive]
 pub enum FailureCause {
-    /// A shard's thread panicked.
+    /// A shard's thread panicked, or (for [`Failure::MAIN_FILE`]) a thread panicked inside a
+    /// manifest commit to the main file (#2129).
     Panic = 1,
     /// An application-owned shard's driver ([`Shard`](crate::Shard)) was dropped before the
     /// close finished.
