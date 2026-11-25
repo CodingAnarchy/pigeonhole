@@ -1030,6 +1030,10 @@ A node writes a partition only while its newest map names it for the partition a
   - **Not promised:** that two reads see the same or a later state (they may hit different replicas) unless you send `served-seqno` back, or any order across partitions.
 - **Promoting a replica** (`phdb cluster promote P --to ID --node URL`): node ID, which holds a replica of P, becomes P's owner. Use it when P's node is lost, or to move P with no copy.
   - **First,** P must be fenced or closed on its owner (`phdb cluster fence`, `close`), or the owner's process stopped (`--old-unreachable`, which still checks briefly that it doesn't answer and serve P).
+  - **With `--old-unreachable`, it also checks that the owner hasn't come back** (#2152), as automatic failover does ([The old owner](#the-old-owner)).
+    - It asks every node for its grants of P, before its first map and again once that map is on a majority. Grants still running from before the owner stopped are waited out first, for up to two leases. It stops if any node still grants P's lease to the old owner after that (the owner renews it, so it's alive), if that map misses a majority, or if too few nodes answer to tell. An old owner that answers and holds no lease of P settles that last question itself.
+    - It also stops if the two surveys are more than a lease apart (from `--cluster-lease-ms`, which each node reports). A node from before 1.3.1 doesn't report its lease; if none does, the promote goes on without that bound and prints a warning naming the nodes.
+    - **When it stops:** on the owner's grant, too few answers, or surveys too far apart, the promote doesn't start, or is abandoned before its stamp with ID back in P's replicas. On a first map short of a majority, it stays pending, unstamped. Either way, run it again once the reason is gone.
   - **What it does:**
     1. It sets a map without ID in P's replicas, so ID closes its copy.
     2. It makes the copy a primary at the last commit it applied, and stamps it at the next epoch: above the map's, and above every epoch a promote of P recorded. A rerun that resumes its own pending promote to the same node keeps that promote's epoch.
@@ -1127,6 +1131,11 @@ Any node still takes any call, before, during and after.
 #### The old owner
 - **Cut off but alive,** it stops serving P within the lease. No other node serves P until the old owner's grants have run out, and a failover comes a whole A after that, so the two never serve P at once.
 - **If it comes back before the failover,** it renews its lease and serves again. The writer sees the renewal and leaves P alone.
+- **If it comes back while the failover runs** (#2152), it depends on how far the promote got.
+  - **Before the promote's first map reached a majority:** the promote finds the owner's new grant, stops before it stamps the replica, and is abandoned. The replica goes back into P's `replicas`, and the owner serves.
+  - **After that,** that map records the promote pending, and no node grants P's lease to the old owner while it's there. So the owner waits, fenced, taking no writes. If the promote finishes, the owner finds P elsewhere, as below. If it can't (the replica stops answering before its stamp), the writer abandons it once the owner answers, and the owner serves again.
+  - Either way, no write the owner acknowledges is lost to the promote.
+- **During a rolling upgrade to 1.3.1,** a 1.3.0 node grants the lease whatever the map's pending promotes. Until every node runs 1.3.1, an owner that comes back after the promote's checks and before its last map can still take writes the promote then loses.
 - **If it comes back after,** it takes the newer map, finds P on another node and serves nothing for it. Its file stays at the old epoch.
   - It doesn't rejoin on its own. Copy off anything you need from its unreplicated tail, drop the file (`phdb cluster drop-partition P --node <old owner>`), then add the node to P's `replicas` with `set-map`. It copies P again from the new owner.
 - **An old writer that comes back** takes the elected map, which has a higher term, and follows it. The nodes that voted refuse every map and writer lease below the new term, so the old writer can't change the map at its old one.
