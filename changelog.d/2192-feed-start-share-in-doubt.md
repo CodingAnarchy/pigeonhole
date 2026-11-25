@@ -4,4 +4,4 @@
   - a replica bootstrapped after the restart, which then copied the partition again;
   - a range move started after the restart, whose follower failed.
 
-  The same held for an embedded `Pigeonhole` feed started from now, a snapshot or a seqno after a reopen with an externally prepared transaction in doubt. Such a start now begins before the transaction's share. A feed resumed from a token taken before the restart was never affected.
+  The same held for an embedded `Pigeonhole` feed started from now, a snapshot or a seqno after a reopen with an externally prepared transaction in doubt. Such a start now begins before the transaction's share. A feed resumed from a token taken before the restart was never affected. A transaction whose share was logged while the feed was off, or in a session a power loss left outside the feed's history, still expires such a feed when it commits, as the change-feed guide now says: never a skip.
