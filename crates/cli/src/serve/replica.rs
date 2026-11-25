@@ -1148,6 +1148,11 @@ impl Replica {
             }
             let failed = match halt {
                 Halt::Stopped => return,
+                // Defensive (#2162 item 3): a stop seen before a bootstrap or a pause ends here.
+                // Nothing between follow's selects and here consumes one today, so their own
+                // `changed()` would fire; this keeps a stop from being waited out if that
+                // changes.
+                _ if *stop.borrow() => return,
                 Halt::Expired(why) => {
                     self.fail(State::ReBootstrapping, why);
                     match self.bootstrap(on, &mut stop).await {
@@ -1160,6 +1165,10 @@ impl Replica {
             };
             if let Some(e) = failed {
                 self.fail(State::Retrying, e);
+            }
+            // The same before the pause (defensive, as above).
+            if *stop.borrow() {
+                return;
             }
             let woken = tokio::select! {
                 () = tokio::time::sleep(backoff) => false,
@@ -1293,7 +1302,13 @@ impl Replica {
             drop(s);
             return Halt::Expired(why);
         }
-        let channel = match self.connect().await {
+        // A dial to an owner that doesn't answer may take its whole connect timeout: a stop
+        // ends it (#2162 item 3). Nothing has happened yet to finish first.
+        let connected = tokio::select! {
+            c = self.connect() => c,
+            _ = stop.changed() => return Halt::Stopped,
+        };
+        let channel = match connected {
             Ok(c) => c,
             Err(e) => return Halt::Failed(e),
         };
