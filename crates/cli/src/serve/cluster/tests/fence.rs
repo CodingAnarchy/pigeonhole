@@ -3020,6 +3020,13 @@ const BALANCER_ADMIN: &str = "adm1n-bal";
 /// Changes the map at the writer `a` by `change` (retrying while its lease comes back),
 /// with the balancer's pass at 100 ms on every node (D332 PR 3's tests), asking with
 /// `token`. The new map's version.
+///
+/// Every node's partitions report a load of 0 ([`load::LOAD_FOR`]), unless the test
+/// registered its own first (`None` keeps the measured load): these tests aren't about load,
+/// and a measured one made a lone partition "too hot" on a slow runner, and never cold
+/// enough to merge (#2164's Windows red).
+///
+/// [`load::LOAD_FOR`]: super::super::load::LOAD_FOR
 async fn balancer_map(
     t: &Rig,
     token: Option<&str>,
@@ -3031,6 +3038,13 @@ async fn balancer_map(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !pass.iter().any(|(d, _)| d == dir) {
             pass.push((dir.clone(), Duration::from_millis(100)));
+        }
+        drop(pass);
+        let mut load = super::super::load::LOAD_FOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !load.iter().any(|(d, _)| d == dir) {
+            load.push((dir.clone(), Some(0.0)));
         }
     }
     let a = t.ports[0];
@@ -3134,7 +3148,15 @@ fn a_paused_or_idle_balancer_changes_no_map() {
     // nothing writes nothing to the map; its reason is in the writer's status. Paused, it
     // says so; on, an even cluster is within bounds, and ten passes and more leave the
     // map's version where it was.
+    //
+    // On the nodes' measured loads, not pinned ones (the coordinator on #2164's flake fix):
+    // the one balancer test that keeps the real measure under the pass. An idle rig does
+    // nothing whatever it measures: no partition has a tablet boundary to split at.
     let mut t = Rig::start();
+    super::super::load::LOAD_FOR
+        .lock()
+        .unwrap()
+        .extend(t.dirs.iter().map(|d| (d.clone(), None)));
     writer_leased(&mut t);
     let a = t.ports[0];
     t.rt.block_on(async {
