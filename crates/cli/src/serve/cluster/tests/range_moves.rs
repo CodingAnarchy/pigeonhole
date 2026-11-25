@@ -2628,9 +2628,13 @@ fn a_move_whose_source_is_down_after_the_hand_over_goes_on_to_cleaning() {
         .await;
         let waited =
             super::super::range_move::resume(&args, &id, Some(Duration::from_secs(30))).await;
+        // The wait ends at its limit, on CLEANING's own answer or, when a last call to the
+        // down node outlives the time left (a connect to a stopped node took about 2 s on
+        // Windows), on that call's. Either way the phase below is CLEANING: it got past
+        // HANDED_OVER without the source.
         let e = waited.expect_err("the move ended with its source's node down");
         assert!(
-            e.message().contains("doesn't answer"),
+            e.message().contains("doesn't answer") || e.message().contains("didn't answer"),
             "it waits for the source's drop, not on the unreachable node: {}",
             e.message()
         );
