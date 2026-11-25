@@ -1014,7 +1014,10 @@ impl Driver {
     /// now. A partition the map no longer lists counts too: a merge removes one only once it
     /// holds no share in doubt (D331 PR 6). One that doesn't answer doesn't count; the first
     /// such refusal comes back beside the acked, for the sweep's log line.
-    pub(crate) async fn confirm(&self, parts: &[String]) -> (Vec<String>, Option<(String, ApiError)>) {
+    pub(crate) async fn confirm(
+        &self,
+        parts: &[String],
+    ) -> (Vec<String>, Option<(String, ApiError)>) {
         let (gone, listed): (Vec<String>, Vec<String>) = {
             let routes = self.node.routes();
             parts
@@ -1619,8 +1622,7 @@ pub(crate) fn start_resolver(
                 if last_sweep.elapsed() >= sweep_every {
                     last_sweep = Instant::now();
                     for (partition, service) in parts.iter() {
-                        confirm_unacked(cluster, partition, service, timeout, &mut cursors)
-                            .await;
+                        confirm_unacked(cluster, partition, service, timeout, &mut cursors).await;
                         if let Err(e) = service.sweep_decisions(now_ms()).await
                             && e.code != "Fenced"
                         {
