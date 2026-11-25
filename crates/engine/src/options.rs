@@ -246,11 +246,12 @@ pub struct EngineOptions {
     /// (D333, from the g152/g153 box runs).
     ///
     /// Punched space is no longer reserved for the file: on a full filesystem a write into a
-    /// punched range can fail for lack of space, where without punching only the file's
-    /// growth could (cleanly, with nothing written). A failed root commit's write stops
-    /// writes until the database is reopened (D58). Holes are tracked in memory only, so
-    /// after a reopen `file_punched_bytes` reads 0 until passes punch that space again,
-    /// which counts it again in `file_punches` and `file_punch_bytes` (#2181).
+    /// punched range can fail for lack of space. On a filesystem that overwrites in place (ext4,
+    /// XFS), without punching only the file's growth could (cleanly, with nothing written); a
+    /// copy-on-write one (APFS, btrfs, ZFS) can fail any overwrite anyway. A failed root commit's
+    /// write stops writes until the database is reopened (D58). Holes are tracked in memory only,
+    /// so after a reopen `file_punched_bytes` reads 0 until passes punch that space again, which
+    /// counts it again in `file_punches` and `file_punch_bytes` (#2181).
     pub punch_freed: bool,
     /// Overrides how a punch pass runs (D333's defaults otherwise). For tests, which
     /// shrink the reserve and lift the pacing.

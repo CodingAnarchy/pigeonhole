@@ -16,7 +16,8 @@
 //! stops punching until the next open; any other error ends the pass and counts as a
 //! refusal, and the next pass waits for a trigger's worth of new free space, as after an
 //! empty one (simp724's S1 on #2034), or starts at the first manifest commit (a flush, a
-//! compaction or a catalog change) 10 s after the refusal, whichever comes first (#2181).
+//! compaction or a catalog change, say) 10 s after the refusal, whichever comes first
+//! (#2181).
 //! A poisoned pager (a failed root commit) punches nothing: the failed root may be the one
 //! recovery opens (simp724's M1).
 //!
