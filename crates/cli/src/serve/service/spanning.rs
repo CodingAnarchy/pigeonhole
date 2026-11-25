@@ -163,6 +163,40 @@ impl Service {
         Ok(n)
     }
 
+    /// This home's committed decision rows past `--txn-outcome-retention` at `now_ms` that
+    /// some branch never acked, at most `limit` of them: each xid with the branches it still
+    /// waits on (#2098).
+    pub(crate) async fn unacked_decisions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<String>)>, ApiError> {
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, unacked};
+        let table = self.decisions_table().await?;
+        let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        self.blocking(move || {
+            let mut out = Vec::new();
+            for row in table.scan_prefix(b"").iter()? {
+                if out.len() >= limit {
+                    break;
+                }
+                let row = row?;
+                let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
+                    continue;
+                };
+                let (Ok(xid), Some(waiting)) = (
+                    std::str::from_utf8(row.key()),
+                    unacked(cell.value(), now_ms, retention),
+                ) else {
+                    continue;
+                };
+                out.push((xid.to_owned(), waiting));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// What transaction `id` is now, without taking it (D329's `Outcome` and resolver), as
     /// `principal` sees it; `None` is the node's own call ([`super::super::sessions::Sessions::peek`]).
     pub(crate) fn peek_txn(

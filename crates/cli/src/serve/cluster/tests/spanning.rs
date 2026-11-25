@@ -865,6 +865,75 @@ fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
     });
 }
 
+#[test]
+fn a_commit_whose_ack_was_lost_is_asked_again_and_collected_past_retention() {
+    // #2098: as in the test above, p1's share is decided by hand, but its ack is lost (a
+    // restart of node a loses the queue it's owed from), so the home's row never takes it.
+    // Once the row is past retention, the home's sweep sends p1 the commit's decide again;
+    // p1 holds nothing in doubt, so it answers at once, its ack is recorded, and the same
+    // sweep collects the row. p1 applied the commit once.
+    use crate::serve::cluster::spanning::seams::{self, Step};
+    use crate::serve::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, DECISIONS};
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_resolve_delay = Duration::from_secs(3600);
+    let retention = limits.txn_outcome_retention;
+    let t = Three::start_limits(["", "", ""], limits);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        use super::several::{add_counter, counter, incr_row};
+        add_counter(&t.ports, c).await;
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(
+            c,
+            &id,
+            vec![incr_row("alice", 1), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let (pause, commit) = paused_commit(c, &id, Step::Decide).await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        assert!(in_doubt(&t, &id));
+        seams::lose_ack(&id);
+        decide(a, "p1", &id, true, true).await.unwrap();
+        assert!(!in_doubt(&t, &id));
+        assert_eq!(counter(c, "alice").await, 1);
+        // The row as the commit left it, aged past retention: nothing acked it.
+        let row = decision_row(&t.dbs[1], &id).unwrap();
+        let text = String::from_utf8(row).unwrap();
+        assert!(text.ends_with("\np1"), "{text:?}");
+        let (head, branches) = text.split_once('\n').unwrap();
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - retention.as_millis() as u64
+            - 1_000;
+        let aged: Vec<&str> = head
+            .split(' ')
+            .map(|w| if w.starts_with("at") { "AT" } else { w })
+            .collect();
+        let aged = format!("{}\n{branches}", aged.join(" ")).replace("AT", &format!("at{old}"));
+        t.dbs[1]
+            .table(DECISIONS)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(id.as_bytes())
+            .put(DECISION_FAMILY, DECISION_QUALIFIER, aged.as_bytes())
+            .commit()
+            .unwrap();
+        eventually_within(
+            Duration::from_secs(30),
+            "the home's sweep collects the row",
+            async || decision_row(&t.dbs[1], &id).is_none(),
+        )
+        .await;
+        assert_eq!(counter(c, "alice").await, 1, "applied once");
+    });
+}
+
 /// D331 PR 5 (simp724's M1 on the design, and the range-scoped in-doubt rule): a spanning
 /// transaction's branch on the moving range is prepared before the move, and its home is
 /// paused before the commit point, so the share stays in doubt on the source. The move
