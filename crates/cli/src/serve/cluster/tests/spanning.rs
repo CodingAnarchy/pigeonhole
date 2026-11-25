@@ -949,47 +949,6 @@ fn a_transaction_ended_by_a_lost_branch_write_answer_says_it_didnt_commit() {
 }
 
 #[test]
-fn a_transaction_ended_by_a_lost_branch_write_answer_says_it_didnt_commit() {
-    // #2161: a home's write to a branch is taken there, but its answer is lost, which is
-    // `OutcomeUnknown` for that one write. The home ends the transaction for it, before any
-    // commit point, so nothing of it can commit: the write's caller, and then `Commit`, are
-    // told so (`Conflict`, retry the transaction), not `OutcomeUnknown`, which sent a
-    // client to `Outcome` for what was already certain. In a `TxnWrite` and in the rows a
-    // `Commit` carries alike.
-    use crate::serve::cluster::spanning::seams;
-    let t = Three::start(["", "", ""]);
-    let [a, _, c] = t.ports;
-    t.rt.block_on(async {
-        let id = begin_spanning(c, "zed").await.unwrap();
-        txn_write(c, &id, vec![put_row("zed", "1")], None)
-            .await
-            .unwrap();
-        seams::lose_write_reply(&id);
-        let e = txn_write(c, &id, vec![put_row("alice", "1")], None)
-            .await
-            .unwrap_err();
-        assert_eq!(code(&e), "Conflict", "{e}");
-        assert!(e.message().contains("nothing of it was committed"), "{e}");
-        // The session's record says the same to its `Commit`.
-        let e = commit_parts(c, &id, Vec::new()).await.unwrap_err();
-        assert_eq!(code(&e), "Conflict", "{e}");
-        assert_eq!(get_row(a, "alice").await.unwrap(), None);
-        assert_eq!(get_row(c, "zed").await.unwrap(), None);
-        assert!(!in_doubt(&t, &id));
-
-        // The same loss on a row the `Commit` itself carries.
-        let id = begin_spanning(c, "zed").await.unwrap();
-        seams::lose_write_reply(&id);
-        let e = commit_parts(c, &id, vec![put_row("alice", "2"), put_row("zed", "2")])
-            .await
-            .unwrap_err();
-        assert_eq!(code(&e), "Conflict", "{e}");
-        assert_eq!(get_row(a, "alice").await.unwrap(), None);
-        assert_eq!(get_row(c, "zed").await.unwrap(), None);
-    });
-}
-
-#[test]
 fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
     // #2078 (audit120's nit on #2076, Q3 on the plan): the home is lost after its commit
     // point, so its row is COMMITTED and p1's share waits in doubt. The resolver waits an
