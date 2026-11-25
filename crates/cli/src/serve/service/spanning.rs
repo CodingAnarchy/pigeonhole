@@ -1,5 +1,14 @@
 use super::*;
 
+/// The home's part of a spanning commit that wrote, as [`Service::spanning_write`] takes
+/// it: its transaction, the durability asked for, and the rows the `Commit` carried for
+/// the home (already applied to the transaction; kept for the range rule, #2155).
+struct HomeCommit {
+    txn: pigeonhole::Transaction,
+    durability: Option<pigeonhole::Durability>,
+    carried: Vec<proto::RowWrites>,
+}
+
 impl Service {
     /// The home partition's `Begin` of a spanning transaction (D329): its id carries the
     /// home's history epoch (`epoch`), and is its xid. The decision table is made first, if
@@ -49,6 +58,34 @@ impl Service {
     pub(crate) fn writable(&self) -> Result<(), ApiError> {
         match &self.gate {
             Some(gate) => gate.enter().map(drop),
+            None => Ok(()),
+        }
+    }
+
+    /// D331's range rule for a spanning transaction's home (#2155), as a plain commit's
+    /// ([`Service::commit`]): `rows`, the home's own, are refused as writes to a range a
+    /// move fences or moved away, and with `snapshot` a transaction that writes is refused
+    /// when it's open across the range's fence or hand-over (M3). A `TxnWrite` passes no
+    /// snapshot: its rows only. `Ok` off a cluster and while no move names the partition.
+    pub(crate) fn home_ranges(
+        &self,
+        rows: &[proto::RowWrites],
+        snapshot: Option<u64>,
+    ) -> Result<(), ApiError> {
+        match &self.gate {
+            Some(gate) => Self::ranges_commit(gate, rows, snapshot),
+            None => Ok(()),
+        }
+    }
+
+    /// [`home_ranges`](Self::home_ranges) on `gate`, with one load of its range state.
+    fn ranges_commit(
+        gate: &super::super::gate::WriteGate,
+        rows: &[proto::RowWrites],
+        snapshot: Option<u64>,
+    ) -> Result<(), ApiError> {
+        match &*gate.ranges().load() {
+            Some(ranges) => ranges.commit(rows, snapshot.unwrap_or(0), snapshot.is_some()),
             None => Ok(()),
         }
     }
@@ -445,6 +482,7 @@ impl Service {
         let branches = span.branches(&home);
         let idle = span.idle(&home);
         let home_read = span.read(&home);
+        let carried = r.rows;
         let (txn, durability, ticket) = g.commit();
         let me = Arc::clone(self);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -459,7 +497,12 @@ impl Service {
             }
             let outcome = match decisions {
                 Some(decisions) => {
-                    me.spanning_write(txn, durability, &decisions, &gate, &driver, &branches)
+                    let home = HomeCommit {
+                        txn,
+                        durability,
+                        carried,
+                    };
+                    me.spanning_write(home, &decisions, &gate, &driver, &branches)
                         .await
                 }
                 None => {
@@ -533,13 +576,17 @@ impl Service {
     /// [`Driver::for_round`]: super::super::cluster::spanning::Driver::for_round
     async fn spanning_write(
         &self,
-        mut txn: pigeonhole::Transaction,
-        durability: Option<pigeonhole::Durability>,
+        home: HomeCommit,
         decisions: &Table,
         gate: &Arc<super::super::gate::WriteGate>,
         driver: &super::super::cluster::spanning::Driver,
         branches: &[String],
     ) -> super::super::sessions::Outcome {
+        let HomeCommit {
+            mut txn,
+            durability,
+            carried,
+        } = home;
         use super::super::cluster::spanning::{
             DECISION_FAMILY, DECISION_QUALIFIER, committed_value,
         };
@@ -621,6 +668,16 @@ impl Service {
                 return Err(e);
             }
         };
+        // D331's range rule under the held count (#2155), as a plain commit's and a branch's
+        // prepare: the rows this commit carried, as writes, and M3, so a home row buffered
+        // before a range's fence or hand-over can't land above the fence's seqno. One that
+        // passes is either waited for by the fence's drain (admitted before it) or saw no
+        // fence. Before the commit point: the branches abort, and the refusal is retry-safe.
+        if let Err(e) = Self::ranges_commit(gate, &carried, Some(txn.snapshot_seqno())) {
+            drop(held);
+            abort().await;
+            return Err(e);
+        }
         let d = durability
             .unwrap_or(pigeonhole::Durability::GroupSync)
             .max(pigeonhole::Durability::GroupSync);
