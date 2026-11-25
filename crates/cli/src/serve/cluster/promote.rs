@@ -44,18 +44,42 @@ const CLOSE_WAIT: Duration = Duration::from_secs(60);
 const SETTLE_WAIT: Duration = Duration::from_secs(3);
 
 /// Past the copy's own reading, before a message counts as heard after the fence: the two
-/// clocks run at the same rate, and this covers the copy's apply of it.
+/// clocks run at the same rate, and this covers the copy's apply of it. Not the call's
+/// latency: [`settle`] measures from when it sent the call, before the copy's reading
+/// (feed1248's N2 on #2184).
 const SETTLE_SLACK: Duration = Duration::from_millis(200);
+
+/// Fences `partition` again on its owner at `url`, within [`SETTLE_WAIT`]: the answer
+/// comes once its feed's durable frontier has reached its last commit (feed1248's S1 on
+/// #2184), so what it sends from then on is final. Only for an operator's fence, which this
+/// repeats and adds nothing to. Whether it answered so.
+async fn fence_again(args: &NodeArgs, url: &str, partition: &str) -> bool {
+    let call = async {
+        let (mut c, token) = connect(args, url).await.ok()?;
+        let req = request(
+            proto::PartitionRequest {
+                partition: partition.to_owned(),
+                force: false,
+            },
+            token.as_deref(),
+        )
+        .ok()?;
+        c.fence(req).await.ok()
+    };
+    matches!(tokio::time::timeout(SETTLE_WAIT, call).await, Ok(Some(_)))
+}
 
 /// Waits up to [`SETTLE_WAIT`] for node `to`'s copy of `partition` (at `url`) to have heard
 /// its owner since this call and applied through the durable seqno it heard (#2162 item 4).
-/// The owner is fenced: what it sends after this is its final frontier. Whether it did.
+/// The owner's frontier is final ([`fence_again`]), so that is the last one. Whether it did.
 async fn settle(args: &NodeArgs, url: &str, partition: &str) -> bool {
     let since = tokio::time::Instant::now();
     loop {
+        // The copy reads its lag after this: heard at least that long before `sent`.
+        let sent = tokio::time::Instant::now();
         if let Ok(Some(lp)) = row_on(args, url, partition).await
             && lp.role() == proto::PartitionRole::Replica
-            && Duration::from_millis(lp.replica_lag_ms) + SETTLE_SLACK < since.elapsed()
+            && Duration::from_millis(lp.replica_lag_ms) + SETTLE_SLACK < sent - since
             && lp.replica_applied_seqno >= lp.replica_primary_seqno
         {
             return true;
@@ -226,12 +250,20 @@ pub(crate) async fn promote(
         lp
     };
     // A fenced owner takes no commit and still streams its feed (Follow is lease-gated,
-    // not fence-gated, D328's M1): wait, bounded, for the copy to hear it after the fence and
-    // apply through its durable seqno, so the loss counted below is exact (#2162 item 4: a
-    // promote right after the fence counted from a frontier up to a heartbeat old). A closed
-    // owner doesn't stream, so its count is a lower bound.
-    let settled = match owner.as_ref().map(proto::LocalPartition::state) {
-        Some(S::Fenced) => settle(args, &url(to).unwrap_or_default(), partition).await,
+    // not fence-gated, D328's M1). The operator's fence, once more, answers when the owner's
+    // durable frontier is final (feed1248's S1 on #2184: a fed `Buffered` commit passes it
+    // only at the owner's background sync); then wait, bounded, for the copy to hear it and
+    // apply through it, so the loss counted below is exact (#2162 item 4: a promote right
+    // after the fence counted from a frontier up to a heartbeat old). A closed owner doesn't
+    // stream, and another fence (a lapsed lease, a start) isn't the operator's to set again:
+    // their counts are lower bounds.
+    let operator_fenced = owner.as_ref().is_some_and(|lp| {
+        lp.state() == S::Fenced && lp.fence_reason() == proto::FenceReason::Operator
+    });
+    let settled = match url(to) {
+        Some(to_url) if operator_fenced && fence_again(args, &old_url, partition).await => {
+            settle(args, &to_url, partition).await
+        }
         _ => false,
     };
     let ops = CliOps {
@@ -269,14 +301,19 @@ pub(crate) async fn promote(
                 json!(if old_unreachable {
                     "not counted: the old owner couldn't be asked"
                 } else if settled {
-                    "exact: the copy heard the fenced owner after the fence, so its durable \
-                     seqno is final, and the copy applied through it"
+                    "exact: the owner's fence found its durable seqno final, and the copy \
+                     heard it after that and applied through it"
                 } else if owner.as_ref().is_some_and(|lp| lp.state() == S::Closed) {
                     "a lower bound: the owner was closed, so the copy last heard its durable \
                      seqno before that, and commits it made durable since aren't counted"
+                } else if !operator_fenced {
+                    "a lower bound: the owner's fence isn't the operator's (its lease lapsed, \
+                     or it awaits its peers' map), so commits it made durable after the \
+                     copy's last message aren't counted"
                 } else {
-                    "a lower bound: the copy didn't hear the fenced owner within 3 s, so \
-                     commits it made durable after its last message aren't counted"
+                    "a lower bound: the fenced owner's final durable seqno didn't reach the \
+                     copy within 3 s, so commits it made durable after the copy's last \
+                     message aren't counted"
                 }),
             ),
             ("map_version", json!(done.map_version)),

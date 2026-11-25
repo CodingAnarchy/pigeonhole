@@ -391,6 +391,72 @@ fn a_cut_off_owners_follow_stream_ends_with_its_lease() {
     super::super::cut_node(&dirs[2], &c_at, &dirs, false);
 }
 
+/// #2162 item 4, feed1248's point 2 on #2184: a planned promote fences its owner again only
+/// when the operator fenced it. c, cut off from its peers, is fenced without its lease (as
+/// awaiting its peers' map, or for its lapsed lease): the promote goes on, and says its
+/// count is a lower bound for that reason.
+#[test]
+fn a_planned_promotion_from_an_owner_fenced_without_its_lease_counts_a_lower_bound() {
+    use crate::serve::proto::{FenceReason, LocalPartitionState, StatusRequest};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (_stops, ports) = three_leased(&rt, &dirs);
+    let c_at = format!("127.0.0.1:{}", ports[2]);
+    rt.block_on(async {
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's replica of p3 to follow c", async || {
+            copy_of(ports[0], "p3").await.is_some_and(|lp| {
+                lp.replica_state() == ReplicaState::Following && lp.replica_lag_ms < 1000
+            })
+        })
+        .await;
+        super::super::cut_node(&dirs[2], &c_at, &dirs, true);
+        eventually_why(
+            Duration::from_secs(10),
+            "c's p3 to be fenced without its lease, not by the operator",
+            async || {
+                let r = client(ports[2])
+                    .await
+                    .status(StatusRequest::default())
+                    .await
+                    .map_err(|s| format!("c's status: {s:?}"))?;
+                let lp = r
+                    .into_inner()
+                    .partitions
+                    .into_iter()
+                    .find(|lp| lp.id == "p3");
+                match lp {
+                    Some(lp)
+                        if lp.state() == LocalPartitionState::Fenced
+                            && lp.fence_reason() != FenceReason::Operator =>
+                    {
+                        Ok(())
+                    }
+                    other => Err(format!("c's p3: {other:?}")),
+                }
+            },
+        )
+        .await;
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits_counted"].as_str().is_some_and(
+                |s| s.starts_with("a lower bound: the owner's fence isn't the operator's")
+            ),
+            "{:?}",
+            r.document
+        );
+    });
+    super::super::cut_node(&dirs[2], &c_at, &dirs, false);
+}
+
 /// Design test 2: a move of p3 with its files (`phdb cluster move`) keeps its history, so
 /// a's follower resumes from its token on the new owner, b, with no second bootstrap, and
 /// applies the writes made there.
@@ -863,18 +929,33 @@ fn a_planned_promotion_makes_the_replica_the_owner() {
 /// #2162 item 4: with the owner fenced (not closed) it still streams, so the promote waits
 /// for the copy to hear it after the fence. A write just before the fence, which the copy
 /// may not have had when the promote began, is applied, and the loss is counted exactly.
+/// The write is `Buffered` (feed1248's S1 on #2184): the owner's feed reports it durable
+/// only at its background sync, which the fence waits for, so its durable frontier is
+/// final once the fence answers.
 #[test]
 fn a_planned_promotion_from_a_fenced_owner_counts_the_loss_exactly() {
-    use crate::serve::proto::PartitionRequest;
+    use crate::serve::proto::{Durability, MutateRequest, PartitionRequest};
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    let (_dirs, ports, _stops, dbs) = following(&rt);
     rt.block_on(async {
-        put_in(ports[1], "r", "k2").await;
+        let mut w = put_row("k2", "v");
+        w.row.as_mut().unwrap().table = "r".into();
+        data(ports[1])
+            .await
+            .mutate(MutateRequest {
+                writes: Some(w),
+                durability: Durability::Buffered as i32,
+            })
+            .await
+            .unwrap();
         let req = PartitionRequest {
             partition: "p3".into(),
             ..Default::default()
         };
         client(ports[2]).await.fence(req).await.unwrap();
+        // c's p3 (`dbs[2]`): nothing it answered is still held from its feed.
+        let (frontier, visible) = (dbs[2].replication_frontier(), dbs[2].visible_seqno());
+        assert!(frontier >= visible, "{frontier} < {visible}");
         let r = within(super::super::promote::promote(
             &args_at(ports[0]),
             "p3",
