@@ -7,20 +7,23 @@
 //! ([`Pager::punch_free`](pigeonhole_pager::Pager::punch_free)), the largest past the
 //! reserve first. A pass stops when nothing is left, or after [`PunchTuning::pass_bytes`];
 //! one stopped there starts the next at once if the gate still passes, so an idle database
-//! keeps punching until it is done (g152 row 2), and sleeps between blocks to stay under [`PunchTuning::bytes_per_sec`] (on a real clock;
-//! a simulated one punches without pacing).
+//! keeps punching until it is done (g152 row 2), and sleeps between blocks to stay under
+//! [`PunchTuning::bytes_per_sec`] (on a real clock; a simulated one punches without
+//! pacing).
 //!
 //! Only free space is punched: what no recoverable root and no live view names, which
 //! the allocator would overwrite anyway. A filesystem that cannot punch (`Unsupported`)
 //! stops punching until the next open; any other error ends the pass and counts as a
 //! refusal, and the next pass waits for a trigger's worth of new free space, as after an
-//! empty one (simp724's S1 on #2034), or 10 s, whichever comes first (#2181). A poisoned pager (a failed root commit) punches
-//! nothing: the failed root may be the one recovery opens (simp724's M1).
+//! empty one (simp724's S1 on #2034), or starts at the first manifest commit (a flush, a
+//! compaction or a catalog change) 10 s after the refusal, whichever comes first (#2181).
+//! A poisoned pager (a failed root commit) punches nothing: the failed root may be the one
+//! recovery opens (simp724's M1).
 //!
 //! No pass starts or punches once the close began (`Shared::closing`), and none punches
 //! after the close released the file's locks: another writer may then have the file, and
-//! its allocator knows nothing of a block a pass took. A slice holds [`Punch`]'s `stop`
-//! lock across its last check and the punch, and `Shared::release_after_io` sets `stop`
+//! its allocator knows nothing of a block a pass took. A slice holds [`Punch`]'s `stopped`
+//! lock across its last check and the punch, and `Shared::release_after_io` sets `stopped`
 //! under that lock before it drops the locks, so it waits for a punch in flight (#2181:
 //! in application-owned mode a shard that reported its part of the close is still driven,
 //! and the last shard's release runs on another thread).
@@ -37,7 +40,9 @@ const MIB: u64 = 1 << 20;
 
 /// How long after a refused punch the gate stops waiting for new free space and punches
 /// what is there again (#2181): a transient error doesn't park punching, and one that
-/// persists fails at most once per this, not once per manifest commit (simp724's S1).
+/// persists fails at most once per this, not once per manifest commit (simp724's S1). The
+/// gate is checked at a manifest commit's reclaim, so the retry comes at the first one
+/// after this, not on a timer.
 const RETRY_AFTER_NANOS: u64 = 10_000_000_000;
 
 /// How a punch pass runs (D333's defaults; tests override them).
