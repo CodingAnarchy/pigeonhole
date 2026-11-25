@@ -2249,6 +2249,11 @@ impl FeedReader {
             return Round::Dropped;
         }
         if !complete || shares.iter().any(|h| h.outside) {
+            // The feed expires on it (#2196): each share it held is a resume point again, so
+            // the hint a token is built from stays at or before it.
+            for h in &shares {
+                self.ahead.skip(h.stream, h.start);
+            }
             return Round::Gap;
         }
         let mut raws = Vec::with_capacity(shares.len());
@@ -2345,11 +2350,13 @@ impl FeedReader {
                     ts,
                     participants,
                     stream,
+                    start,
                     end,
                     session,
                     ..
                 } => {
                     let st = &mut self.streams[stream];
+                    let was = st.delivered_end;
                     st.delivered_end = st.delivered_end.max(end);
                     if self.include_silent {
                         self.out_silent = self.silent_seen.remove(&id);
@@ -2364,6 +2371,12 @@ impl FeedReader {
                             continue;
                         }
                         Round::Gap => {
+                            // #2196: the position stays before the round, so a token taken
+                            // from the expired feed resumes into the same gap, never past
+                            // it: the Decision is a resume point again (its shares are, in
+                            // `take_round`), and its stream's end delivered goes back.
+                            self.streams[stream].delivered_end = was;
+                            self.ahead.skip(stream, start);
                             self.expired = Some(gap(key));
                             return Ok(Emitted::Nothing);
                         }
