@@ -279,11 +279,22 @@ impl Node {
     /// File `name` of partition `id`, closed here ([`Closed::file`]), and its path: what
     /// `Admin.BackupDownload`'s `fenced_file` streams (D317 ticket 6). The name is one the
     /// close's hash listed, so the path is one of the partition's own files.
+    ///
+    /// Refused while the partition is being reopened. Its close record, and the hashes it
+    /// kept, last until the reopen serves it (#2113), but its engine is open and writing
+    /// before then. The stream reads the file directly, so no writer lock would refuse it
+    /// (perf287 on #2168).
     pub(crate) fn closed_file(
         &self,
         id: &str,
         name: &str,
     ) -> Result<(PathBuf, PartitionFile), ApiError> {
+        if self.fences.is_opening(id) {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {id:?} is being reopened on this node, so its files are changing: \
+                 close it again to copy them"
+            )));
+        }
         let file = self
             .fences
             .closed(id, |closed| closed.file(id, name).cloned())

@@ -126,8 +126,9 @@ impl Node {
     /// before (and this sees its map) or runs after `join` (and sees the partition).
     /// `join` publishes the partition (its service into the node's parts); then it's served
     /// behind `gate`, at its file's `epoch` or the one its hand-over raised it to, in the
-    /// same step: `Status` shows it open only once a write routes to it (#2113).
-    /// **Blocking.**
+    /// same step: `Status` shows it open only once a write routes to it (#2113). At a node's
+    /// start, `join` publishes nothing: the parts are built after every partition is armed,
+    /// and nothing routes until the server listens (perf287's nit on #2168). **Blocking.**
     pub(crate) fn arm_ranges(
         &self,
         gate: &std::sync::Arc<WriteGate>,

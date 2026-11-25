@@ -416,6 +416,18 @@ fn a_reopening_partition_shows_open_only_once_its_writes_route() {
                 .unwrap_err();
             assert_eq!(code(&e), "PartitionUnavailable", "through {entry}: {e}");
         }
+        // Its engine is open, so its files aren't offered as a closed partition's (perf287).
+        let e = super::upload::admin(a)
+            .await
+            .backup_download(crate::serve::proto::BackupDownloadRequest {
+                partition: "p1".into(),
+                fenced_file: Some(String::new()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("being reopened"), "{e}");
         release.send(()).unwrap();
         let lp = reopen.await.unwrap().unwrap();
         assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
