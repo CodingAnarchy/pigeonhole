@@ -939,6 +939,39 @@ fn a_panicked_shard_thread_does_not_hang_close() {
     );
 }
 
+/// A shard thread panics inside a flush's manifest commit (`manifest::begin`, with the
+/// manifest writer's exclusion held; #2129). The final close runs only once that exclusion
+/// is free, so before the fix `close` waited for ever. Now the panic releases it: the flush
+/// and `close` both report an error, and no later manifest commit goes ahead.
+#[test]
+fn a_shard_panic_inside_the_flush_commit_does_not_hang_close() {
+    let (vfs, _gate) = gate::vfs(2129);
+    let db = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let t = table(&db, "t");
+    db.commit(put(&t, "row"), Some(Durability::Buffered))
+        .unwrap();
+    db.panic_next_manifest_begin();
+    let db2 = Arc::clone(&db);
+    let flushed = gate::within(10, move || db2.flush())
+        .expect("a flush whose manifest commit panicked hung (or panicked on this thread)");
+    assert!(flushed.is_err(), "{flushed:?}");
+    let db2 = Arc::clone(&db);
+    let created = gate::within(10, move || {
+        db2.create_table("after", &[("f".into(), FamilyOptions::default())])
+    })
+    .expect("a manifest commit after the panic hung");
+    assert!(
+        created.is_err(),
+        "a manifest commit went ahead after the panic"
+    );
+    let closed =
+        gate::within(10, move || db.close()).expect("close hung after a panic in the flush commit");
+    assert!(
+        matches!(closed, Err(Error::Io(ref e)) if e.to_string().contains("panicked")),
+        "{closed:?}"
+    );
+}
+
 /// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A
 /// commit on shard 0 does not wait behind that group at all: the group is applied, so it
 /// holds no visibility while its sync runs (D227). The failed sync then resolves the group

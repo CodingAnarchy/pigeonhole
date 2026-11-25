@@ -181,6 +181,12 @@ impl ManifestWriter {
         self.poisoned
     }
 
+    /// Refuses every commit until reopen: a thread panicked while it held the exclusion
+    /// (`UnwindRelease`), so what it left of the writer's state is not trusted.
+    fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     /// The version the next commit gets.
     pub(crate) fn next_version(&self) -> ManifestVersion {
         self.root.manifest_version + 1
@@ -831,6 +837,16 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         .manifest
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    // Fault injection (#2129): a panic here, with the exclusion and the writer held, as a
+    // failed assertion below would.
+    #[cfg(feature = "test-hooks")]
+    if shared
+        .hooks
+        .manifest_begin_panic
+        .swap(false, Ordering::AcqRel)
+    {
+        panic!("injected panic in manifest::begin (test hook)");
+    }
     let current = shared.view.load_full();
     let old = Arc::clone(&current.catalog);
     let mut catalog = (*old).clone();
@@ -1396,6 +1412,43 @@ pub(crate) fn release(shared: &Shared) {
     shared.manifest_flight.wake_threads();
 }
 
+/// Releases the exclusion if the thread holding it panics (#2129): armed from a `claim`
+/// until the holder releases or hands the exclusion to an in-flight commit (whose pump's
+/// drop finishes it). A panic in between (in `begin` or `end`, say) would otherwise leave
+/// the exclusion held for ever, and the final close, which runs only once it is free,
+/// with it: `Engine::close` and the drop of the last handle would wait for ever. The
+/// writer is poisoned first, so no commit goes ahead on whatever state the panic left
+/// (the close is unclean already: the dead shard failed it).
+#[must_use]
+pub(crate) struct UnwindRelease<'a>(Option<&'a Shared>);
+
+impl<'a> UnwindRelease<'a> {
+    pub(crate) fn arm(shared: &'a Shared) -> Self {
+        Self(Some(shared))
+    }
+
+    /// The holder releases or hands over the exclusion itself.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for UnwindRelease<'_> {
+    fn drop(&mut self) {
+        let Some(shared) = self.0.take() else {
+            return;
+        };
+        // Armed and dropped without `disarm`: only an unwind gets here.
+        debug_assert!(std::thread::panicking(), "an armed UnwindRelease dropped");
+        shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .poison();
+        release(shared);
+    }
+}
+
 /// Outcome of a pump's root commit (`Pager::submit_commit_root`).
 type RootResult = std::result::Result<(), pigeonhole_io::Error>;
 
@@ -1467,9 +1520,11 @@ pub(crate) fn commit_req_from_thread(
             // Release, then re-check: a request pushed after the last `begin` returned
             // `None` found the exclusion held, and its pump left; nobody else will run it.
             loop {
+                let held = UnwindRelease::arm(shared);
                 drain_sync(shared);
                 #[cfg(feature = "test-hooks")]
                 race_window(shared);
+                held.disarm();
                 release(shared);
                 if shared.manifest_queue.is_empty() || !claim(shared) {
                     break;
@@ -1481,7 +1536,9 @@ pub(crate) fn commit_req_from_thread(
         {
             // A pump's root commit completed and its shard has not run since: finish it
             // here (taking it hands its exclusion over), then look again.
+            let held = UnwindRelease::arm(shared);
             end(shared, commit, result);
+            held.disarm();
             release(shared);
             continue;
         }
@@ -1650,7 +1707,10 @@ impl Task for ManifestPump {
                     Stage::Pending => return TaskPoll::Blocked,
                     Stage::Done(commit, result) => {
                         self.inflight = None;
+                        // Taking the finished commit hands its exclusion to this thread.
+                        let held = UnwindRelease::arm(&self.shared);
                         end(&self.shared, *commit, result);
+                        held.disarm();
                         release(&self.shared);
                     }
                     // A thread blocked on the exclusion finished it (and released).
@@ -1665,8 +1725,13 @@ impl Task for ManifestPump {
                 crate::shard::trace!("manifest pump: busy, leaving");
                 return TaskPoll::Done;
             }
-            match begin(&self.shared) {
+            let held = UnwindRelease::arm(&self.shared);
+            let begun = begin(&self.shared);
+            held.disarm();
+            match begun {
                 Some(commit) => {
+                    // From here the exclusion is the in-flight commit's: this pump's drop
+                    // finishes and releases it if the shard goes away first.
                     self.start(commit, waker);
                     return TaskPoll::Blocked;
                 }

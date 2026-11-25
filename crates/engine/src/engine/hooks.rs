@@ -271,6 +271,9 @@ pub(crate) struct Hooks {
     /// `Engine::park_manifest_commits`), and the parked pump's waker.
     pub manifest_park: AtomicBool,
     pub manifest_parked: Mutex<Option<TaskWaker>>,
+    /// Panics the next `manifest::begin`, with the exclusion and the writer held
+    /// (`Engine::panic_next_manifest_begin`, #2129). One-shot.
+    pub manifest_begin_panic: AtomicBool,
     /// Keeps flush tasks that have reported alive (`flush::FlushTask`'s `run`,
     /// `Engine::park_finished_flushes`), and their wakers.
     pub flush_done_park: AtomicBool,
@@ -1582,6 +1585,17 @@ impl Engine {
     #[doc(hidden)]
     pub fn shard_died(&self) -> bool {
         self.inner.shared.shard_died.load(Ordering::Acquire)
+    }
+
+    /// Panics the next manifest commit's `begin`, on whichever thread runs it, with the
+    /// writer's exclusion held (fault injection, #2129; test hook).
+    #[doc(hidden)]
+    pub fn panic_next_manifest_begin(&self) {
+        self.inner
+            .shared
+            .hooks
+            .manifest_begin_panic
+            .store(true, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits
