@@ -139,7 +139,10 @@ impl FeedReader {
     /// D320: evicts the largest-keyed records kept while the read-ahead is over its budget,
     /// or past the cutoff, lowering the cutoff below each. A held share counts at its id + 1
     /// (its round's apply seqno is above its id), and goes with every share of its round; a
-    /// decided round goes with its shares. Returns whether it evicted anything.
+    /// decided round goes with its shares. An external share (D329) never causes an eviction
+    /// or lowers the cutoff, but once the cutoff has fallen, those held at or past it are
+    /// passed over too ([`evict_external_past_cutoff`](Self::evict_external_past_cutoff)).
+    /// Returns whether it evicted anything.
     ///
     /// Run after every record a pass keeps: the check stays inline and the eviction is out
     /// of line, so a reader that keeps up pays only the check (callgrind's feed-drain on
@@ -157,7 +160,9 @@ impl FeedReader {
     /// The largest key kept, and the largest held share's id + 1 (not a share of a round
     /// whose id + 1 is at or below `delivered`, simp724's N1 on #1622: a rewind can re-read a
     /// delivered round's share without its Decision, and evicting it would put the cutoff at
-    /// or below `delivered` for nothing; rule C drops it).
+    /// or below `delivered` for nothing; rule C drops it). External shares are left out
+    /// (ICR 0140 E3): [`evict_external_past_cutoff`](Self::evict_external_past_cutoff) passes
+    /// over those a fallen cutoff reaches.
     #[inline]
     pub(super) fn trim_tops(&self) -> (Option<Seqno>, Option<Seqno>) {
         let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
@@ -179,7 +184,8 @@ impl FeedReader {
             || top_held.is_some_and(|k| k > c)
     }
 
-    /// [`trim`](Self::trim)'s eviction, once it's due.
+    /// [`trim`](Self::trim)'s eviction, once it's due: the largest keys first, then the
+    /// external shares held at or past where the cutoff ended (#2180).
     #[cold]
     #[inline(never)]
     pub(super) fn evict_over(&mut self) {

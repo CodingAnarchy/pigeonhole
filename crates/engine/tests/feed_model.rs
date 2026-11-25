@@ -1,5 +1,6 @@
 //! The change feed's model check (D310 PR 3a; rev 3 §5): seeded runs of single-shard and
-//! cross-shard commits at every durability, flushes, clean reopens and power losses, with a
+//! cross-shard commits at every durability, rounds prepared for an external coordinator and
+//! decided later (D329, ICR 0140; #2186), flushes, clean reopens and power losses, with a
 //! durable and a visible subscriber that resume from tokens. Checked at every poll:
 //!
 //! - every delivered commit is one the run made, whole (every mutation of it, nothing else),
@@ -8,7 +9,10 @@
 //!   frontier, was delivered (M1 at every frontier);
 //! - a durable subscriber never delivers a commit a power loss then undoes, and resumes
 //!   across every reopen and power loss without expiring (retention is never passed here);
-//! - a visible one may expire after a power loss, and then starts over.
+//! - a visible one may expire after a power loss, and then starts over;
+//! - an external round is delivered once, whole, at its decision's seqno if it committed, and
+//!   never if it was aborted or is still in doubt; a round in doubt survives every reopen and
+//!   power loss.
 //!
 //! The run is single-threaded (application-owned shards driven by hand), so a seed replays.
 //!
@@ -156,6 +160,12 @@ struct Sub {
     /// A read-ahead budget of a few records in place of the 64 MiB default (D320), so the
     /// cap passes records over, rewinds and doubles its budget in the run.
     cap: Option<u64>,
+    /// A window round (`Run::window_rounds`) committed since this subscriber last had
+    /// nothing more to read: it may expire once, as a gap of a session that didn't feed.
+    gap_ok: bool,
+    /// Its next subscription is from now though it is an `oldest` one: its last start from
+    /// the oldest expired on a window round's commit, and another would again.
+    now_once: bool,
 }
 
 struct Run {
@@ -170,6 +180,24 @@ struct Run {
     /// Every commit that survives (or may), by tag.
     made: BTreeMap<u32, Made>,
     subs: Vec<Sub>,
+    /// The external rounds in doubt (#2186), by tag: prepared at `GroupSync` or `Sync`, so a
+    /// power loss keeps them, and decided some commits later. One becomes a commit in `made`
+    /// at its decision, or nothing if it's aborted.
+    doubt: BTreeMap<u32, Made>,
+    /// External rounds committed, aborted, and refused `Busy` at their prepare.
+    external: [u32; 3],
+    /// Rounds in doubt at a power loss inside fix A's window (a root commit's sidecar sync
+    /// not landed): the lost Root entry leaves the session that logged their shares outside
+    /// the feed's history, as one that didn't feed, so such a share is outside it too, and
+    /// the round's commit expires a feed that holds it (the safe direction, as the window's
+    /// own expiries are; #2192 keeps that rule).
+    window_rounds: HashSet<u32>,
+    /// Feeds expired by a window round's commit.
+    window_round_expiries: u32,
+    /// A window round committed in this run: from then on a start from the oldest can begin
+    /// before that commit with its share outside the history, and expire on it each time
+    /// (#2193's review), until retention passes it (never, here).
+    window_committed: bool,
     /// Durable subscribers expired by a power loss inside fix A's window.
     window_expiries: u32,
     /// Commits a power loss undid.
@@ -243,9 +271,10 @@ impl Run {
 
     /// (Re)subscribes `i`: from its token if it has one, else from now.
     fn subscribe(&mut self, i: usize) {
+        let now_once = std::mem::take(&mut self.subs[i].now_once);
         let start = match &self.subs[i].token {
             Some(t) => FeedStart::Token(t.clone()),
-            None if self.subs[i].oldest => FeedStart::Oldest,
+            None if self.subs[i].oldest && !now_once => FeedStart::Oldest,
             None => FeedStart::Now,
         };
         let spec = self.spec(self.subs[i].durable, start);
@@ -313,6 +342,96 @@ impl Run {
             },
         );
         pc
+    }
+
+    /// The xid of external round `tag`.
+    fn xid(tag: u32) -> Vec<u8> {
+        format!("x{tag}").into_bytes()
+    }
+
+    /// Prepares external round `tag` (D329): one share, or one on each table's shard with the
+    /// coordinator's side chosen by the tag. It stays in doubt until [`Run::decide`]. A
+    /// prepare refused `Busy` (ICR 0140: what a plain commit would retry) made nothing.
+    fn prepare(&mut self, tag: u32, cross: bool, durability: Durability) {
+        let row = tag.to_string().into_bytes();
+        let mut tables: Vec<&Arc<TableInfo>> = if cross {
+            self.tables.iter().collect()
+        } else {
+            vec![&self.tables[(tag as usize) % 2]]
+        };
+        if tag % 2 == 1 {
+            tables.reverse();
+        }
+        let mut txn = self.db().begin().unwrap();
+        let mut rows = Vec::new();
+        for t in tables {
+            txn.batch()
+                .put(
+                    t.id,
+                    t.families[0].id,
+                    &row,
+                    b"q",
+                    None,
+                    ValueRef::Bytes(&row),
+                )
+                .unwrap();
+            rows.push((t.id, row.clone()));
+        }
+        let pc = txn.submit_prepare(&Self::xid(tag), durability).unwrap();
+        match drive(&mut self.shards, pc) {
+            Ok(_) => {
+                self.doubt.insert(
+                    tag,
+                    Made {
+                        rows,
+                        seqno: 0,
+                        durability,
+                    },
+                );
+            }
+            Err(pigeonhole_engine::Error::Busy) => self.external[2] += 1,
+            Err(e) => panic!("seed {}: prepare {tag}: {e}", self.seed),
+        }
+    }
+
+    /// Decides external round `tag`: a commit is a commit the run made from here on, at the
+    /// decision's seqno; an abort leaves nothing.
+    fn decide(&mut self, tag: u32, commit: bool) {
+        let mut m = self.doubt.remove(&tag).expect("in doubt in the model");
+        let pc = self
+            .db()
+            .submit_decide(&Self::xid(tag), commit)
+            .unwrap()
+            .unwrap_or_else(|| panic!("seed {}: round {tag} not in doubt", self.seed));
+        let info = drive(&mut self.shards, pc)
+            .unwrap_or_else(|e| panic!("seed {}: decide {tag}: {e}", self.seed));
+        let window = self.window_rounds.remove(&tag);
+        if commit {
+            m.seqno = info.seqno;
+            self.made.insert(tag, m);
+            self.external[0] += 1;
+            if window {
+                self.window_committed = true;
+                for sub in &mut self.subs {
+                    sub.gap_ok = true;
+                }
+            }
+        } else {
+            self.external[1] += 1;
+        }
+    }
+
+    /// The engine's rounds in doubt are the model's: after every open.
+    fn check_in_doubt(&self) {
+        let mut have: Vec<Vec<u8>> = self.db().in_doubt().into_iter().map(|(x, _)| x).collect();
+        have.sort();
+        let mut want: Vec<Vec<u8>> = self.doubt.keys().map(|&t| Self::xid(t)).collect();
+        want.sort();
+        assert_eq!(
+            have, want,
+            "seed {}: the rounds in doubt after an open",
+            self.seed
+        );
     }
 
     /// A burst of `None` and `Buffered` commits, a few shard turns (the visible subscriber
@@ -411,6 +530,7 @@ impl Run {
                         // M1 at this frontier: every surviving commit at or below it past
                         // the subscriber's start was delivered. The position too: it is
                         // the frontier of the read pass that found nothing (ICR 0114).
+                        sub.gap_ok = false;
                         let frontier = r.frontier();
                         let position = r.position().seqno;
                         assert!(
@@ -441,10 +561,25 @@ impl Run {
                         }
                         break;
                     }
+                    Next::Expired(e)
+                        if (sub.gap_ok || (sub.oldest && self.window_committed))
+                            && e.reason.contains("did not feed these tables") =>
+                    {
+                        sub.now_once = sub.oldest;
+                        // A window round's commit: the feed starts over, from now (or from
+                        // the oldest again).
+                        sub.gap_ok = false;
+                        sub.token = None;
+                        sub.reader = None;
+                        self.window_round_expiries += 1;
+                        self.subscribe(i);
+                        continue;
+                    }
                     Next::Expired(e) => {
                         panic!(
-                            "seed {seed}: expired without cause (durable {}): {e:?}",
-                            sub.durable
+                            "seed {seed}: expired without cause (durable {}, process {}, oldest \
+                             {}): {e:?}",
+                            sub.durable, sub.process, sub.oldest
                         )
                     }
                     Next::Catalog(e) => {
@@ -487,12 +622,15 @@ impl Run {
                     assert!(
                         !(m.seqno != 0 && m.seqno > prev && m.seqno < c.seqno),
                         "seed {seed}: commit {t} (seqno {}, {:?}) skipped between {prev} and {} \
-                         (durable {}, process {}; delivered tail {:?}, last {})",
+                         (durable {}, process {}, oldest {}, cap {:?}; delivered tail {:?}, last \
+                         {})",
                         m.seqno,
                         m.durability,
                         c.seqno,
                         sub.durable,
                         sub.process,
+                        sub.oldest,
+                        sub.cap,
                         &sub.delivered[sub.delivered.len().saturating_sub(4)..],
                         sub.last
                     );
@@ -527,6 +665,7 @@ impl Run {
         let shards = std::mem::take(&mut self.shards);
         close_app_owned(db, shards);
         self.open();
+        self.check_in_doubt();
         for i in 0..self.subs.len() {
             if !self.subs[i].process {
                 self.subscribe(i);
@@ -551,6 +690,9 @@ impl Run {
         // A root commit whose sidecar sync hasn't landed: its Root entry may be lost with the
         // power, which expires every token (the window fix A leaves, the safe direction).
         let root_unsynced = self.db().feed_sidecar_sync_pending();
+        if root_unsynced {
+            self.window_rounds.extend(self.doubt.keys().copied());
+        }
         // A power loss ends every process, the reader's too.
         self.reader_db = None;
         self.vfs.crash(CrashKind::Power);
@@ -558,6 +700,7 @@ impl Run {
         self.db = None;
         self.open();
         self.open_reader();
+        self.check_in_doubt();
         // Which commits survived: a power loss may undo `None` and `Buffered` ones.
         let mut lost = Vec::new();
         for (tag, m) in &self.made {
@@ -627,15 +770,19 @@ impl Run {
                     // Fix A's window: a lost Root entry breaks the session chain, which
                     // shows at the token ("another session wrote") or at the first record
                     // past it ("a session that did not feed these tables wrote").
+                    // Or a window round's commit, not read before this power loss: its
+                    // expiry comes at the resume.
                     !durable
                         || (root_unsynced
                             && (reason.contains("another session wrote")
-                                || reason.contains("did not feed these tables"))),
+                                || reason.contains("did not feed these tables")))
+                        || (self.subs[i].gap_ok && reason.contains("did not feed these tables")),
                     "seed {}: the durable feed expired after a power loss: {reason} \
                      (a sidecar sync in flight: {root_unsynced})",
                     self.seed
                 );
                 self.window_expiries += u32::from(durable);
+                self.subs[i].gap_ok = false;
                 self.subs[i].token = None;
             } else if !durable && self.subs[i].delivered.iter().any(|d| lost.contains(&d.1)) {
                 self.subs[i].token = None;
@@ -691,6 +838,11 @@ fn run(seed: u64) {
         reader_db: None,
         shards: Vec::new(),
         made: BTreeMap::new(),
+        doubt: BTreeMap::new(),
+        external: [0; 3],
+        window_rounds: HashSet::new(),
+        window_round_expiries: 0,
+        window_committed: false,
         // A durable and a visible subscriber in the writer, and the same in a reader process;
         // two that subscribe from the oldest each time (#1465): a durable one in the writer
         // and a visible one in the reader process; and two with a read-ahead of a few
@@ -716,6 +868,8 @@ fn run(seed: u64) {
             last: 0,
             position: 0,
             cap: capped.then(|| 200 + rng.below(1000)),
+            gap_ok: false,
+            now_once: false,
         })
         .collect(),
         window_expiries: 0,
@@ -733,10 +887,24 @@ fn run(seed: u64) {
         Durability::Sync,
     ];
     let mut reopens = HashMap::new();
+    let mut xrng = Rng(seed ^ 0x2186_2186_2186_2186);
     for tag in 0..240u32 {
         let durability = levels[rng.below(4) as usize];
         let cross = run.shards_n > 1 && rng.below(3) == 0;
         run.commit(tag, cross, durability);
+        // External rounds (#2186), from their own generator so the run's other choices are
+        // what they were: about one prepare every four commits, each decided a few commits
+        // later (three in four commit), so a few are in doubt across most reopens.
+        if xrng.below(4) == 0 {
+            let durability = levels[2 + xrng.below(2) as usize];
+            let cross = run.shards_n > 1 && xrng.below(3) != 0;
+            run.prepare(100_000 + tag, cross, durability);
+        }
+        if !run.doubt.is_empty() && xrng.below(4) == 0 {
+            let n = xrng.below(run.doubt.len() as u64) as usize;
+            let round = *run.doubt.keys().nth(n).unwrap();
+            run.decide(round, xrng.below(4) != 0);
+        }
         match rng.below(40) {
             0..=7 => run.poll(),
             8 => {
@@ -773,6 +941,13 @@ fn run(seed: u64) {
             _ => {}
         }
     }
+    // The rounds still in doubt commit, all but the last, which is aborted.
+    let left: Vec<u32> = run.doubt.keys().copied().collect();
+    for (i, round) in left.iter().enumerate() {
+        run.decide(*round, i + 1 < left.len());
+    }
+    // Read now: a feed a window round's commit expires starts over before the last commit.
+    run.poll();
     // Everything synced, then every surviving commit is delivered to both.
     let flush = run.db().submit_flush().unwrap();
     drive(&mut run.shards, flush).unwrap();
@@ -809,11 +984,14 @@ fn run(seed: u64) {
     }
     eprintln!(
         "seed {seed}: {} shards, {} commits kept, {} lost, reopens {reopens:?}, window \
-         expiries {}",
+         expiries {}, external rounds committed, aborted and refused {:?}, feeds expired by \
+         a window round's commit {}",
         run.shards_n,
         run.made.len(),
         run.lost_total,
-        run.window_expiries
+        run.window_expiries,
+        run.external,
+        run.window_round_expiries
     );
     let db = run.db.take().unwrap();
     for sub in &mut run.subs {
