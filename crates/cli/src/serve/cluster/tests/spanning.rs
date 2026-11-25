@@ -1003,17 +1003,15 @@ fn a_token_cluster_settles_a_share_across_nodes(lose: bool) {
                 async || !in_doubt(&t, &id),
             )
             .await;
-            assert!(
-                t.dbs[0]
-                    .table("users")
-                    .unwrap()
-                    .open()
-                    .unwrap()
-                    .get(b"alice", "f", b"q")
-                    .unwrap()
-                    .is_some(),
-                "p1 applied the commit"
-            );
+            // The share leaves the in-doubt registry before its decision is written and
+            // applied (the engine's `on_external_decide`), so its row shows a moment later.
+            let users = t.dbs[0].table("users").unwrap().open().unwrap();
+            eventually_within(
+                Duration::from_secs(30),
+                "p1 applied the commit",
+                async || users.get(b"alice", "f", b"q").unwrap().is_some(),
+            )
+            .await;
             return;
         }
         seams::lose_ack(&id);
