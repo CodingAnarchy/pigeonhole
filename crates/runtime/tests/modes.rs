@@ -756,8 +756,9 @@ fn sleeping_task_fires_on_time_real(mode: Mode) {
     h.submitter(0).submit(Msg::Spawn(Box::new(task))).unwrap();
     // A plain thread sleeping to the same deadline: how late this machine wakes a parked
     // thread right now. A loaded runner can wake any thread hundreds of milliseconds late
-    // (main's macOS CI: 263 ms), which is not the shard's lateness. It sits on the CPUs the
-    // shard's driver may run on, so it waits for them as the driver does: on Windows a
+    // (main's macOS CI: 263 ms), which is not the shard's lateness. It sits on the driver's
+    // CPU (one driver here, since there is one shard; with more, the reference would share
+    // only some of their CPUs), so it waits for that CPU as the driver does: on Windows a
     // pinned thread waits out a busy unpinned one's scheduler quantum (100-200 ms) on its
     // CPU, which an unpinned reference never sees (#2224).
     let cpus = h.driver_cpus();
