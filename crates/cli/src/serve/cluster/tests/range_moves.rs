@@ -235,6 +235,79 @@ fn an_opening_partition_gates_a_moved_range_from_its_file() {
     let _ = db.close();
 }
 
+/// #2153, simp724's Q1 on #2214: a partition opening with a move's `newest/<id>` row (a
+/// target whose move left the map before it settled, or a promoted copy of one that did:
+/// the floor isn't replicated, the row is) raises its timestamp floor past it before it
+/// serves, so a default-stamped write sorts after the copied cells.
+#[test]
+fn an_opening_partition_raises_its_floor_past_a_moves_newest_row() {
+    use pigeonhole::Family;
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    let n = node(&dir, "a");
+    n.push_map(the_map(1, &ports), None).unwrap();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("p1.phdb"),
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap();
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+        + 3_600_000_000;
+    db.table(super::super::identity::TABLE)
+        .unwrap()
+        .family("moved", Family::default())
+        .create_if_missing()
+        .unwrap()
+        .mutate(b"newest/mv9")
+        .put("moved", b"ts", ahead.to_string().as_bytes())
+        .commit()
+        .unwrap();
+    let users = db
+        .table("users")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 1, &db, || ()).unwrap();
+    users.mutate(b"a").put("f", b"q", b"new").commit().unwrap();
+    let stamped = users.get(b"a", "f", b"q").unwrap().unwrap().timestamp();
+    assert!(stamped > ahead, "{stamped} <= {ahead}");
+    let _ = db.close();
+}
+
+/// audit120 on #2214: the open's read of the `newest/` rows creates nothing: a partition
+/// that never took a move opens without the progress family.
+#[test]
+fn an_opening_partition_with_no_move_creates_no_progress_family() {
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    let n = node(&dir, "a");
+    n.push_map(the_map(1, &ports), None).unwrap();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("p1.phdb"),
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 1, &db, || ()).unwrap();
+    let family = match db
+        .table(super::super::identity::TABLE)
+        .and_then(|b| b.open())
+    {
+        Ok(t) => t.families().contains(&"moved"),
+        Err(e) => {
+            assert_eq!(e.code(), pigeonhole::ErrorCode::TableNotFound, "{e}");
+            false
+        }
+    };
+    assert!(!family, "the open created the progress family");
+    let _ = db.close();
+}
+
 /// simp724's B3, the crash case: the map at the hand-over's epoch persisted, the source's
 /// file still at the epoch before (a crash before the stamp). Its open finishes the
 /// hand-over: the row, then the stamp, and it opens at the map's epoch.
@@ -1790,6 +1863,117 @@ fn a_row_deleted_and_compacted_on_the_source_after_its_copy_is_gone_on_the_targe
         }
     });
     let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// #2153 (D331): before it serves the range, the target raises its timestamp floor past
+/// every cell it copied, so a default-stamped write it takes there sorts after them, whatever
+/// the two nodes' clocks. The source holds `c1` (copied) and then `c2` (through the
+/// catch-up) an hour ahead of every clock, as a source whose floor leads the target's clock
+/// does. Once the target serves, a put of each through the cluster reads back, not the
+/// copied value.
+#[test]
+fn a_targets_default_stamped_write_sorts_after_every_cell_it_copied() {
+    copied_ahead_then_written(true);
+}
+
+/// #2153, audit120's and simp724's P1 on #2214: a target that never takes the move's
+/// CLEANING map (down from the hand-over until the record left the map) raises its floor
+/// in the reconcile that prunes the move's progress rows, before it serves the range.
+#[test]
+fn a_target_that_skips_cleaning_raises_its_floor_before_it_serves() {
+    copied_ahead_then_written(false);
+}
+
+/// The two tests above: `cleaning`, the target takes the CLEANING map; else the map goes
+/// from HANDED_OVER straight to one without the move.
+fn copied_ahead_then_written(cleaning: bool) {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+        + 3_600_000_000;
+    let src = t.db_a.table("users").unwrap().open().unwrap();
+    src.mutate(b"c1")
+        .put_at("f", b"q", ahead, b"copied")
+        .commit()
+        .unwrap();
+    let base = t.rt.block_on(async {
+        client(c)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    let v = base.map_version;
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+    });
+    src.mutate(b"c2")
+        .put_at("f", b"q", ahead + 1, b"caught up")
+        .commit()
+        .unwrap();
+    t.rt.block_on(async {
+        if cleaning {
+            finish_move(&t, &base, v + 2).await;
+        } else {
+            handed_over_then_done(&t, &base, v + 2).await;
+        }
+        eventually("p2 serves the range", async || {
+            get_row(c, "c1").await.is_ok_and(|v| v.is_some())
+        })
+        .await;
+        assert_eq!(get_row(c, "c1").await.unwrap(), Some(b"copied".to_vec()));
+        assert_eq!(get_row(c, "c2").await.unwrap(), Some(b"caught up".to_vec()));
+        for row in ["c1", "c2"] {
+            try_put(c, row, "new").await.unwrap();
+            assert_eq!(
+                get_row(c, row).await.unwrap(),
+                Some(b"new".to_vec()),
+                "{row}: the target's write sorts after the copied cell"
+            );
+        }
+    });
+    if cleaning {
+        assert!(
+            super::super::range_follow::newest_ts(&t.db_b, "mv1").unwrap() > ahead,
+            "the catch-up's cell raised the newest timestamp"
+        );
+    } else {
+        assert_eq!(
+            super::super::range_follow::newest_ts(&t.db_b, "mv1").unwrap(),
+            0,
+            "the reconcile pruned the move's rows, after it raised the floor"
+        );
+    }
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// [`finish_move`], but the map goes from HANDED_OVER (the target caught up past the last
+/// seqno) straight to one without the move: the target never sees CLEANING.
+async fn handed_over_then_done(t: &Three, base: &ClusterMap, v: u64) {
+    let (b, ports) = (t.ports[1], &t.ports);
+    push(ports, &moving(base, v, Some(MovePhase::CatchingUp))).await;
+    push(ports, &moving(base, v + 1, Some(MovePhase::HandingOver))).await;
+    let last = t.db_a.visible_seqno();
+    let mut handed = moving(base, v + 2, Some(MovePhase::HandedOver));
+    handed.moves[0].final_seqno = last;
+    push(ports, &handed).await;
+    eventually("b's catch-up passes the move's last seqno", async || {
+        move_status(b, "p2", "mv1")
+            .await
+            .is_some_and(|s| s.source_applied_seqno >= last)
+    })
+    .await;
+    push(ports, &moving(base, v + 3, None)).await;
 }
 
 /// simp724 on the M-a fix: a stop that comes inside a row spanning several commits, with

@@ -1154,6 +1154,68 @@ fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
     });
 }
 
+/// #2156: a promotion that stopped between the copy's promote and its identity (a crash
+/// there) leaves a primary at the copy's bootstrap epoch, with the promote's intent beside
+/// it. Without that intent the file is refused, as one the map moved past; with it, the
+/// rerun writes the identity and finishes.
+#[test]
+fn a_promotion_stopped_between_its_promote_and_its_identity_finishes_when_run_again() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::stamp::STOP_AFTER_PROMOTE
+            .lock()
+            .unwrap()
+            .push(dirs[0].clone());
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("stopped");
+        assert!(
+            e.message()
+                .contains("between the copy's promote and its identity"),
+            "{}",
+            e.message()
+        );
+        let (node, epoch, _, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1), "the map didn't move");
+        let intent = super::super::stamp::promote_intent(&dirs[0], "p3");
+        assert!(intent.exists(), "{}", intent.display());
+        // Without its intent, the primary at the bootstrap epoch is refused.
+        let aside = intent.with_extension("aside");
+        std::fs::rename(&intent, &aside).unwrap();
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("refused");
+        assert!(e.message().contains("already a primary"), "{}", e.message());
+        std::fs::rename(&aside, &intent).unwrap();
+        let r = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let (node, epoch, history, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        assert!(!intent.exists(), "the intent is removed once done");
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
 /// simp724's M1 on #2007: a promote that stopped after its stamp doesn't overwrite a map
 /// someone changed since. Here a set-map put a back in p3's replicas: the rerun refuses,
 /// says what it found, and the map stays as that set-map left it.

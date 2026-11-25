@@ -146,6 +146,8 @@ impl Node {
                 },
             }
         }
+        #[cfg(test)]
+        super::hold_install(&self.dir);
         let canonical = map::canonical(derived.as_ref().unwrap_or(map));
         let json = map::canonical_json(&canonical);
         write_map(&self.dir, &json)

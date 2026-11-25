@@ -1131,7 +1131,10 @@ impl Node {
     pub(crate) fn apply_leases(&self, round: &Round) {
         let end = super::lease::holder_end(round.t0, self.grants.lease());
         let st = self.state();
-        if st.version() != round.map.map_version {
+        // The round's map by `(writer_term, map_version)`, not the version alone (#2159 item
+        // 4): a deposed writer's map and the elected writer's can share a version.
+        let same = |m: &ClusterMap| (m.writer_term, m.map_version);
+        if st.map.as_ref().map(|(m, _)| same(m)) != Some(same(&round.map)) {
             return;
         }
         self.fences.for_served(|id, s| {
