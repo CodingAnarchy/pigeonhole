@@ -817,6 +817,96 @@ fn a_spanning_transactions_outcome_is_its_tokens_alone_while_its_session_lasts()
     });
 }
 
+/// A call of transaction `id` that pauses at `Step::Forwarded` (its branch rows sent) and
+/// is cancelled there, as a client that goes away or whose deadline passes: the pause is
+/// never released, so the call can only end by being dropped where it waits. Then `again`
+/// is tried until the session answers for itself (the cancel has to reach the home's node
+/// first), and its answer is returned.
+async fn cancelled_after_forwarding<T, F, R, G, S>(
+    id: &str,
+    call: F,
+    again: G,
+) -> Result<R, tonic::Status>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+    G: Fn() -> S,
+    S: std::future::Future<Output = Result<R, tonic::Status>>,
+    R: std::fmt::Debug,
+{
+    use crate::serve::cluster::spanning::seams::{self, Step};
+    let pause = seams::pause(id, Step::Forwarded);
+    let first = tokio::spawn(call);
+    pause.reached.notified().await;
+    first.abort();
+    let _ = first.await;
+    let mut second = again().await;
+    let mut tries = 0;
+    while let Err(e) = &second {
+        if !matches!(code(e).as_str(), "SessionBusy" | "InProgress") || tries == 200 {
+            break;
+        }
+        tries += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        second = again().await;
+    }
+    assert!(
+        !matches!(&second, Err(e) if matches!(code(e).as_str(), "SessionBusy" | "InProgress")),
+        "the cancelled call never let go of the session: {second:?}"
+    );
+    drop(pause);
+    second
+}
+
+#[test]
+fn a_call_cancelled_after_its_branch_rows_went_out_ends_the_transaction() {
+    // #2157: a `Commit` carries a counter's increment for a branch (p1) and a row for its
+    // home (p2). The client goes away once the increment has reached the branch and before
+    // the commit's round starts, then sends the same `Commit` again, as a client with no
+    // answer does. Before the fix the session was put back open, the second `Commit` sent
+    // the increment again and committed, and the counter read 2. Now the cancelled call
+    // ends the transaction: the second `Commit` is told so (`Conflict`, retry the
+    // transaction) and nothing was applied. The same for a `TxnWrite` cut short.
+    let t = Three::start(["", "", ""]);
+    let [_, _, c] = t.ports;
+    t.rt.block_on(async {
+        use super::several::{add_counter, counter, incr_row};
+        add_counter(&t.ports, c).await;
+        let rows = || vec![incr_row("alice", 1), put_row("zed", "1")];
+
+        let id = begin_spanning(c, "zed").await.unwrap();
+        let first = {
+            let (id, rows) = (id.clone(), rows());
+            async move { commit_parts(c, &id, rows).await }
+        };
+        let second = cancelled_after_forwarding(&id, first, || commit_parts(c, &id, rows())).await;
+        let e = second.expect_err("the cancelled Commit ended the transaction");
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert!(e.message().contains("cancelled part-way"), "{e}");
+        assert_eq!(counter(c, "alice").await, 0);
+        assert_eq!(get_row(c, "zed").await.unwrap(), None);
+
+        // A `TxnWrite` cut short the same way: its retry finds the transaction ended, and
+        // so does a `Commit`.
+        let id = begin_spanning(c, "zed").await.unwrap();
+        let first = {
+            let (id, rows) = (id.clone(), rows());
+            async move { txn_write(c, &id, rows, None).await }
+        };
+        let second =
+            cancelled_after_forwarding(&id, first, || txn_write(c, &id, rows(), None)).await;
+        assert!(second.is_err(), "{second:?}");
+        let e = commit_parts(c, &id, Vec::new()).await.unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert_eq!(counter(c, "alice").await, 0);
+
+        // A whole transaction after that applies the increment once.
+        let id = begin_spanning(c, "zed").await.unwrap();
+        commit_parts(c, &id, rows()).await.unwrap();
+        assert_eq!(counter(c, "alice").await, 1);
+    });
+}
+
 #[test]
 fn a_transaction_ended_by_a_lost_branch_write_answer_says_it_didnt_commit() {
     // #2161: a home's write to a branch is taken there, but its answer is lost, which is
