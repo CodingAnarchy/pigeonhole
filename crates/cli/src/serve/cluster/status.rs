@@ -240,6 +240,10 @@ impl Node {
                 if let Some(part) = open.get(&id) {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
+                    #[cfg(test)]
+                    if let Some(at) = super::load::load_for(&self.dir) {
+                        (lp.load_cpu, lp.load_device, lp.load) = (at, at, at);
+                    }
                     // D331 PR 5's plan: absent until the first interval ends.
                     lp.write_bytes_rate = l.write_rate.map(|r| r as u64);
                     lp.file_bytes = used_bytes(&part.db);

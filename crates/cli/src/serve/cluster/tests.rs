@@ -249,6 +249,25 @@ async fn eventually_within(limit: Duration, what: &str, mut cond: impl AsyncFnMu
     panic!("{what}: never happened within {limit:?}");
 }
 
+/// [`eventually_within`], with `cond` saying why it isn't so yet: the last reason is in the
+/// panic, so a wait that runs out on CI names the step that stalled (#2162).
+async fn eventually_why(
+    limit: Duration,
+    what: &str,
+    mut cond: impl AsyncFnMut() -> Result<(), String>,
+) {
+    let until = tokio::time::Instant::now() + limit;
+    let mut why = String::new();
+    while tokio::time::Instant::now() < until {
+        match cond().await {
+            Ok(()) => return,
+            Err(w) => why = w,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{what}: never happened within {limit:?}; last: {why}");
+}
+
 /// Runs `test` on a thread of its own and fails if it isn't done within `limit`, so a test
 /// that would hang (a call that never answers, a stuck runtime) fails instead (#1865). A
 /// panic in `test` is the test's.
