@@ -260,10 +260,12 @@ pub(crate) async fn promote(
     let operator_fenced = owner.as_ref().is_some_and(|lp| {
         lp.state() == S::Fenced && lp.fence_reason() == proto::FenceReason::Operator
     });
+    // Whether the fence again answered, and then whether the copy settled: each failure
+    // says which step fell short (feed1248's N4 on #2184).
+    let refenced =
+        operator_fenced && url(to).is_some() && fence_again(args, &old_url, partition).await;
     let settled = match url(to) {
-        Some(to_url) if operator_fenced && fence_again(args, &old_url, partition).await => {
-            settle(args, &to_url, partition).await
-        }
+        Some(to_url) if refenced => settle(args, &to_url, partition).await,
         _ => false,
     };
     let ops = CliOps {
@@ -309,6 +311,10 @@ pub(crate) async fn promote(
                 } else if !operator_fenced {
                     "a lower bound: the owner's fence isn't the operator's (its lease lapsed, \
                      or it awaits its peers' map), so commits it made durable after the \
+                     copy's last message aren't counted"
+                } else if !refenced {
+                    "a lower bound: fencing the owner again didn't answer within 3 s, so its \
+                     durable seqno may not be final, and commits it made durable after the \
                      copy's last message aren't counted"
                 } else {
                     "a lower bound: the fenced owner's final durable seqno didn't reach the \
