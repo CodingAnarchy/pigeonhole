@@ -1148,10 +1148,10 @@ impl Replica {
             }
             let failed = match halt {
                 Halt::Stopped => return,
-                // A stop the follow already took is never `changed()` again: one that came as
-                // its last apply failed ends here, not in a bootstrap or a pause whose stop
-                // would never fire (#2162 item 3: a close, and a promote's wait for it, could
-                // stall that long).
+                // Defensive (#2162 item 3): a stop seen before a bootstrap or a pause ends here.
+                // Nothing between follow's selects and here consumes one today, so their own
+                // `changed()` would fire; this keeps a stop from being waited out if that
+                // changes.
                 _ if *stop.borrow() => return,
                 Halt::Expired(why) => {
                     self.fail(State::ReBootstrapping, why);
@@ -1166,7 +1166,7 @@ impl Replica {
             if let Some(e) = failed {
                 self.fail(State::Retrying, e);
             }
-            // The same for a stop a bootstrap took as it failed.
+            // The same before the pause (defensive, as above).
             if *stop.borrow() {
                 return;
             }
