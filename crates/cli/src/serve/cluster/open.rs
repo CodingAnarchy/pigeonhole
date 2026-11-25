@@ -867,6 +867,17 @@ impl Node {
     /// replica here to resume from, or for `drop-partition` to move aside.
     pub(crate) async fn close_replica(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
         let _one = self.opening.lock().await;
+        // The map as it is now, as an open reads it (#2162 item 2): a pass that read an
+        // older map, which dropped this node from P's replicas, can reach here after a newer
+        // one listed it again and found the copy open. Closing it then would leave the map
+        // listing a copy that nothing reopens until the next map.
+        if self.get_map().is_ok_and(|m| {
+            m.partitions
+                .iter()
+                .any(|p| p.id == id && p.replicas.contains(&self.id))
+        }) {
+            return Ok(());
+        }
         let Some(server) = self.server.get() else {
             return Ok(());
         };

@@ -4,7 +4,7 @@ Small database files that every later build must open, read, check and write (D2
 
 `format4/<entry>/` holds one database:
 - `data.phdb`, the main file;
-- `data.phdb-wal-N`, the WAL files of an entry left crashed (`wal_crash`), or of one whose change feed retains history (`feed`). The other clean entries closed cleanly, so they have none;
+- `data.phdb-wal-N`, the WAL files of an entry left crashed (`wal_crash`, `xshard_crash`), or of one whose change feed retains history (`feed`). The other clean entries closed cleanly, so they have none;
 - `data.phdb-feed`, the change feed's sidecar, in the `feed` entries;
 - `expected.txt`, every cell the generating build read back, one per line: table, row (hex), family, qualifier (hex), timestamp, value. A vector value is its element, dimension and stored bytes;
 - `expected-extra.txt`, in the entries built on the public API: what the generating build's text index, vector index or memory store `verify` reported, or the commits a feed resumed from a stored token delivered. The check compares what the checking build reads with it;
@@ -18,7 +18,7 @@ Small database files that every later build must open, read, check and write (D2
 | `counters` | a counter family over 2 shards, partly flushed |
 | `blobs` | separated values, half overwritten and compacted |
 | `merge` | a family with a custom merge operator (`corpus.concat`, which the check registers) |
-| `wal_crash` | 2 shards, flushed rows, then synced single and cross-shard commits a process crash left only in the WAL |
+| `wal_crash` | 2 shards, flushed rows, then synced commits of one and several rows a process crash left only in the WAL. They're all in one table, on one shard, so on one WAL stream |
 | `families` | every family setting the manifest records (TTL, version limit, bloom bits, block size, cache priority, tiered and FIFO compaction), flushed three times and compacted, beside a table created, written, flushed and dropped |
 | `wal_ops` | 2 shards, a flushed base, then one synced batch per operation (bytes, i64 and f64 puts, every delete kind, counter increments, merge operands, a separated value, rows on both shards, a row deleted) a process crash left only in the WAL |
 | `checkpoints` | a counter family whose reads kept D291 bases, flushed: level 0 holds the bases beside increments flushed after them |
@@ -35,6 +35,7 @@ Small database files that every later build must open, read, check and write (D2
 | `text_packed` | a packed `pigeonhole-text` index (#1585, ICR 0143: layout version 2, which 1.2 can't open) with positions: 300 documents over a small vocabulary, packed into blocks, then a rewrite, a delete and new documents as posting cells beside the blocks. `expected-extra.txt` adds the packed postings and tombstones counts, and a phrase search's and a term search's ids |
 | `spanning_txn` | `incompat` bit 2 (D329, ICR 0140), with `__unstable-txn-prepare`: over 2 shards with the change feed on, transactions prepared for an external coordinator, one committed and one aborted, each with writes on both shards (so an External Prepare on each WAL stream and a decision naming both; `spanning_txn_shares_are_on_both_streams` checks the files), one with reads and no writes committed, and an xid-tagged commit, left by a process crash so the reopen replays the External Prepare, Decision and External Abort records. None is left in doubt. The check resumes a table feed: the committed changes with their xids, nothing of the aborted one |
 | `range_move` | `incompat` bit 3 (D331, ICR 0141), with `__unstable-replication`: over 2 shards with the change feed on, what a range move leaves: feed-silent batches (a move's copy, one carrying tombstones: a column delete with a newer value after it, and a cell delete), the timestamp floor raised, and Range Drops of flushed and unflushed rows, one bounded and one open-ended (its cleanup), between ordinary commits, left by a process crash. The check resumes a table feed, which passes over the silent commits and the drop |
+| `xshard_crash` | 2 shards, two tables on different shards, flushed rows, then synced cross-shard write batches and transactions (each with rows in both tables) a process crash left only in the WAL: a Prepare on each WAL stream and a Decision naming both, which the reopen replays (#2145; `xshard_crash_prepares_are_on_both_streams` checks the files) |
 
 The check copies each entry to a temporary directory, opens it with the real filesystem, and compares every cell with `expected.txt`. It then writes a row through a flush and a compaction, closes, runs the offline check, reopens, and reads everything again.
 
