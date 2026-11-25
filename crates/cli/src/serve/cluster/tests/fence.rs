@@ -3246,6 +3246,13 @@ fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
 /// a again, and an ABORT event is recorded. With `tokens`, under the cluster token alone
 /// (audit120's M1 on #2103).
 fn an_earlier_writers_move_is_aborted(tokens: &str) {
+    an_earlier_writers_move_is_aborted_with(tokens, false);
+}
+
+/// [`an_earlier_writers_move_is_aborted`]; with `unfence_fails`, the abort's unfence fails
+/// once (#2151): the record is already gone, so the balancer keeps the unfence and its next
+/// pass sends it again. Before the fix nothing retried, and p1 stayed closed on a.
+fn an_earlier_writers_move_is_aborted_with(tokens: &str, unfence_fails: bool) {
     use crate::serve::cluster::moving::{STOP, Start, Step};
     use crate::serve::proto::{BalancerEventKind, MovePhase};
     let mut t = Rig::start_with(tokens);
@@ -3279,6 +3286,11 @@ fn an_earlier_writers_move_is_aborted(tokens: &str) {
         .expect("stopped after the stamp");
         let (id, from, phase) = bal_record(&map_of_as(a, tok).await).expect("recorded");
         assert_eq!((from.as_str(), phase), ("p1", MovePhase::HandingOver));
+        if unfence_fails {
+            // Whichever node is the writer: only its balancer takes its entry.
+            let mut fail = super::super::balancing::FAIL_UNFENCE.lock().unwrap();
+            fail.extend(t.dirs.iter().cloned());
+        }
         balancer_map(&t, tok, |m| {
             m.set_balancer(crate::serve::proto::BalancerMode::On);
         })
@@ -3294,12 +3306,26 @@ fn an_earlier_writers_move_is_aborted(tokens: &str) {
         .await;
         assert!(!t.dirs[2].join("p1.phdb").exists(), "c's copy went aside");
         eventually_within(
-            Duration::from_secs(10),
+            Duration::from_secs(if unfence_fails { 30 } else { 10 }),
             "p1 to serve on a again",
             async || local_as(a, "p1", tok).await.state() == LocalPartitionState::Serving,
         )
         .await;
+        if unfence_fails {
+            let fail = super::super::balancing::FAIL_UNFENCE.lock().unwrap();
+            let armed = t.dirs.iter().filter(|d| fail.contains(d)).count();
+            assert_eq!(armed, 2, "the writer's balancer took its fault");
+        }
     });
+    if unfence_fails {
+        let mut fail = super::super::balancing::FAIL_UNFENCE.lock().unwrap();
+        fail.retain(|d| !t.dirs.contains(d));
+    }
+}
+
+#[test]
+fn a_balancer_abort_whose_unfence_failed_unfences_on_a_later_pass() {
+    an_earlier_writers_move_is_aborted_with("", true);
 }
 
 #[test]
