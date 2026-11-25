@@ -256,9 +256,9 @@ pub(crate) fn run(
         .map(|o| -> Result<_, Failure> {
             // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
-            let gate = node.open_gate(&o.id, epoch);
+            let gate = node.new_gate(&o.id);
             // D331: its range gate, before it serves.
-            node.arm_ranges(&gate, &o.id, &o.db, || ())
+            node.arm_ranges(&gate, &o.id, epoch, &o.db, || ())
                 .map_err(|e| Failure::usage(&format!("partition {}: {e}", o.id)))?;
             let config = super::super::service::PartitionConfig {
                 backups: Arc::clone(&backups),
@@ -341,8 +341,11 @@ pub(crate) fn run(
     // A node that restarts with a map takes a newer one from its peers, then pushes; and
     // D329's resolver starts once it serves, as do the range moves it follows as a target
     // (D331 PR 4b), each from its progress rows.
-    let resolver =
-        spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let resolver = spanning::start_resolver(
+        Arc::downgrade(&shared),
+        shared.limits.txn_resolve_delay,
+        spanning::sweep_every(shared.limits.txn_outcome_retention),
+    );
     let sync = start_sync(&node, version);
     let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {

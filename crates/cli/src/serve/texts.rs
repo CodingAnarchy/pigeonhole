@@ -73,7 +73,9 @@ pub(crate) struct PackCounters {
 }
 
 /// How long the pack thread waits between passes. A pass over indexes with nothing new
-/// reads their few unpacked cells and writes nothing.
+/// reads their few unpacked cells, and commits only its cursor: put at the pass's start and
+/// deleted at its end, two small commits an index a pass, which a feed of the index table
+/// and a replica see.
 const PACK_EVERY: Duration = Duration::from_secs(60);
 
 /// The resume thread's state, under [`Texts::resume`]'s lock.

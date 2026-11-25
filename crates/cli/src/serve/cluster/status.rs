@@ -253,12 +253,13 @@ impl Node {
                 if let Some(part) = open.get(&id) {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
+                    #[cfg(test)]
+                    if let Some(at) = super::load::load_for(&self.dir) {
+                        (lp.load_cpu, lp.load_device, lp.load) = (at, at, at);
+                    }
                     // D331 PR 5's plan: absent until the first interval ends.
                     lp.write_bytes_rate = l.write_rate.map(|r| r as u64);
-                    // Its size from the file system, no read of the file (perf287): the
-                    // path the database opened, not one built from the id (CodeQL on
-                    // #2103).
-                    lp.file_bytes = std::fs::metadata(part.db.path()).map_or(0, |m| m.len());
+                    lp.file_bytes = used_bytes(&part.db);
                     // D331 PR 6: an owner's partition the map places nothing on (a merge
                     // emptied it): what still keeps it listed.
                     if let Some(m) = &map
@@ -350,6 +351,7 @@ impl Node {
             partitions,
             divergent,
             grace_remaining_ms: millis(self.grants.grace_remaining()),
+            lease_ms: millis(self.grants.lease()),
             map_features: MAP_FEATURES
                 .iter()
                 .filter(|&&f| {
@@ -398,5 +400,75 @@ impl Node {
                 .map(|&f| f.to_owned())
                 .collect(),
         }
+    }
+}
+
+/// The bytes partition `db`'s file holds here, for the balancer (D332) and a move's plan:
+/// its length less the free space inside it (#2150). The length alone never shrinks while
+/// the partition is served: a split's cleanup or a large delete frees space inside the file,
+/// and D333 punches it with the length kept, so a partition split for size would be split
+/// again every dwell. The file's length if the engine can't say (that's what was reported
+/// before).
+fn used_bytes(db: &pigeonhole::Pigeonhole) -> u64 {
+    match db.info() {
+        Ok(info) => info.file_bytes.saturating_sub(info.free_bytes.unwrap_or(0)),
+        // The path the database opened, not one built from the id (CodeQL on #2103).
+        Err(_) => std::fs::metadata(db.path()).map_or(0, |m| m.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    /// #2150: what Status reports as a partition's size falls when space inside its file is
+    /// freed, though the file's length doesn't.
+    #[test]
+    fn a_partitions_size_is_what_its_file_holds_not_its_length() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("p1.phdb"),
+            pigeonhole::Options::default().shards(1),
+        )
+        .unwrap();
+        let t = db
+            .table("big")
+            .unwrap()
+            .family("f", pigeonhole::Family::default())
+            .create()
+            .unwrap();
+        // Incompressible values (a fixed xorshift stream), so the file holds what was written.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for i in 0..2048u32 {
+            let value: Vec<u8> = (0..(4 << 10) / 8)
+                .flat_map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x.to_le_bytes()
+                })
+                .collect();
+            t.mutate(format!("r{i:05}").as_bytes())
+                .put("f", b"q", &value)
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        let full = super::used_bytes(&db);
+        assert!(full >= 8 << 20, "{full}");
+        db.drop_table("big").unwrap();
+        db.flush().unwrap();
+        let length = std::fs::metadata(db.path()).unwrap().len();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let used = super::used_bytes(&db);
+            if used < full / 2 {
+                assert!(used < length, "{used} of {length}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "still {used} of {full}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        db.close().unwrap();
     }
 }

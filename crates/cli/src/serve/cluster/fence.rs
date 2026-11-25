@@ -435,15 +435,22 @@ impl Node {
         Ok(())
     }
 
-    /// Partition `id`'s gate, at its file's `epoch`, as it opens here: with no lease until a
-    /// majority of the map's nodes grant one (D326; rule 3: a node that was down may have
-    /// missed the partition's move), and fenced by the operator as well if `fenced.json`
-    /// lists it. The two are separate (#1829), so an operator's fence doesn't hide the wait.
-    pub(crate) fn open_gate(&self, id: &str, epoch: u64) -> Arc<WriteGate> {
+    /// Partition `id`'s gate as it opens here: with no lease until a majority of the map's
+    /// nodes grant one (D326; rule 3: a node that was down may have missed the partition's
+    /// move), and fenced by the operator as well if `fenced.json` lists it. The two are
+    /// separate (#1829), so an operator's fence doesn't hide the wait. Not served yet:
+    /// [`serve_gate`](Self::serve_gate) does that, once writes route to it.
+    pub(crate) fn new_gate(&self, id: &str) -> Arc<WriteGate> {
         let operator = self.fences.operator().contains(id);
-        let gate = WriteGate::opened(id, operator, Arc::clone(self.grants.clock()));
-        self.fences.serve(id, Arc::clone(&gate), epoch);
-        gate
+        WriteGate::opened(id, operator, Arc::clone(self.grants.clock()))
+    }
+
+    /// Partition `id` is served here from now, behind `gate`, at its file's `epoch`: `Status`
+    /// shows it open, its lease rounds ask for it, and the operator can fence it. Only once
+    /// the router's parts hold it, so `Status` never shows it open before a write can route
+    /// to it (#2113).
+    pub(crate) fn serve_gate(&self, id: &str, gate: &Arc<WriteGate>, epoch: u64) {
+        self.fences.serve(id, Arc::clone(gate), epoch);
     }
 
     /// Partition `id`'s state here, and why it's fenced when it is, for `Status`: `None`
@@ -1342,7 +1349,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let _gate = n.open_gate("p1", 1);
+        n.serve_gate("p1", &n.new_gate("p1"), 1);
         assert_eq!(n.fences.confirmable(&map("a", 1), "a"), ["p1"]);
         assert!(
             n.fences.confirmable(&map("b", 2), "a").is_empty(),

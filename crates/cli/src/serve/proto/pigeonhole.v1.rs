@@ -7795,6 +7795,10 @@ pub struct NodeStatus {
     pub move_retention_cap: u64,
     #[prost(uint32, tag = "17")]
     pub max_move_followers: u32,
+    /// D326: this node's `--cluster-lease-ms` (#2152): a promote run by the CLI bounds the time
+    /// between its two surveys of the old owner's grants by it. 0: unknown (an older node).
+    #[prost(uint64, tag = "18")]
+    pub lease_ms: u64,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7902,8 +7906,10 @@ pub struct LocalPartition {
     pub load_device: f64,
     #[prost(double, tag = "31")]
     pub load: f64,
-    /// D332: the partition file's size here, from the file system (the database is one file,
-    /// WAL included), for the balancer. Open partitions only; 0 when closed.
+    /// D332: the bytes the partition's file holds here, for the balancer and a move's plan:
+    /// the file's length less the free space inside it (#2150, 1.3.1; before, its length,
+    /// which a split's cleanup or a large delete never shrank). Open partitions only; 0 when
+    /// closed.
     #[prost(uint64, tag = "32")]
     pub file_bytes: u64,
     /// D331 PR 6: on a partition the map places no range on (a merge emptied it), what still
