@@ -614,9 +614,6 @@ impl Service {
         })
     }
 
-    /// The home's decision table (D329). Created through the gate if it's missing (a write
-    /// to the file: never past a fence's drain), the first time a spanning transaction
-    /// begins on the partition.
     /// This home's decision table, if it has one: the decision sweeps read it, and never
     /// create it, so an idle partition's sweep writes nothing (#2164: a catalog change on
     /// every partition of an idle cluster showed in its device load).
@@ -625,6 +622,9 @@ impl Service {
         Ok(self.part()?.db.table(DECISIONS).and_then(|t| t.open()).ok())
     }
 
+    /// The home's decision table (D329). Created through the gate if it's missing (a write
+    /// to the file: never past a fence's drain), the first time a spanning transaction
+    /// begins on the partition.
     pub(crate) async fn decisions_table(&self) -> Result<Table, ApiError> {
         use super::super::cluster::spanning::{DECISION_FAMILY, DECISIONS};
         let db = self.part()?.db.clone();
