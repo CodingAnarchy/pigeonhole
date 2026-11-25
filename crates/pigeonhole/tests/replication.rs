@@ -1670,7 +1670,9 @@ fn a_row_with_a_zero_byte_at_a_chunks_edge_is_copied() {
 }
 
 /// `row`'s put on `t`: feed-silent, or a spanning commit's share tagged with `xid` (a
-/// transaction, as `phdb serve` tags one), or plain.
+/// transaction, as `phdb serve` tags one), or plain. Only the xid tests use it, and
+/// tagging is prepare-only (#2146).
+#[cfg(feature = "__unstable-txn-prepare")]
 fn commit(db: &Pigeonhole, t: &pigeonhole::Table, row: &[u8], silent: bool, xid: Option<&[u8]>) {
     match xid {
         Some(x) => {
@@ -1694,6 +1696,7 @@ fn commit(db: &Pigeonhole, t: &pigeonhole::Table, row: &[u8], silent: bool, xid:
 /// event, a flags byte and the xid before version 1's fields. The replica
 /// applies it tagged, so its own feed carries the xid; an untagged commit stays version 1
 /// or 2, byte for byte. Unknown flag bits, and an empty xid, are refused.
+#[cfg(feature = "__unstable-txn-prepare")]
 #[test]
 fn a_replica_applies_a_spanning_share_with_its_xid() {
     let (pv, rv) = (SimVfs::new(41), SimVfs::new(42));
@@ -1836,6 +1839,7 @@ fn a_range_drop_waits_for_a_read_hold() {
 /// after a spanning commit's share carries no xid. The tagged commit replicates with its
 /// xid, the drop after it with none (so in the plain version, which a drop must be: one
 /// in the flags form is refused), and the replica matches its primary.
+#[cfg(feature = "__unstable-txn-prepare")]
 #[test]
 fn a_range_drop_after_a_tagged_commit_carries_no_xid() {
     let (pv, rv) = (SimVfs::new(60), SimVfs::new(61));
