@@ -39,6 +39,34 @@ const GRANT_SLACK: Duration = Duration::from_millis(500);
 /// How long the promote waits for ID to close its copy after the map dropped it.
 const CLOSE_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a planned promote waits for the copy to hear its fenced owner (#2162 item 4):
+/// the owner sends at least once a second while idle.
+const SETTLE_WAIT: Duration = Duration::from_secs(3);
+
+/// Past the copy's own reading, before a message counts as heard after the fence: the two
+/// clocks run at the same rate, and this covers the copy's apply of it.
+const SETTLE_SLACK: Duration = Duration::from_millis(200);
+
+/// Waits up to [`SETTLE_WAIT`] for node `to`'s copy of `partition` (at `url`) to have heard
+/// its owner since this call and applied through the durable seqno it heard (#2162 item 4).
+/// The owner is fenced: what it sends after this is its final frontier. Whether it did.
+async fn settle(args: &NodeArgs, url: &str, partition: &str) -> bool {
+    let since = tokio::time::Instant::now();
+    loop {
+        if let Ok(Some(lp)) = row_on(args, url, partition).await
+            && lp.role() == proto::PartitionRole::Replica
+            && Duration::from_millis(lp.replica_lag_ms) + SETTLE_SLACK < since.elapsed()
+            && lp.replica_applied_seqno >= lp.replica_primary_seqno
+        {
+            return true;
+        }
+        if since.elapsed() > SETTLE_WAIT {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// ID's row for `partition` in its `Status`.
 async fn row_on(
     args: &NodeArgs,
@@ -197,6 +225,15 @@ pub(crate) async fn promote(
         }
         lp
     };
+    // A fenced owner takes no commit and still streams its feed (Follow is lease-gated,
+    // not fence-gated, D328's M1): wait, bounded, for the copy to hear it after the fence and
+    // apply through its durable seqno, so the loss counted below is exact (#2162 item 4: a
+    // promote right after the fence counted from a frontier up to a heartbeat old). A closed
+    // owner doesn't stream, so its count is a lower bound.
+    let settled = match owner.as_ref().map(proto::LocalPartition::state) {
+        Some(S::Fenced) => settle(args, &url(to).unwrap_or_default(), partition).await,
+        _ => false,
+    };
     let ops = CliOps {
         args,
         map: &m,
@@ -231,9 +268,15 @@ pub(crate) async fn promote(
                 "lost_commits_counted",
                 json!(if old_unreachable {
                     "not counted: the old owner couldn't be asked"
+                } else if settled {
+                    "exact: the copy heard the fenced owner after the fence, so its durable \
+                     seqno is final, and the copy applied through it"
+                } else if owner.as_ref().is_some_and(|lp| lp.state() == S::Closed) {
+                    "a lower bound: the owner was closed, so the copy last heard its durable \
+                     seqno before that, and commits it made durable since aren't counted"
                 } else {
-                    "from the owner's durable seqno as the copy last heard it, with the owner \
-                     fenced or closed, so it took no commit since"
+                    "a lower bound: the copy didn't hear the fenced owner within 3 s, so \
+                     commits it made durable after its last message aren't counted"
                 }),
             ),
             ("map_version", json!(done.map_version)),

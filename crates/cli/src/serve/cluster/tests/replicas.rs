@@ -825,6 +825,14 @@ fn a_planned_promotion_makes_the_replica_the_owner() {
         .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
         assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        // A closed owner streams nothing, so the count is a lower bound (#2162 item 4).
+        assert!(
+            r.document["lost_commits_counted"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("a lower bound: the owner was closed")),
+            "{:?}",
+            r.document
+        );
         // The promote waited for a to serve p3 (#2035): a read on a at once, no retry.
         let (value, _, _) = read_through(ports[1], "k2", None, None).await.unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
@@ -849,6 +857,43 @@ fn a_planned_promotion_makes_the_replica_the_owner() {
         .await
         .unwrap();
         assert!(again.document.contains_key("done"), "{:?}", again.document);
+    });
+}
+
+/// #2162 item 4: with the owner fenced (not closed) it still streams, so the promote waits
+/// for the copy to hear it after the fence. A write just before the fence, which the copy
+/// may not have had when the promote began, is applied, and the loss is counted exactly.
+#[test]
+fn a_planned_promotion_from_a_fenced_owner_counts_the_loss_exactly() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        put_in(ports[1], "r", "k2").await;
+        let req = PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req).await.unwrap();
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits_counted"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("exact")),
+            "{:?}",
+            r.document
+        );
+        assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        let (value, _, _) = read_through(ports[1], "k2", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
     });
 }
 
