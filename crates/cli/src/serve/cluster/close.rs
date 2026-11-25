@@ -501,6 +501,11 @@ pub(super) fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiErro
                 files.push(e.path());
             }
         }
+        // A stopped promote's intent (#2156) goes with the file it was for.
+        let intent = super::stamp::promote_intent(dir, id);
+        if intent.exists() {
+            files.push(intent);
+        }
     }
     if files.is_empty() {
         return Err(ApiError::not_found(format!(
