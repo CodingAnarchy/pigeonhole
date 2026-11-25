@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use super::balance::{self, Action, Bounds, Counters, Decision, Kind, NodeView, PartView};
 use super::proto::{
-    self, BalancerEvent, BalancerEventKind, BalancerMode, ClusterMap, MoveHistory, NodeStatus,
-    PartitionRequest, PartitionRole, SetMapRequest,
+    self, BalancerEvent, BalancerEventKind, BalancerMode, ClusterMap, LocalPartitionState,
+    MoveHistory, NodeStatus, PartitionRequest, PartitionRole, SetMapRequest,
 };
 use super::{Node, map, schema};
 
@@ -174,7 +174,7 @@ pub(crate) fn views(
     statuses: &HashMap<String, NodeStatus>,
     in_doubt: impl Fn(&str) -> bool,
 ) -> (Vec<NodeView>, Vec<PartView>) {
-    let nodes = map
+    let mut nodes: Vec<NodeView> = map
         .nodes
         .iter()
         .map(|n| NodeView {
@@ -185,6 +185,7 @@ pub(crate) fn views(
                 f64::from(n.weight)
             },
             fresh: statuses.contains_key(&n.id),
+            incomplete: None,
         })
         .collect();
     let parts = map
@@ -196,6 +197,25 @@ pub(crate) fn views(
                     .iter()
                     .find(|lp| lp.id == p.id && lp.role() != PartitionRole::Replica)
             });
+            // Status measures only a partition open there, serving or fenced (#2158): any other
+            // leaves its node's numbers incomplete, so the node isn't fresh this pass.
+            if statuses.contains_key(&p.node) {
+                let why = match lp.map(|lp| lp.state()) {
+                    Some(LocalPartitionState::Serving | LocalPartitionState::Fenced) => None,
+                    Some(LocalPartitionState::Closed) => Some("is closed"),
+                    Some(LocalPartitionState::Opening) => Some("is opening"),
+                    _ => Some("isn't open"),
+                };
+                if let Some(why) = why
+                    && let Some(n) = nodes.iter_mut().find(|n| n.id == p.node && n.fresh)
+                {
+                    n.fresh = false;
+                    n.incomplete = Some(format!(
+                        "node {}'s numbers are incomplete: partition {} {why} there",
+                        n.id, p.id
+                    ));
+                }
+            }
             let tables: Vec<&proto::TablePlacement> = map
                 .tables
                 .iter()
@@ -1584,5 +1604,80 @@ mod tests {
         let mut last = kept();
         last.term = u64::MAX;
         assert!(!last.carries(0));
+    }
+
+    /// #2158 item 1: a node that answered, but without numbers for a partition the map
+    /// places on it (closed, opening, or missing from its Status), isn't fresh, and says
+    /// why. A fenced partition is still measured.
+    #[test]
+    fn a_node_is_fresh_only_with_numbers_for_every_partition_placed_on_it() {
+        use super::proto::{LocalPartition, LocalPartitionState as S, NodeStatus};
+        use std::collections::HashMap;
+        let placed = [
+            ("p1", "a"),
+            ("p2", "b"),
+            ("p3", "c"),
+            ("p4", "d"),
+            ("p5", "e"),
+        ];
+        let map = ClusterMap {
+            nodes: ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|id| proto::Node {
+                    id: (*id).into(),
+                    ..proto::Node::default()
+                })
+                .collect(),
+            partitions: placed
+                .iter()
+                .map(|(id, node)| proto::Partition {
+                    id: (*id).into(),
+                    node: (*node).into(),
+                    ..proto::Partition::default()
+                })
+                .collect(),
+            ..ClusterMap::default()
+        };
+        let status = |p: &str, state: Option<S>| {
+            let mut st = NodeStatus::default();
+            if let Some(state) = state {
+                let mut lp = LocalPartition {
+                    id: p.into(),
+                    ..LocalPartition::default()
+                };
+                lp.set_state(state);
+                st.partitions.push(lp);
+            }
+            st
+        };
+        // e doesn't answer at all.
+        let statuses: HashMap<String, NodeStatus> = [
+            ("a", status("p1", Some(S::Serving))),
+            ("b", status("p2", Some(S::Fenced))),
+            ("c", status("p3", Some(S::Closed))),
+            ("d", status("p4", None)),
+        ]
+        .into_iter()
+        .map(|(n, st)| (n.to_owned(), st))
+        .collect();
+        let (nodes, _) = super::views(&map, &statuses, |_| false);
+        let of = |id: &str| nodes.iter().find(|n| n.id == id).expect("a node");
+        assert!(of("a").fresh && of("a").incomplete.is_none());
+        assert!(
+            of("b").fresh && of("b").incomplete.is_none(),
+            "fenced is measured"
+        );
+        assert!(!of("c").fresh);
+        assert_eq!(
+            of("c").incomplete.as_deref(),
+            Some("node c's numbers are incomplete: partition p3 is closed there")
+        );
+        assert!(!of("d").fresh);
+        assert_eq!(
+            of("d").incomplete.as_deref(),
+            Some("node d's numbers are incomplete: partition p4 isn't open there")
+        );
+        // Not answering is the old staleness, with nothing to name.
+        assert!(!of("e").fresh && of("e").incomplete.is_none());
     }
 }
