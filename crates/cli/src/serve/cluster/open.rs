@@ -216,6 +216,38 @@ async fn hold_confirm(dir: &std::path::Path) {
     let _ = tokio::task::spawn_blocking(move || wait.recv()).await;
 }
 
+/// A hold seam (tests): the next owner's open in each listed cluster directory waits once its
+/// engine is open and its service made, before it joins the node's parts and is served,
+/// until the sender sends or is dropped. `reached` is notified as it starts to wait.
+#[cfg(test)]
+pub(crate) static HOLD_SERVE: std::sync::Mutex<Vec<ServeHold>> = std::sync::Mutex::new(Vec::new());
+
+/// One [`HOLD_SERVE`] entry: the cluster directory, notified on reaching the hold, and the
+/// receiver it waits on.
+#[cfg(test)]
+pub(crate) type ServeHold = (
+    std::path::PathBuf,
+    Arc<tokio::sync::Notify>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
+async fn hold_serve(dir: &std::path::Path) {
+    let (reached, wait) = {
+        let mut armed = HOLD_SERVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(i) = armed.iter().position(|(d, ..)| d == dir) else {
+            return;
+        };
+        let (_, reached, wait) = armed.swap_remove(i);
+        (reached, wait)
+    };
+    reached.notify_one();
+    // On a blocking thread, as `hold_confirm` waits (#1865).
+    let _ = tokio::task::spawn_blocking(move || wait.recv()).await;
+}
+
 #[cfg(test)]
 fn hold_open(dir: &std::path::Path) {
     let mut armed = HOLD_OPEN
@@ -689,9 +721,9 @@ impl Node {
                 .serve_replica(id, opened, &shared, cluster, server, (shrunk, &resplit))
                 .await;
         }
-        // Reopened: its files change from here, so the hashes a close kept go (feed1248),
-        // in the step that makes it served.
-        let gate = self.open_gate(id, epoch);
+        // Not served yet: the step that joins it to the parts does that (#2113). A reopened
+        // partition's close (and the hashes it kept, feed1248) goes in that step too.
+        let gate = self.new_gate(id);
         let config = crate::serve::service::PartitionConfig {
             backups: Arc::clone(&server.backups),
             placement: Some(Arc::clone(&server.placement)),
@@ -714,9 +746,12 @@ impl Node {
         let mut parts = (*cluster.parts.load_full()).clone();
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
         remask_off_async(&server.placement, &parts, format!("partition {id} opened")).await;
+        #[cfg(test)]
+        hold_serve(&self.dir).await;
         // D331: its range gate, from its file's moved-away rows and the map, then it joins
-        // the node's parts, both under the install lock (simp724's S1): an install either
-        // ran before (its map is the one armed) or runs after (it sees the partition).
+        // the node's parts and is served, all under the install lock (simp724's S1): an
+        // install either ran before (its map is the one armed) or runs after (it sees the
+        // partition).
         {
             let (node, db, id, slot) = (
                 Arc::clone(self),
@@ -726,7 +761,7 @@ impl Node {
             );
             let parts = Arc::new(parts);
             tokio::task::spawn_blocking(move || {
-                node.arm_ranges(&gate, &id, &db, || slot.store(parts))
+                node.arm_ranges(&gate, &id, epoch, &db, || slot.store(parts))
             })
             .await?
             .map_err(|e| ApiError::internal(format!("partition's range gate: {e}")))?;
