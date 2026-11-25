@@ -923,7 +923,13 @@ impl Index {
     /// It carries on from where a stopped pack left off ([`pack_with`](Self::pack_with)),
     /// and otherwise starts at the first term. `PackRefused` while a rebuild is pending
     /// ([`rebuild_pending`](Self::rebuild_pending)): finish the rebuild first. `Busy` while
-    /// a repair runs.
+    /// a repair runs. A chunk whose commit conflicts with writers, or is too large for the
+    /// database (`BatchTooLarge`, `RecordTooLarge`), is retried smaller; an error coded
+    /// `Conflict` means writers kept changing a chunk's postings through its retries, even
+    /// at its smallest. A size error means one posting's chunk doesn't fit: a posting
+    /// written while the database was opened with a larger `memtable_budget` than
+    /// now. Open it with the larger budget to pack that term. Either way the
+    /// index is consistent and the cursor kept: pack again to carry on.
     pub fn pack(&self) -> Result<PackStats> {
         self.pack_with(PackOptions::new(), |_| ControlFlow::Continue(()))
     }
@@ -939,8 +945,8 @@ impl Index {
     ) -> Result<PackStats> {
         self.pack_begin(options)?;
         let mut stats = PackStats::default();
-        let (mut term, mut at) = (None, None);
-        while self.pack_chunk(&mut stats, &mut term, &mut at)? {
+        let (mut term, mut at, mut cut) = (None, None, None);
+        while self.pack_chunk(&mut stats, &mut term, &mut at, &mut cut)? {
             if step(&stats).is_break() {
                 stats.stopped = true;
                 break;
@@ -1000,19 +1006,25 @@ impl Index {
     /// with nothing to write, which are most terms of a real vocabulary (a few postings
     /// each, left as cells), commit nothing, the cursor included. A pass that stops there
     /// reads them again. After 64 such chunks it returns, so the caller's step still runs.
+    ///
+    /// `cut` is a term whose chunk was too large to commit, with the limit that fit: the
+    /// rest of that term's chunks start there, not at [`PACK_CHUNK`] (ai1249 on #2183), so
+    /// none reads and builds hundreds of postings only to be refused.
     fn pack_chunk(
         &self,
         stats: &mut PackStats,
         term: &mut Option<Vec<u8>>,
         at: &mut Option<(Vec<u8>, Vec<u8>)>,
+        cut: &mut Option<(Vec<u8>, usize)>,
     ) -> Result<bool> {
         let w = self.w();
         let t = self.block_table()?;
         let rows = self.rows(true)?;
         let positions = self.inner.opts.get_positions();
         // The most cells the chunk takes: cut when its transaction runs out of retries, so
-        // a pack beside steady writers of the same documents still gets through.
-        let mut limit = PACK_CHUNK;
+        // a pack beside steady writers of the same documents still gets through, or is too
+        // large to commit.
+        let mut limit = cut.as_ref().map_or(PACK_CHUNK, |(_, l)| *l);
         let mut idle = 0;
         loop {
             let Some(cursor) = t.get(GLOBAL, META, PACK_AFTER)?.map(|c| c.value().to_vec()) else {
@@ -1041,6 +1053,14 @@ impl Index {
                 })?;
                 return Ok(false);
             };
+            // A size cut holds for its term only: the next term's chunk is read again whole.
+            if cut.as_ref().is_some_and(|(t, _)| *t != work.term) {
+                *cut = None;
+                if limit < PACK_CHUNK {
+                    limit = PACK_CHUNK;
+                    continue;
+                }
+            }
             let plan = pack_plan(&work, positions, limit)?;
             let row = [POST_PREFIX, &work.term[..]].concat();
             let last = &work.cells.last().expect("a chunk has cells").0;
@@ -1109,10 +1129,25 @@ impl Index {
                 tx.put(t, GLOBAL, META, PACK_AFTER, &next);
                 Ok::<_, Tx>(true)
             });
+            // Cut on a conflict (to 8 at least; this chunk only), and on a commit too large for
+            // the database (to one cell: a common word in long documents carries long position
+            // lists, #2182; kept for the rest of the term). One cell's chunk is about the size
+            // of the write that made it.
             let done = match done.map_err(Error::from) {
                 Ok((done, _)) => done,
                 Err(e) if e.code() == pigeonhole::ErrorCode::Conflict && limit > 8 => {
                     limit = (limit / 8).max(8);
+                    continue;
+                }
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        pigeonhole::ErrorCode::BatchTooLarge
+                            | pigeonhole::ErrorCode::RecordTooLarge
+                    ) && limit > 1 =>
+                {
+                    limit = (limit / 8).max(1);
+                    *cut = Some((work.term.clone(), limit));
                     continue;
                 }
                 Err(e) => return Err(e),
