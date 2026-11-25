@@ -1,0 +1,5 @@
+### Changed
+- **`Cluster.Status`'s `LocalPartition.file_bytes` is now the bytes a partition's file holds, not its length** (#2150). It is the file's length less the free space inside it (allocated plus retired extents). A script or dashboard that read it as the file's length now sees less after deletes, a split's cleanup or a move. The length is still in `Admin.Info`'s per-partition `file_bytes`, or from the file system. If the database can't report its free space, Status gives the length, as before.
+
+### Fixed
+- **The balancer no longer splits a partition again and again, nor never merges one that shrank** (#2150). It measured a partition by its file's length, which a split's cleanup or a large delete doesn't reduce while the partition is served: freed space is punched as holes and the length kept. So a partition split for size looked as large after the split, and was split again every dwell until no tablet boundary was left; and one that shrank was never merged. It now measures what the file holds (`file_bytes` above).
