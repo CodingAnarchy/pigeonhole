@@ -61,11 +61,44 @@ pub(crate) static FAIL_UNFENCE: std::sync::Mutex<Vec<std::path::PathBuf>> =
 
 /// A partition an aborted balancer move left fenced and closed on its node, whose unfence
 /// failed (#2151): each pass tries again, and `state` names it.
+///
+/// It lifts only the fence that move set (ai1249's S1 on #2170), so it's kept only while
+/// that is certainly the fence in place: the partition on the node and at the epoch it had
+/// at the abort, no move naming it ([`Unfence::stands`]), and this node the writer since,
+/// in the abort's term or the one right after it ([`Unfence::carries`]).
 #[derive(Debug, Clone)]
 struct Unfence {
     partition: String,
     move_id: String,
     error: String,
+    /// The partition's node and epoch at the abort.
+    node: String,
+    epoch: u64,
+    /// The writer term of the abort.
+    term: u64,
+}
+
+impl Unfence {
+    /// Whether `map` still has the partition as the abort left it: on the same node at the
+    /// same epoch, with no move naming it. A relocation, a failover, a promote or a forced
+    /// map changes one of the two without a move record, and whoever made that change, or a
+    /// move that names the partition now, owns its fence.
+    fn stands(&self, map: &ClusterMap) -> bool {
+        map.partitions
+            .iter()
+            .any(|p| p.id == self.partition && p.node == self.node && p.epoch == self.epoch)
+            && !map
+                .moves
+                .iter()
+                .any(|m| m.from == self.partition || (!map::node_move(m) && m.to == self.partition))
+    }
+
+    /// Whether it carries into this node's new writer term `term`: only the term right
+    /// after the abort's. Terms are one writer's each, so no other node was the writer in
+    /// between; past that, another writer (or an operator, under it) may have set the fence.
+    fn carries(&self, term: u64) -> bool {
+        self.term.checked_add(1) == Some(term)
+    }
 }
 
 /// The writer's balancer state: in memory, new with each writer term (S3).
@@ -89,8 +122,8 @@ pub(crate) struct Run {
     /// owner didn't answer it, or the split couldn't start (perf2's and ai1249's S1 on
     /// #2137). `state` names them.
     no_cut: HashMap<String, (u64, String)>,
-    /// Partitions still to unfence after an abort (#2151). Kept across terms: the fence
-    /// stands whoever the writer is.
+    /// Partitions still to unfence after an abort (#2151). Carried only into this node's
+    /// own next term ([`Unfence::carries`]).
     unfence: Vec<Unfence>,
 }
 
@@ -392,8 +425,6 @@ fn emptied(m: &ClusterMap) -> Vec<String> {
         .collect()
 }
 
-/// What an abort's state line adds when its ABORT event's map change failed (audit120's
-/// nit on #2137): the abort happened, the event wasn't recorded.
 /// What `state` says of a partition an aborted move left fenced (#2151).
 fn still_fenced(partition: &str, move_id: &str, error: &str) -> String {
     format!(
@@ -402,6 +433,8 @@ fn still_fenced(partition: &str, move_id: &str, error: &str) -> String {
     )
 }
 
+/// What an abort's state line adds when its ABORT event's map change failed (audit120's
+/// nit on #2137): the abort happened, the event wasn't recorded.
 fn unrecorded(recorded: Result<(), String>) -> String {
     recorded
         .err()
@@ -534,12 +567,24 @@ impl Node {
             if r.term != Some(map.writer_term) {
                 // A new term's counters; the move in flight, the running pass and the
                 // metric's totals carry over.
+                let (unfence, dropped): (Vec<Unfence>, Vec<Unfence>) =
+                    std::mem::take(&mut r.unfence)
+                        .into_iter()
+                        .partition(|u| u.carries(map.writer_term));
+                for u in dropped {
+                    eprintln!(
+                        "phdb serve: the balancer no longer retries unfencing {} after \
+                         aborted move {} (the writer term went from {} to {}): if it's still \
+                         closed on node {}, run phdb cluster unfence {} there",
+                        u.partition, u.move_id, u.term, map.writer_term, u.node, u.partition
+                    );
+                }
                 *r = Run {
                     term: Some(map.writer_term),
                     moving: r.moving.take(),
                     actions: std::mem::take(&mut r.actions),
                     passing: r.passing,
-                    unfence: std::mem::take(&mut r.unfence),
+                    unfence,
                     ..Run::default()
                 };
             }
@@ -1270,11 +1315,18 @@ impl Node {
                     rec.from, rec.id
                 );
                 let note = format!("; {}", still_fenced(&rec.from, &rec.id, &e));
-                self.balancing().unfence.push(Unfence {
-                    partition: rec.from.clone(),
-                    move_id: rec.id.clone(),
-                    error: e,
-                });
+                // Kept with where the partition is now: the retry lifts this move's fence
+                // only (ai1249's S1 on #2170).
+                if let Some(p) = map.partitions.iter().find(|p| p.id == rec.from) {
+                    self.balancing().unfence.push(Unfence {
+                        partition: rec.from.clone(),
+                        move_id: rec.id.clone(),
+                        error: e,
+                        node: p.node.clone(),
+                        epoch: p.epoch,
+                        term: map.writer_term,
+                    });
+                }
                 note
             }
         };
@@ -1335,9 +1387,9 @@ impl Node {
     }
 
     /// Tries again each unfence an abort left ([`Run::unfence`], #2151). One is dropped once
-    /// it succeeds, or once the map has moved on for its partition (a move names it, or the
-    /// map no longer has it): that move, or its operator, owns the fence then. Whether any
-    /// is still waiting, with `state` naming them: the pass decides nothing else meanwhile.
+    /// it succeeds, or once the map no longer has its partition as the abort left it
+    /// ([`Unfence::stands`]). Whether any is still waiting, with `state` naming them: the
+    /// pass decides nothing else meanwhile.
     async fn retry_unfences(&self, map: &ClusterMap) -> bool {
         let pending = self.balancing().unfence.clone();
         if pending.is_empty() {
@@ -1345,12 +1397,7 @@ impl Node {
         }
         let mut left = Vec::new();
         for mut u in pending {
-            let moved_on = !map.partitions.iter().any(|p| p.id == u.partition)
-                || map
-                    .moves
-                    .iter()
-                    .any(|m| m.from == u.partition || (!map::node_move(m) && m.to == u.partition));
-            if moved_on {
+            if !u.stands(map) {
                 continue;
             }
             match self.unfence_after_abort(map, &u.partition).await {
@@ -1465,4 +1512,77 @@ fn node_ratios(nodes: &[NodeView], parts: &[PartView]) -> Vec<(String, f64)> {
         .into_iter()
         .map(|(n, l)| (n, if mean > 0.0 { l / mean } else { 1.0 }))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClusterMap, Unfence, proto};
+
+    fn kept() -> Unfence {
+        Unfence {
+            partition: "p1".into(),
+            move_id: "bal-1".into(),
+            error: String::new(),
+            node: "a".into(),
+            epoch: 4,
+            term: 7,
+        }
+    }
+
+    fn map_with(node: &str, epoch: u64) -> ClusterMap {
+        ClusterMap {
+            partitions: vec![proto::Partition {
+                id: "p1".into(),
+                node: node.into(),
+                epoch,
+                ..proto::Partition::default()
+            }],
+            ..ClusterMap::default()
+        }
+    }
+
+    /// ai1249's S1 on #2170: a kept unfence lifts only the fence its aborted move set. It
+    /// goes once the partition isn't where the abort left it (a relocation, a failover or a
+    /// forced map changes its node or epoch with no move record), once a move names it, or
+    /// once the map has no such partition.
+    #[test]
+    fn a_kept_unfence_stands_only_while_the_partition_is_as_the_abort_left_it() {
+        let u = kept();
+        assert!(u.stands(&map_with("a", 4)));
+        assert!(!u.stands(&map_with("b", 4)), "another node");
+        assert!(!u.stands(&map_with("a", 5)), "a new epoch on the same node");
+        assert!(!u.stands(&ClusterMap::default()), "no such partition");
+        // A whole move of p1, and a range move into it.
+        let mut moving = map_with("a", 4);
+        moving.moves.push(proto::RangeMove {
+            id: "mv".into(),
+            from: "p1".into(),
+            to: "b".into(),
+            ..proto::RangeMove::default()
+        });
+        assert!(!u.stands(&moving), "a move of it");
+        let mut into = map_with("a", 4);
+        into.moves.push(proto::RangeMove {
+            id: "range-1".into(),
+            from: "p2".into(),
+            to: "p1".into(),
+            table: "users".into(),
+            ..proto::RangeMove::default()
+        });
+        assert!(!u.stands(&into), "a range move into it");
+    }
+
+    /// It carries into this node's own next writer term only: no other node held a term in
+    /// between. Not into a later one, nor (never seen) an earlier one.
+    #[test]
+    fn a_kept_unfence_carries_into_the_next_term_only() {
+        let u = kept();
+        assert!(u.carries(8));
+        assert!(!u.carries(9));
+        assert!(!u.carries(7));
+        assert!(!u.carries(6));
+        let mut last = kept();
+        last.term = u64::MAX;
+        assert!(!last.carries(0));
+    }
 }
