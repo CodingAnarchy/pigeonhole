@@ -413,12 +413,22 @@ pub(crate) fn qualify(
         })
         .max_by_key(|e| e.to_epoch)
     {
-        let stamped = statuses.get(&e.to).is_some_and(|st| {
+        // Its copy, closed (out of the replicas since the pending map), at the promote's
+        // epoch if stamped, or still at its bootstrap epoch inside P's history if the
+        // promote stopped before its stamp or between the copy's promote and its identity
+        // (#2156). Both are finished from here: the stamp writes only what's left.
+        // The range can also match an old owner's closed file of the same history on that
+        // node: the stamp's exact match on the promote's intent is what admits a file, so
+        // that one is refused, the promote stays pending, and abandon handles it (simp724).
+        let resumable = statuses.get(&e.to).is_some_and(|st| {
             st.partitions.iter().any(|lp| {
-                lp.id == p.id && lp.role() != PartitionRole::Replica && lp.epoch == e.to_epoch
+                lp.id == p.id
+                    && lp.role() != PartitionRole::Replica
+                    && (lp.epoch == e.to_epoch
+                        || (p.history_epoch <= lp.epoch && lp.epoch <= p.epoch))
             })
         });
-        if stamped {
+        if resumable {
             return Ok(e.to.clone());
         }
     }
