@@ -300,11 +300,20 @@ pub(crate) fn classify(status: &tonic::Status, address: &str, writes: bool) -> A
 
 /// Whether the forward never reached the owner, or reached it and was refused unprocessed:
 /// any failure to connect (tonic's `ConnectError`: refused, timed out, unreachable), a
-/// `REFUSED_STREAM` reset, or a `GOAWAY` (the server names the last stream it processed, so
-/// the client fails only streams it didn't). Either way nothing ran (cli692's point 5).
+/// `REFUSED_STREAM` reset, a `GOAWAY` (the server names the last stream it processed, so
+/// the client fails only streams it didn't), or a call hyper cancelled before it sent it.
+/// Either way nothing ran (cli692's point 5).
 fn refused_unprocessed(status: &tonic::Status) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(status);
     while let Some(e) = source {
+        // #2212: hyper's `Canceled` is a call still queued for its connection when that
+        // connection ended ("connection closed"), or one it wasn't ready for: never handed
+        // to HTTP/2, so never sent. One the connection took fails as an h2 error instead.
+        if e.downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_canceled)
+        {
+            return true;
+        }
         if let Some(h2) = e.downcast_ref::<h2::Error>() {
             return h2.reason() == Some(h2::Reason::REFUSED_STREAM) || h2.is_go_away();
         }
@@ -686,6 +695,41 @@ mod tests {
                 digest.to_vec().into()
             },
         })
+    }
+
+    /// #2212: a forward still queued for a pooled connection to the owner when that
+    /// connection closed (the owner shutting down) was never sent. hyper cancels it, and the
+    /// write answers `PartitionUnavailable`, not `OutcomeUnknown`. A failure the forward
+    /// can't place answers `OutcomeUnknown`, as before.
+    #[test]
+    fn a_forward_cancelled_before_it_was_sent_is_unavailable_not_unknown() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancelled = rt.block_on(async {
+            let (io, _owner) = tokio::io::duplex(1 << 16);
+            let (mut send, conn) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                hyper_util::rt::TokioIo::new(io),
+            )
+            .await
+            .unwrap();
+            // Queued, then its connection ends before it takes the call.
+            let call = send.send_request(hyper::Request::new(String::new()));
+            drop(conn);
+            call.await.unwrap_err()
+        });
+        assert!(cancelled.is_canceled(), "{cancelled:?}");
+        let status = tonic::Status::from_error(Box::new(cancelled));
+        assert_eq!(
+            classify(&status, "127.0.0.1:1", true).code,
+            "PartitionUnavailable"
+        );
+        let lost = tonic::Status::from_error(Box::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert_eq!(classify(&lost, "127.0.0.1:1", true).code, "OutcomeUnknown");
     }
 
     /// The owner's own entry for the token decides the forwarded caller's scope and
