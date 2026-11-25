@@ -329,6 +329,14 @@ pub(crate) fn read_pending(db: &Pigeonhole) -> Result<Vec<Pending>, String> {
     Ok(out)
 }
 
+/// Whether a drop row of move `id` itself is here: the drop of an aborted record's copy
+/// under the same id, which a map brought back (#2141). Real records never reuse an id
+/// (`<prefix>-<ms>`, taken at their start), so only a hand-built map does. The follower waits
+/// for it before it reads its progress rows, which that drop deletes with the range.
+pub(crate) fn pending_own(db: &Pigeonhole, id: &str) -> Result<bool, String> {
+    Ok(read_pending(db)?.iter().any(|p| p.id == id))
+}
+
 /// A drop row here overlapping move `m`'s range, other than its own: its follower waits
 /// (cli692's Must 4). The id of the move it's from.
 pub(crate) fn pending_overlap(db: &Pigeonhole, m: &RangeMove) -> Result<Option<String>, String> {
