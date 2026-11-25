@@ -496,6 +496,53 @@ fn a_backup_and_a_feed_from_one_snapshot_bootstrap_a_replica() {
     primary.close().unwrap();
 }
 
+/// #2215: a replica's timestamp floor survives a crash before its next manifest commit, so
+/// once promoted it stamps a default write above every cell it applied, whatever the two
+/// nodes' clocks. The floor comes back from the replica's own WAL: each applied part is
+/// committed at a timestamp at or above its newest cell (`apply_replicated_with` seeds the
+/// floor first), and replay raises the floor to every record's commit timestamp. Here the
+/// primary's clock runs an hour ahead of the replica's, the replica crashes (power loss, then
+/// a process crash) with the applied cell only in its WAL, and its promoted write to the same
+/// cell must read back as the newest version.
+#[test]
+fn a_promoted_replica_stamps_above_what_it_applied_after_a_crash_before_any_flush() {
+    for (seed, kind) in [(51, CrashKind::Power), (53, CrashKind::Process)] {
+        let (pv, rv) = (SimVfs::new(seed), SimVfs::new(seed + 1));
+        pv.advance(3_600 * 1_000_000_000);
+        let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+        let mut feed = primary.feed().open().unwrap();
+        let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+        let t = primary
+            .table("t")
+            .unwrap()
+            .family("a", Family::default())
+            .create()
+            .unwrap();
+        t.mutate(b"r").put("a", b"q", b"old").commit().unwrap();
+        let old = t.get(b"r", "a", b"q").unwrap().unwrap().timestamp();
+        apply(&replica, &ready(&mut feed), 4);
+        rv.crash(kind);
+        drop(replica);
+        let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+        replica.promote().unwrap();
+        let r = replica.table("t").unwrap().open().unwrap();
+        r.mutate(b"r").put("a", b"q", b"new").commit().unwrap();
+        let got = r.get(b"r", "a", b"q").unwrap().unwrap();
+        assert_eq!(
+            got.value(),
+            b"new",
+            "{kind:?}: the promoted write sorts at or below the applied one (at {old}): the read \
+             returns {:?} at {}",
+            got.value(),
+            got.timestamp()
+        );
+        assert!(got.timestamp() > old, "{kind:?}");
+        drop((r, t, feed));
+        replica.close().unwrap();
+        primary.close().unwrap();
+    }
+}
+
 /// `promote` (#1436, ICR 0125): the replica becomes a primary at what it applied last. It
 /// returns the token it stopped at, takes writes, keeps its own feed going without a catalog
 /// event for the state table, clears `ro_compat` bit 0, and refuses any apply after it.
