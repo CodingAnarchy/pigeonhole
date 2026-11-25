@@ -406,6 +406,15 @@ impl Node {
                 final_seqno: m.final_seqno,
                 token: token.unwrap_or_default(),
             };
+            // D331, #2153: past every timestamp the move wrote here, before the gate opens
+            // the range, so a default-stamped write it takes there sorts after them all,
+            // whatever the two nodes' clocks. Durable before the serving row; a crash
+            // between the two raises it again (a raise to a floor already past is a no-op).
+            let newest = super::range_follow::newest_ts(db, &m.id).map_err(|e| e.message)?;
+            if newest > 0 {
+                db.raise_ts_floor(newest)
+                    .map_err(|e| format!("raise the timestamp floor: {e}"))?;
+            }
             ranges::write_serving(db, &row)?;
             gate.ranges().add_serving(row);
         }

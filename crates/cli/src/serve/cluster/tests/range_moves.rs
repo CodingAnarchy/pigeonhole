@@ -1792,6 +1792,72 @@ fn a_row_deleted_and_compacted_on_the_source_after_its_copy_is_gone_on_the_targe
     let _ = (t.db_a.close(), t.db_b.close());
 }
 
+/// #2153 (D331): before it serves the range, the target raises its timestamp floor past
+/// every cell it copied, so a default-stamped write it takes there sorts after them, whatever
+/// the two nodes' clocks. The source holds `c1` (copied) and then `c2` (through the
+/// catch-up) an hour ahead of every clock, as a source whose floor leads the target's clock
+/// does. Once the target serves, a put of each through the cluster reads back, not the
+/// copied value.
+#[test]
+fn a_targets_default_stamped_write_sorts_after_every_cell_it_copied() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+        + 3_600_000_000;
+    let src = t.db_a.table("users").unwrap().open().unwrap();
+    src.mutate(b"c1")
+        .put_at("f", b"q", ahead, b"copied")
+        .commit()
+        .unwrap();
+    let base = t.rt.block_on(async {
+        client(c)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    let v = base.map_version;
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+    });
+    src.mutate(b"c2")
+        .put_at("f", b"q", ahead + 1, b"caught up")
+        .commit()
+        .unwrap();
+    t.rt.block_on(async {
+        finish_move(&t, &base, v + 2).await;
+        eventually("p2 serves the range", async || {
+            get_row(c, "c1").await.is_ok_and(|v| v.is_some())
+        })
+        .await;
+        assert_eq!(get_row(c, "c1").await.unwrap(), Some(b"copied".to_vec()));
+        assert_eq!(get_row(c, "c2").await.unwrap(), Some(b"caught up".to_vec()));
+        for row in ["c1", "c2"] {
+            try_put(c, row, "new").await.unwrap();
+            assert_eq!(
+                get_row(c, row).await.unwrap(),
+                Some(b"new".to_vec()),
+                "{row}: the target's write sorts after the copied cell"
+            );
+        }
+    });
+    assert!(
+        super::super::range_follow::newest_ts(&t.db_b, "mv1").unwrap() > ahead,
+        "the catch-up's cell raised the newest timestamp"
+    );
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
 /// simp724 on the M-a fix: a stop that comes inside a row spanning several commits, with
 /// little of it left, waits for the row, so nothing is left half-copied, and the move goes
 /// on once the map gives it back.

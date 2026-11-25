@@ -11,7 +11,9 @@
 //! - **Progress** (in `__phdb_cluster`'s `moved` family, beside the moved-away and serving
 //!   rows, which every reader takes by their own prefixes, M4): `copy/<id>` holds the next
 //!   row to ask for, the copy's first token, the chunk count and `done`; `copy/<id>/<n>`
-//!   holds record `n`'s end row and snapshot seqno; `follow/<id>` the catch-up's token.
+//!   holds record `n`'s end row and snapshot seqno; `follow/<id>` the catch-up's token;
+//!   `newest/<id>` the newest timestamp of the cells written here (#2153), which the
+//!   target raises its timestamp floor past before it serves the range.
 //! - **Nothing is copied twice** (cli692's M-a on #2107): a chunk is written as commits of
 //!   whole rows of about 256 KiB, each with its own record (ending just past its last row)
 //!   and the head's `next`, so a resume asks only after the last row written. A row too big
@@ -597,6 +599,7 @@ impl Follower {
     ) -> Result<(), Failed> {
         let db = cx.db.clone();
         let table = cx.m.table.clone();
+        let id = self.id.clone();
         let held = cx.gate.enter()?;
         tokio::task::spawn_blocking(move || {
             let t = db.table(&table)?.open()?;
@@ -605,6 +608,7 @@ impl Follower {
             for c in &cells {
                 b.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
             }
+            push_newest(&mut b, &rows, &id, &cells)?;
             if let Some(p) = &progress {
                 p.push(&mut b, &rows);
             }
@@ -735,6 +739,7 @@ impl Follower {
         let db = cx.db.clone();
         let table = cx.m.table.clone();
         let row = [b"follow/".as_slice(), self.id.as_bytes()].concat();
+        let id = self.id.clone();
         let held = cx.gate.enter()?;
         tokio::task::spawn_blocking(move || {
             let t = db.table(&table)?.open()?;
@@ -743,6 +748,7 @@ impl Follower {
             for c in &cells {
                 b.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
             }
+            push_newest(&mut b, &rows, &id, &cells)?;
             put(&mut b, &rows, &row, b"token", &token);
             b.mark_feed_silent();
             b.commit().map(|_| ())
@@ -1029,12 +1035,14 @@ pub(crate) fn copies(db: &Pigeonhole) -> Result<Vec<(String, Option<CopyRange>)>
     Ok(out)
 }
 
-/// Deletes move `id`'s progress rows (`copy/<id>`, its records and `follow/<id>`).
+/// Deletes move `id`'s progress rows (`copy/<id>`, its records, `follow/<id>` and
+/// `newest/<id>`).
 pub(crate) fn prune(db: &Pigeonhole, id: &str) -> Result<(), ApiError> {
     let t = progress_table(db)?;
     let mut rows = vec![
         [b"copy/".as_slice(), id.as_bytes()].concat(),
         [b"follow/".as_slice(), id.as_bytes()].concat(),
+        newest_row(id),
     ];
     let prefix = format!("copy/{id}/").into_bytes();
     for row in t.scan_prefix(&prefix).family(FAMILY).iter()? {
@@ -1082,6 +1090,43 @@ fn merge_records(records: Chunks) -> Chunks {
         }
     }
     out
+}
+
+/// Move `id`'s `newest/<id>` row.
+fn newest_row(id: &str) -> Vec<u8> {
+    [b"newest/".as_slice(), id.as_bytes()].concat()
+}
+
+/// The newest timestamp `t`'s `newest/<id>` row holds; 0 without one.
+fn stored_newest(t: &pigeonhole::Table, id: &str) -> pigeonhole::Result<u64> {
+    Ok(t.get(&newest_row(id), FAMILY, b"ts")?
+        .and_then(|c| std::str::from_utf8(c.value()).ok()?.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Adds to `b` the raise of `newest/<id>` to the newest of `cells`' timestamps, when that
+/// is past the stored one (#2153). Two followers of a move never write at once (M1), so
+/// the read before the commit isn't raced.
+fn push_newest(
+    b: &mut pigeonhole::replication::LoggedBatch<'_>,
+    t: &pigeonhole::Table,
+    id: &str,
+    cells: &[CopiedCell],
+) -> pigeonhole::Result<()> {
+    let Some(newest) = cells.iter().map(|c| c.ts).max() else {
+        return Ok(());
+    };
+    if newest > stored_newest(t, id)? {
+        put(b, t, &newest_row(id), b"ts", newest.to_string().as_bytes());
+    }
+    Ok(())
+}
+
+/// The newest timestamp of the cells move `id`'s copy and catch-up wrote here (#2153): the
+/// target raises its timestamp floor past it before it serves the range. 0 when they wrote
+/// none.
+pub(crate) fn newest_ts(db: &Pigeonhole, id: &str) -> Result<u64, ApiError> {
+    Ok(stored_newest(&progress_table(db)?, id)?)
 }
 
 /// The catch-up's token, once it has stored one.
