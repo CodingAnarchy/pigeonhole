@@ -1120,6 +1120,10 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
             async || taken(&super::super::range_follow::HOLD_COMMIT, &dirs[1]),
         )
         .await;
+        // The first chunk's records, read while the hold keeps the second out and before the
+        // abort: once b takes it, the abort's reconcile (D331 PR 5) may prune them at any
+        // moment (the race behind main's flake since 2026-11-20).
+        recorded_before = records(&db_b);
         // The move goes from the map (an abort at COPYING) while the chunk is in hand. The
         // hold is never released, so only the stop wakes the follower, and its own check
         // must keep it from committing.
@@ -1130,7 +1134,6 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
             move_status(b, "p2", "mv1").await.is_none()
         })
         .await;
-        recorded_before = records(&db_b);
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
     let users = db_b.table("users").unwrap().open().unwrap();
@@ -1200,6 +1203,10 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
             async || taken(&super::super::range_follow::HOLD_COMMIT, &dirs[1]),
         )
         .await;
+        // The first chunk's records, read while the hold keeps the second out and before the
+        // abort: once b takes it, the abort's reconcile (D331 PR 5) may prune them at any
+        // moment (the race behind main's flake since 2026-11-20).
+        recorded_before = records(&db_b);
         push(&ports, &moving(&v1, 3, Some(MovePhase::Aborting))).await;
         eventually("b takes the abort", async || {
             move_status(b, "p2", "mv1")
@@ -1207,7 +1214,6 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
                 .is_some_and(|s| s.phase == MovePhase::Aborting as i32)
         })
         .await;
-        recorded_before = records(&db_b);
         tokio::time::sleep(Duration::from_millis(500)).await;
         let t = move_status(b, "p2", "mv1").await.unwrap();
         assert!(!t.serving, "the target serves none of it");

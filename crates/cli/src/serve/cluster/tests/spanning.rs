@@ -431,7 +431,7 @@ fn resolving() -> crate::serve::config::Limits {
 }
 
 /// `Transactions.Outcome` of `id` through `port`.
-async fn outcome(
+pub(super) async fn outcome(
     port: u16,
     id: &str,
 ) -> Result<super::super::proto::TxnOutcomeResponse, tonic::Status> {
