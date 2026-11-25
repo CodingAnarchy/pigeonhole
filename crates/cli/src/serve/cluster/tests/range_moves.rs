@@ -1277,6 +1277,64 @@ fn a_branch_that_wrote_the_range_before_the_fence_cant_prepare_after_it() {
     );
 }
 
+/// #2155: the home's twin of the branch test above. A spanning transaction homed on the
+/// source that buffered a row of the moving range before the fence is refused at its
+/// commit, as a plain transaction is (M3), whether or not it has a branch: before the fix the
+/// home committed the row on the source above the fence's seqno and answered committed, and
+/// the target never got it. With the fence up, the home also takes no new row of the range,
+/// in a `TxnWrite` or carried by a `Commit`.
+#[test]
+fn a_home_that_wrote_the_range_before_the_fence_cant_commit_after_it() {
+    let t = three();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::CatchingUp))).await;
+        // Home p1 (by "d05", inside the moving [c, f)). One transaction is the home's alone;
+        // the other has a branch on p2 as well.
+        let alone = super::spanning::begin_spanning(c, "d05").await.unwrap();
+        txn_write(c, &alone, vec![put_row("d05", "1")], None)
+            .await
+            .unwrap();
+        let both = super::spanning::begin_spanning(c, "d06").await.unwrap();
+        txn_write(c, &both, vec![put_row("d06", "1")], None)
+            .await
+            .unwrap();
+        txn_write(c, &both, vec![put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        push(&t.ports, &moving(&t.v1, 3, Some(MovePhase::HandingOver))).await;
+        for id in [&alone, &both] {
+            let refused = super::spanning::commit_parts(c, id, Vec::new()).await;
+            let e = refused.expect_err("a home commit across the fence");
+            assert_eq!(code(&e), "Fenced", "retry-safe, as a plain commit's: {e}");
+        }
+        assert_eq!(get_row(c, "zed").await.unwrap(), None, "the branch wrote");
+        // Begun after the fence: no row of the range is taken, buffered or carried.
+        let late = super::spanning::begin_spanning(c, "b01").await.unwrap();
+        let refused = txn_write(c, &late, vec![put_row("d07", "1")], None).await;
+        assert!(refused.is_err(), "{refused:?}");
+        let carried = super::spanning::begin_spanning(c, "b02").await.unwrap();
+        let refused = super::spanning::commit_parts(c, &carried, vec![put_row("d08", "1")]).await;
+        assert!(refused.is_err(), "{refused:?}");
+        // Outside the range the home commits as before.
+        let outside = super::spanning::begin_spanning(c, "b03").await.unwrap();
+        txn_write(c, &outside, vec![put_row("b03", "1")], None)
+            .await
+            .unwrap();
+        super::spanning::commit_parts(c, &outside, Vec::new())
+            .await
+            .unwrap();
+    });
+    let users = t.db_a.table("users").unwrap().open().unwrap();
+    for row in ["d05", "d06", "d07", "d08"] {
+        assert!(
+            users.get(row.as_bytes(), "f", b"q").unwrap().is_none(),
+            "the home wrote {row} on the source past its fence"
+        );
+    }
+    assert!(users.get(b"b03", "f", b"q").unwrap().is_some());
+}
+
 /// Three nodes as the PR 4b tests run them: p1 on a, p2 on b, c routing. The databases of a
 /// and b, the map, the ports, the directories and the stop senders.
 struct Three {
