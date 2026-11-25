@@ -1,5 +1,34 @@
 use super::*;
 
+/// The outcome of a spanning transaction ended before its commit point by `err` (#2161).
+/// `OutcomeUnknown` there means a branch's answer to a buffered write was lost; the
+/// transaction itself is ended and its branches aborted, so nothing of it commits. It
+/// becomes `Conflict` (retry the transaction), keeping what was lost in the message, so a
+/// client isn't sent to `Outcome` for what is already certain. Any other error stands.
+fn ended_before_commit(err: ApiError) -> ApiError {
+    if err.code != "OutcomeUnknown" {
+        return err;
+    }
+    ApiError::from_code(
+        pigeonhole::ErrorCode::Conflict,
+        &format!(
+            "the transaction was ended before its commit point, and nothing of it was \
+             committed: a write it sent to another partition got no answer ({}). Retry the \
+             transaction",
+            err.message
+        ),
+    )
+}
+
+/// The home's part of a spanning commit that wrote, as [`Service::spanning_write`] takes
+/// it: its transaction, the durability asked for, and the rows the `Commit` carried for
+/// the home (already applied to the transaction; kept for the range rule, #2155).
+struct HomeCommit {
+    txn: pigeonhole::Transaction,
+    durability: Option<pigeonhole::Durability>,
+    carried: Vec<proto::RowWrites>,
+}
+
 impl Service {
     /// The home partition's `Begin` of a spanning transaction (D329): its id carries the
     /// home's history epoch (`epoch`), and is its xid. The decision table is made first, if
@@ -53,16 +82,50 @@ impl Service {
         }
     }
 
+    /// D331's range rule for a spanning transaction's home (#2155), as a plain commit's
+    /// ([`Service::commit`]): `rows`, the home's own, are refused as writes to a range a
+    /// move fences or moved away, and with `snapshot` a transaction that writes is refused
+    /// when it's open across the range's fence or hand-over (M3). A `TxnWrite` passes no
+    /// snapshot: its rows only. `Ok` off a cluster and while no move names the partition.
+    pub(crate) fn home_ranges(
+        &self,
+        rows: &[proto::RowWrites],
+        snapshot: Option<u64>,
+    ) -> Result<(), ApiError> {
+        match &self.gate {
+            Some(gate) => Self::ranges_commit(gate, rows, snapshot),
+            None => Ok(()),
+        }
+    }
+
+    /// [`home_ranges`](Self::home_ranges) on `gate`, with one load of its range state.
+    fn ranges_commit(
+        gate: &super::super::gate::WriteGate,
+        rows: &[proto::RowWrites],
+        snapshot: Option<u64>,
+    ) -> Result<(), ApiError> {
+        match &*gate.ranges().load() {
+            Some(ranges) => ranges.commit(rows, snapshot.unwrap_or(0), snapshot.is_some()),
+            None => Ok(()),
+        }
+    }
+
     /// Ends spanning transaction `g` after a call that sent rows to a branch failed (D329,
     /// audit120's M3b on #2062): its branches are aborted (in the background, on their own
     /// budget), and `err` becomes the session's recorded outcome, so a retry finds the
     /// transaction ended rather than applying those rows again. Returns `err`.
+    ///
+    /// Every caller is before the commit point, so the transaction's outcome is known
+    /// whatever `err` says: it didn't commit and can't. An `OutcomeUnknown` (a branch's
+    /// answer to a write was lost) is true of that one write, not of the transaction, so it
+    /// is recorded and returned as [`ended_before_commit`] makes it (#2161).
     pub(crate) fn end_spanning(
         mut g: super::super::sessions::TxnGuard,
         err: ApiError,
         driver: &super::super::cluster::spanning::Driver,
     ) -> ApiError {
         use super::super::cluster::spanning::SpanView;
+        let err = ended_before_commit(err);
         if let Some(span) = g.span() {
             let mut branches = span.branches(&driver.home);
             branches.extend(span.idle(&driver.home));
@@ -131,7 +194,11 @@ impl Service {
     /// 2b): commits every branch acknowledged, and abort markers. Returns how many went.
     pub(crate) async fn sweep_decisions(&self, now_ms: u64) -> Result<usize, ApiError> {
         use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
-        let table = self.decisions_table().await?;
+        // A home that never decided anything has no table: nothing to sweep, and nothing
+        // written to create it (the balancer judges an idle partition's device bytes).
+        let Some(table) = self.existing_decisions_table()? else {
+            return Ok(0);
+        };
         let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
         let gone: Vec<Vec<u8>> = {
             let table = table.clone();
@@ -161,6 +228,47 @@ impl Service {
         }
         drop(held);
         Ok(n)
+    }
+
+    /// This home's committed decision rows past `--txn-outcome-retention` at `now_ms` that
+    /// some branch never acked, at most `limit` of them, after xid `after` if given (the
+    /// sweep's cursor): each xid with the branches it still waits on (#2098).
+    pub(crate) async fn unacked_decisions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<(String, Vec<String>)>, ApiError> {
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, unacked};
+        let Some(table) = self.existing_decisions_table()? else {
+            return Ok(Vec::new());
+        };
+        let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        let after = after.map(|a| a.as_bytes().to_vec());
+        self.blocking(move || {
+            let mut out = Vec::new();
+            for row in table.scan_prefix(b"").iter()? {
+                if out.len() >= limit {
+                    break;
+                }
+                let row = row?;
+                if after.as_deref().is_some_and(|a| row.key() <= a) {
+                    continue;
+                }
+                let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
+                    continue;
+                };
+                let (Ok(xid), Some(waiting)) = (
+                    std::str::from_utf8(row.key()),
+                    unacked(cell.value(), now_ms, retention),
+                ) else {
+                    continue;
+                };
+                out.push((xid.to_owned(), waiting));
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// What transaction `id` is now, without taking it (D329's `Outcome` and resolver), as
@@ -445,6 +553,7 @@ impl Service {
         let branches = span.branches(&home);
         let idle = span.idle(&home);
         let home_read = span.read(&home);
+        let carried = r.rows;
         let (txn, durability, ticket) = g.commit();
         let me = Arc::clone(self);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -459,7 +568,12 @@ impl Service {
             }
             let outcome = match decisions {
                 Some(decisions) => {
-                    me.spanning_write(txn, durability, &decisions, &gate, &driver, &branches)
+                    let home = HomeCommit {
+                        txn,
+                        durability,
+                        carried,
+                    };
+                    me.spanning_write(home, &decisions, &gate, &driver, &branches)
                         .await
                 }
                 None => {
@@ -500,6 +614,14 @@ impl Service {
         })
     }
 
+    /// This home's decision table, if it has one: the decision sweeps read it, and never
+    /// create it, so an idle partition's sweep writes nothing (#2164: a catalog change on
+    /// every partition of an idle cluster showed in its device load).
+    pub(crate) fn existing_decisions_table(&self) -> Result<Option<Table>, ApiError> {
+        use super::super::cluster::spanning::DECISIONS;
+        Ok(self.part()?.db.table(DECISIONS).and_then(|t| t.open()).ok())
+    }
+
     /// The home's decision table (D329). Created through the gate if it's missing (a write
     /// to the file: never past a fence's drain), the first time a spanning transaction
     /// begins on the partition.
@@ -533,13 +655,17 @@ impl Service {
     /// [`Driver::for_round`]: super::super::cluster::spanning::Driver::for_round
     async fn spanning_write(
         &self,
-        mut txn: pigeonhole::Transaction,
-        durability: Option<pigeonhole::Durability>,
+        home: HomeCommit,
         decisions: &Table,
         gate: &Arc<super::super::gate::WriteGate>,
         driver: &super::super::cluster::spanning::Driver,
         branches: &[String],
     ) -> super::super::sessions::Outcome {
+        let HomeCommit {
+            mut txn,
+            durability,
+            carried,
+        } = home;
         use super::super::cluster::spanning::{
             DECISION_FAMILY, DECISION_QUALIFIER, committed_value,
         };
@@ -621,6 +747,16 @@ impl Service {
                 return Err(e);
             }
         };
+        // D331's range rule under the held count (#2155), as a plain commit's and a branch's
+        // prepare: the rows this commit carried, as writes, and M3, so a home row buffered
+        // before a range's fence or hand-over can't land above the fence's seqno. One that
+        // passes is either waited for by the fence's drain (admitted before it) or saw no
+        // fence. Before the commit point: the branches abort, and the refusal is retry-safe.
+        if let Err(e) = Self::ranges_commit(gate, &carried, Some(txn.snapshot_seqno())) {
+            drop(held);
+            abort().await;
+            return Err(e);
+        }
         let d = durability
             .unwrap_or(pigeonhole::Durability::GroupSync)
             .max(pigeonhole::Durability::GroupSync);

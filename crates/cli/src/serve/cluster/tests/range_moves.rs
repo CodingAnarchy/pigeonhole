@@ -215,8 +215,8 @@ fn an_opening_partition_gates_a_moved_range_from_its_file() {
         },
     )
     .unwrap();
-    let gate = n.open_gate("p1", 2);
-    n.arm_ranges(&gate, "p1", &db, || ()).unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 2, &db, || ()).unwrap();
     let state = (*gate.ranges().load())
         .clone()
         .expect("the row gates the range");
@@ -289,8 +289,8 @@ fn an_opening_source_fences_a_handing_over_range() {
         pigeonhole::Options::default().shards(1),
     )
     .unwrap();
-    let gate = n.open_gate("p1", 1);
-    n.arm_ranges(&gate, "p1", &db, || ()).unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 1, &db, || ()).unwrap();
     let state = (*gate.ranges().load()).clone().expect("fenced");
     let put = crate::serve::service::ServiceOp::Mutate(crate::serve::proto::MutateRequest {
         writes: Some(put_row("d", "x")),
@@ -1120,6 +1120,10 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
             async || taken(&super::super::range_follow::HOLD_COMMIT, &dirs[1]),
         )
         .await;
+        // The first chunk's records, read while the hold keeps the second out and before the
+        // abort: once b takes it, the abort's reconcile (D331 PR 5) may prune them at any
+        // moment (the race behind main's flake since 2026-11-20).
+        recorded_before = records(&db_b);
         // The move goes from the map (an abort at COPYING) while the chunk is in hand. The
         // hold is never released, so only the stop wakes the follower, and its own check
         // must keep it from committing.
@@ -1130,7 +1134,6 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
             move_status(b, "p2", "mv1").await.is_none()
         })
         .await;
-        recorded_before = records(&db_b);
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
     let users = db_b.table("users").unwrap().open().unwrap();
@@ -1200,6 +1203,10 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
             async || taken(&super::super::range_follow::HOLD_COMMIT, &dirs[1]),
         )
         .await;
+        // The first chunk's records, read while the hold keeps the second out and before the
+        // abort: once b takes it, the abort's reconcile (D331 PR 5) may prune them at any
+        // moment (the race behind main's flake since 2026-11-20).
+        recorded_before = records(&db_b);
         push(&ports, &moving(&v1, 3, Some(MovePhase::Aborting))).await;
         eventually("b takes the abort", async || {
             move_status(b, "p2", "mv1")
@@ -1207,7 +1214,6 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
                 .is_some_and(|s| s.phase == MovePhase::Aborting as i32)
         })
         .await;
-        recorded_before = records(&db_b);
         tokio::time::sleep(Duration::from_millis(500)).await;
         let t = move_status(b, "p2", "mv1").await.unwrap();
         assert!(!t.serving, "the target serves none of it");
@@ -1275,6 +1281,64 @@ fn a_branch_that_wrote_the_range_before_the_fence_cant_prepare_after_it() {
         users.get(b"d05", "f", b"q").unwrap().is_none(),
         "the branch wrote on the source past its fence"
     );
+}
+
+/// #2155: the home's twin of the branch test above. A spanning transaction homed on the
+/// source that buffered a row of the moving range before the fence is refused at its
+/// commit, as a plain transaction is (M3), whether or not it has a branch: before the fix the
+/// home committed the row on the source above the fence's seqno and answered committed, and
+/// the target never got it. With the fence up, the home also takes no new row of the range,
+/// in a `TxnWrite` or carried by a `Commit`.
+#[test]
+fn a_home_that_wrote_the_range_before_the_fence_cant_commit_after_it() {
+    let t = three();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::CatchingUp))).await;
+        // Home p1 (by "d05", inside the moving [c, f)). One transaction is the home's alone;
+        // the other has a branch on p2 as well.
+        let alone = super::spanning::begin_spanning(c, "d05").await.unwrap();
+        txn_write(c, &alone, vec![put_row("d05", "1")], None)
+            .await
+            .unwrap();
+        let both = super::spanning::begin_spanning(c, "d06").await.unwrap();
+        txn_write(c, &both, vec![put_row("d06", "1")], None)
+            .await
+            .unwrap();
+        txn_write(c, &both, vec![put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        push(&t.ports, &moving(&t.v1, 3, Some(MovePhase::HandingOver))).await;
+        for id in [&alone, &both] {
+            let refused = super::spanning::commit_parts(c, id, Vec::new()).await;
+            let e = refused.expect_err("a home commit across the fence");
+            assert_eq!(code(&e), "Fenced", "retry-safe, as a plain commit's: {e}");
+        }
+        assert_eq!(get_row(c, "zed").await.unwrap(), None, "the branch wrote");
+        // Begun after the fence: no row of the range is taken, buffered or carried.
+        let late = super::spanning::begin_spanning(c, "b01").await.unwrap();
+        let refused = txn_write(c, &late, vec![put_row("d07", "1")], None).await;
+        assert!(refused.is_err(), "{refused:?}");
+        let carried = super::spanning::begin_spanning(c, "b02").await.unwrap();
+        let refused = super::spanning::commit_parts(c, &carried, vec![put_row("d08", "1")]).await;
+        assert!(refused.is_err(), "{refused:?}");
+        // Outside the range the home commits as before.
+        let outside = super::spanning::begin_spanning(c, "b03").await.unwrap();
+        txn_write(c, &outside, vec![put_row("b03", "1")], None)
+            .await
+            .unwrap();
+        super::spanning::commit_parts(c, &outside, Vec::new())
+            .await
+            .unwrap();
+    });
+    let users = t.db_a.table("users").unwrap().open().unwrap();
+    for row in ["d05", "d06", "d07", "d08"] {
+        assert!(
+            users.get(row.as_bytes(), "f", b"q").unwrap().is_none(),
+            "the home wrote {row} on the source past its fence"
+        );
+    }
+    assert!(users.get(b"b03", "f", b"q").unwrap().is_some());
 }
 
 /// Three nodes as the PR 4b tests run them: p1 on a, p2 on b, c routing. The databases of a
