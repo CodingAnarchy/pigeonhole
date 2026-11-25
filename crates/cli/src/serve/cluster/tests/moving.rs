@@ -1223,26 +1223,17 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
                 })
         })
         .await;
-        // #2072: Status reports p1 from its gate, which the open registers before the router
-        // has the partition (`open_gate`, then the parts' store). A call in between answers
-        // `PartitionUnavailable` ("isn't open here"), retry-safe and right, so wait until a
-        // write reaches p1's gate. Nothing else may answer, and nothing is written.
-        eventually("c's router to route to p1", async || {
-            let e = data(c)
-                .await
-                .mutate(MutateRequest {
-                    writes: Some(put_row("amy", "0")),
-                    durability: 0,
-                })
-                .await
-                .expect_err("an unconfirmed partition takes no write");
-            match code(&e).as_str() {
-                "Fenced" => true,
-                "PartitionUnavailable" => false,
-                other => panic!("{other}: {e}"),
-            }
-        })
-        .await;
+        // Status shows p1 open only once c's router has it (#2113; #2072 waited for that
+        // here): a write reaches its gate at once.
+        let e = data(c)
+            .await
+            .mutate(MutateRequest {
+                writes: Some(put_row("amy", "0")),
+                durability: 0,
+            })
+            .await
+            .expect_err("an unconfirmed partition takes no write");
+        assert_eq!(code(&e), "Fenced", "{e}");
         let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
             .unwrap()
             .connect()
