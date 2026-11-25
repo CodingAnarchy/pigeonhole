@@ -11,6 +11,7 @@
 //! is above every one a promote of P recorded ([`target_epoch`]), not always the map's
 //! + 1: a copy stamped by a promote that never finished is never taken for a new history.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -27,6 +28,13 @@ use crate::serve::proto::{self, GetMapRequest, StatusRequest};
 #[cfg(test)]
 pub(crate) static STOP_AFTER_STAMP: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
+
+/// How long the CLI's survey of a node's `Status` waits (#2152).
+const SURVEY_WAIT: Duration = Duration::from_secs(3);
+
+/// Past the longest grant's time left, before the promote looks again (#2152): the grantors'
+/// clocks and the survey's own delay.
+const GRANT_SLACK: Duration = Duration::from_millis(500);
 
 /// How long the promote waits for ID to close its copy after the map dropped it.
 const CLOSE_WAIT: Duration = Duration::from_secs(60);
@@ -194,7 +202,10 @@ pub(crate) async fn promote(
         map: &m,
         timeout,
     };
-    let done = run(&ops, &m, partition, to, &How::Manual).await?;
+    let done = run(&ops, &m, partition, to, &How::Manual { old_unreachable }).await?;
+    for w in &done.warnings {
+        eprintln!("phdb cluster promote: warning: {w}");
+    }
     let (applied, primary, replica) = (done.applied, done.primary, done.replica);
     let lost = if old_unreachable {
         json!(
@@ -229,6 +240,9 @@ pub(crate) async fn promote(
         ],
         Value::Null,
     );
+    if !done.warnings.is_empty() {
+        r.document.insert("warnings".into(), json!(done.warnings));
+    }
     if owner.is_some_and(|lp| lp.state() == S::Fenced) {
         r.document.insert(
             "old_owner".into(),
@@ -243,8 +257,10 @@ pub(crate) async fn promote(
 
 /// How a promote was asked for.
 pub(crate) enum How {
-    /// `phdb cluster promote`: the operator's checks of the old owner were made.
-    Manual,
+    /// `phdb cluster promote`: the operator's checks of the old owner were made. With
+    /// `old_unreachable` the owner couldn't be asked, so it may come back while the promote
+    /// runs (#2152).
+    Manual { old_unreachable: bool },
     /// The map's writer failing a down partition over (D330 PR 2): the in-doubt shares the
     /// old owner last reported, for the event, and the partition's failover count rises.
     Failover {
@@ -265,6 +281,17 @@ pub(crate) struct Promoted {
     /// earlier run).
     pub(crate) replica: bool,
     pub(crate) map_version: u64,
+    /// What the promote couldn't check, for the caller to report (#2152: no node reported
+    /// its lease, so the time between the surveys of the old owner's grants went unbounded).
+    pub(crate) warnings: Vec<String>,
+}
+
+/// A planned map change: its version, and how many of its nodes hold it, the writer
+/// included.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Set {
+    pub(crate) version: u64,
+    pub(crate) held: usize,
 }
 
 /// What a promote does to the cluster (D330 PR 2's F1), so `phdb cluster promote` and the
@@ -279,8 +306,16 @@ pub(crate) trait Promoter {
     ) -> Result<Option<proto::LocalPartition>, Failure>;
     /// The map as the writer has it.
     async fn map(&self) -> Result<proto::ClusterMap, Failure>;
-    /// Sets `m` (its version already raised) as a planned change; its version.
-    async fn set_map(&self, m: proto::ClusterMap) -> Result<u64, Failure>;
+    /// Sets `m` (its version already raised) as a planned change.
+    async fn set_map(&self, m: proto::ClusterMap) -> Result<Set, Failure>;
+    /// Now, in nanoseconds, on a clock that counts a suspend (the lease clock's).
+    fn now(&self) -> u64;
+    /// Every node of the map's `Status`, by id: `None` for one that didn't answer (#2152).
+    async fn survey(&self) -> Result<HashMap<String, Option<proto::NodeStatus>>, Failure>;
+    /// Waits `d` (#2152: for an unreachable owner's grants to run out).
+    async fn sleep(&self, d: Duration) {
+        tokio::time::sleep(d).await;
+    }
     /// Stamps node `id`'s copy.
     async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<(), Failure>;
     /// Waits for node `id` to close its replica copy of `partition`.
@@ -401,10 +436,173 @@ pub(crate) fn range_move_holds(m: &proto::ClusterMap, partition: &str) -> Option
     ))
 }
 
+/// The pending promote of `p` in `m` that keeps `p`'s lease from its owner (#2152): the
+/// latest PENDING partition event of it above its epoch, from its owner. Grantors give P's
+/// owner no lease while it's there (`lease.rs`), so an owner that comes back mid-promote
+/// can't take writes the promoted copy would lose.
+pub(crate) fn pending_promote<'a>(
+    m: &'a proto::ClusterMap,
+    p: &proto::Partition,
+) -> Option<&'a proto::FailoverEvent> {
+    use proto::{FailoverKind as K, FailoverState as St};
+    m.failovers
+        .iter()
+        .filter(|e| {
+            e.kind() == K::Partition
+                && e.partition == p.id
+                && e.from == p.node
+                && e.state() == St::Pending
+                && e.to_epoch > p.epoch
+        })
+        .max_by_key(|e| e.to_epoch)
+}
+
+/// Why a promote of `p` must stop for its owner, by a survey of every node of `m` (#2152):
+/// the owner serves P, or another node still grants it P's lease, or too few of the other
+/// nodes can be asked to tell. An owner's lease needs a majority, at most one grant of it its
+/// own, so a survey that hears all but `majority − 2` of the others (none restarted, since a
+/// restart forgets its grants: D326's start grace) sees at least one grant of any lease it
+/// holds. `None`: it holds none.
+pub(crate) fn owner_back(
+    m: &proto::ClusterMap,
+    p: &proto::Partition,
+    statuses: &HashMap<String, Option<proto::NodeStatus>>,
+) -> Option<String> {
+    let owner = statuses.get(&p.node).and_then(Option::as_ref);
+    if super::failover::serves(p, owner) {
+        return Some(format!(
+            "node {:?}, {}'s owner, answers and serves it",
+            p.node, p.id
+        ));
+    }
+    // An owner that answers and holds no lease of P says so itself: a lease it took between
+    // two surveys within a lease of each other would still run at the second, so the other
+    // nodes needn't all be asked (only grants they do report count, below).
+    let unleased = owner.is_some_and(|st| {
+        !st.partitions.iter().any(|lp| {
+            lp.id == p.id
+                && lp.role() != proto::PartitionRole::Replica
+                && lp.epoch == p.epoch
+                && lp.lease_remaining_ms > 0
+        })
+    });
+    let mut unknown = Vec::new();
+    for n in m.nodes.iter().filter(|n| n.id != p.node) {
+        let Some(Some(st)) = statuses.get(&n.id) else {
+            unknown.push(format!("{} didn't answer", n.id));
+            continue;
+        };
+        if let Some(g) = st
+            .grants
+            .iter()
+            .find(|g| g.partition == p.id && g.holder == p.node && g.remaining_ms > 0)
+        {
+            return Some(format!(
+                "node {} grants {}'s lease to its owner, node {:?} ({} ms left): the owner \
+                 holds it or renewed it",
+                n.id, p.id, p.node, g.remaining_ms
+            ));
+        }
+        if st.grace_remaining_ms > 0 {
+            unknown.push(format!("{} restarted", n.id));
+        }
+    }
+    let majority = m.nodes.len() / 2 + 1;
+    (!unleased && unknown.len() + 2 > majority).then(|| {
+        format!(
+            "can't tell whether {}'s owner, node {:?}, took its lease back: {} ({} of the \
+             other nodes can't be asked, and a lease needs only {} of them)",
+            p.id,
+            p.node,
+            unknown.join(", "),
+            unknown.len(),
+            majority - 1
+        )
+    })
+}
+
+/// The longest time left on another node's grant of `p`'s lease to its owner, in
+/// `statuses` (#2152): `None` when none is live.
+fn owner_grant_left(
+    p: &proto::Partition,
+    statuses: &HashMap<String, Option<proto::NodeStatus>>,
+) -> Option<Duration> {
+    statuses
+        .iter()
+        .filter(|(id, _)| **id != p.node)
+        .filter_map(|(_, st)| st.as_ref())
+        .flat_map(|st| &st.grants)
+        .filter(|g| g.partition == p.id && g.holder == p.node && g.remaining_ms > 0)
+        .map(|g| Duration::from_millis(g.remaining_ms))
+        .max()
+}
+
+/// The cluster's lease as `statuses` report it (D326: every node runs with one), the
+/// smallest reported; `None` when no node reports it (an older build). With the node ids
+/// that didn't.
+pub(crate) fn surveyed_lease(
+    statuses: &HashMap<String, Option<proto::NodeStatus>>,
+) -> (Option<Duration>, Vec<String>) {
+    let mut lease = None;
+    let mut silent = Vec::new();
+    for (id, st) in statuses {
+        match st.as_ref().map(|st| st.lease_ms) {
+            Some(0) => silent.push(id.clone()),
+            Some(ms) => {
+                let d = Duration::from_millis(ms);
+                lease = Some(lease.map_or(d, |l: Duration| l.min(d)));
+            }
+            None => {}
+        }
+    }
+    silent.sort();
+    (lease, silent)
+}
+
+/// Abandons the pending promote of `partition` to `to` at `target` before its stamp
+/// (#2152): the event ABANDONED, and `to` back in P's replicas, since its copy is still
+/// unstamped. Waits for that copy to close first, so the node opens it again from the new
+/// map rather than finishing a close begun on the old one.
+async fn abandon_unstamped(
+    ops: &impl Promoter,
+    partition: &str,
+    to: &str,
+    target: u64,
+) -> Result<u64, Failure> {
+    use proto::{FailoverKind as K, FailoverState as St};
+    let _ = ops.wait_closed(to, partition).await;
+    let mut m = ops.map().await?;
+    let mut changed = false;
+    for e in m.failovers.iter_mut().filter(|e| {
+        e.kind() == K::Partition
+            && e.partition == partition
+            && e.to == to
+            && e.to_epoch == target
+            && e.state() == St::Pending
+    }) {
+        e.set_state(St::Abandoned);
+        changed = true;
+    }
+    for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
+        if q.node != to && !q.replicas.iter().any(|r| r == to) {
+            q.replicas.push(to.to_owned());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(m.map_version);
+    }
+    m.map_version += 1;
+    Ok(ops.set_map(m).await?.version)
+}
+
 /// Promotes node `to`'s copy of `partition` in `m` (D328 PR 3, with D330 PR 2's pending
 /// events): the steps after the caller's checks of the old owner.
 /// 1. `to` leaves P's replicas, so it closes its copy; with writer terms the same map
-///    records the promote pending at its epoch ([`target_epoch`]), before any stamp.
+///    records the promote pending at its epoch ([`target_epoch`]), before any stamp. When
+///    the old owner couldn't be asked (a failover, or `--old-unreachable`), that map must
+///    reach a majority, and surveys of P's grants before and after it must find none to the
+///    owner, within a lease of each other (#2152); else the promote stops, abandoned.
 /// 2. The copy is promoted and stamped at that epoch.
 /// 3. The map gives P to `to` there, with a new history, and marks the promote done.
 /// 4. It waits for `to` to serve P.
@@ -458,6 +656,45 @@ pub(crate) async fn run(
         )));
     }
     let (applied, primary) = (row.replica_applied_seqno, row.replica_primary_seqno);
+    // #2152: an owner that couldn't be asked may come back while this runs, renew its lease
+    // and take writes the copy would never have. Until the copy is stamped, P's grants are
+    // surveyed before step 1's map and again once that map, whose pending promote stops
+    // every grant of P to its owner, is on a majority.
+    let guard = !stamped
+        && match how {
+            How::Manual { old_unreachable } => *old_unreachable,
+            How::Failover { .. } => true,
+        };
+    let mut warnings = Vec::new();
+    let first = if guard {
+        let mut t0 = ops.now();
+        let mut statuses = ops.survey().await?;
+        // `--old-unreachable` right after the owner stopped: the others' grants to it end
+        // within their time left, so the promote waits them out, two leases at most (a
+        // stopping owner may renew once more on its way down). Grants still live after that
+        // are an owner that renews: alive, so the promote doesn't start.
+        if matches!(how, How::Manual { .. }) {
+            let began = t0;
+            while let Some(left) = owner_grant_left(&p, &statuses) {
+                let lease = surveyed_lease(&statuses).0.unwrap_or(left);
+                let waited = Duration::from_nanos(ops.now().saturating_sub(began));
+                if waited >= lease * 2 {
+                    break;
+                }
+                ops.sleep(left + GRANT_SLACK).await;
+                t0 = ops.now();
+                statuses = ops.survey().await?;
+            }
+        }
+        if let Some(why) = owner_back(m, &p, &statuses) {
+            return Err(Failure::usage(&format!(
+                "{why}: the promote of {partition} to node {to:?} didn't start"
+            )));
+        }
+        Some((t0, surveyed_lease(&statuses).0))
+    } else {
+        None
+    };
     // 1. ID leaves P's replicas, so it closes its copy (D328 PR 1's sync); with writer terms
     // the same map records the promote pending at `target`, before the stamp (S2). A copy
     // still open while `to` is out of P's replicas is an earlier run's, closing (simp724's
@@ -467,7 +704,9 @@ pub(crate) async fn run(
     // (simp724's M1 on #2007).
     let leave = replica && p.replicas.iter().any(|r| r == to);
     let record = terms && !resumes && !stamped;
-    if leave || record {
+    // With the guard, a map is set even with nothing to change (a rerun's), so the pending
+    // promote is known to be on a majority before the stamp (#2159's item 2).
+    if leave || record || guard {
         let mut m1 = m.clone();
         m1.map_version += 1;
         if leave {
@@ -482,7 +721,7 @@ pub(crate) async fn run(
                 e.set_state(St::Abandoned);
             }
             let (in_doubt_xids, in_doubt_count) = match how {
-                How::Manual => (Vec::new(), 0),
+                How::Manual { .. } => (Vec::new(), 0),
                 How::Failover {
                     in_doubt_xids,
                     in_doubt_count,
@@ -506,7 +745,49 @@ pub(crate) async fn run(
             e.set_state(St::Pending);
             push_event(&mut m1, e);
         }
-        ops.set_map(m1).await?;
+        let set = ops.set_map(m1).await?;
+        let majority = m.nodes.len() / 2 + 1;
+        if guard && set.held < majority {
+            return Err(Failure::usage(&format!(
+                "map version {} reached {} of the map's {} nodes, not a majority: the promote \
+                 of {partition} to node {to:?} stays pending, unstamped, for a later run",
+                set.version,
+                set.held,
+                m.nodes.len()
+            )));
+        }
+    }
+    if let Some((t0, lease)) = first {
+        let statuses = ops.survey().await?;
+        let now = ops.now();
+        let (reported, silent) = surveyed_lease(&statuses);
+        let why = owner_back(m, &p, &statuses).or_else(|| match lease.or(reported) {
+            // A grant the owner took after the first survey runs a lease on its grantor's
+            // clock, so the second survey still sees it if it ends within L·(1−ρ)/(1+ρ) on
+            // this one (D326's holder bound).
+            Some(l) if now > super::lease::holder_end(t0, l) => Some(format!(
+                "the two surveys of {partition}'s grants took {} ms, more than a lease of {} \
+                 ms allows: a grant its owner took between them may have run out unseen",
+                (now - t0) / 1_000_000,
+                l.as_millis()
+            )),
+            Some(_) => None,
+            None => {
+                warnings.push(format!(
+                    "no node reported its lease (an older build: {}), so the time between \
+                     the surveys of {partition}'s grants to its owner wasn't bounded",
+                    silent.join(", ")
+                ));
+                None
+            }
+        });
+        if let Some(why) = why {
+            let v = abandon_unstamped(ops, partition, to, target).await?;
+            return Err(Failure::usage(&format!(
+                "{why}. The promote of {partition} to node {to:?} is abandoned at map version \
+                 {v}, before its stamp: node {to:?} is one of its replicas again"
+            )));
+        }
     }
     if replica {
         ops.wait_closed(to, partition).await?;
@@ -600,7 +881,7 @@ pub(crate) async fn run(
     }) {
         e.set_state(St::Done);
     }
-    let map_version = ops.set_map(m2).await?;
+    let map_version = ops.set_map(m2).await?.version;
     // 4. Serving on ID, as a move waits for its new node (#2035): done means P takes reads
     // and writes there.
     ops.wait_serving(to, partition, target).await?;
@@ -610,6 +891,7 @@ pub(crate) async fn run(
         primary,
         replica,
         map_version,
+        warnings,
     })
 }
 
@@ -644,13 +926,55 @@ impl Promoter for CliOps<'_> {
         map_of(self.args).await
     }
 
-    async fn set_map(&self, m: proto::ClusterMap) -> Result<u64, Failure> {
+    async fn set_map(&self, m: proto::ClusterMap) -> Result<Set, Failure> {
         let set = set_map(self.args, m, false, Vec::new()).await?;
-        Ok(set
+        let version = set
             .document
             .get("map_version")
             .and_then(Value::as_u64)
-            .unwrap_or(0))
+            .unwrap_or(0);
+        // The writer's pushes to the others; it holds the map itself.
+        let pushed = set
+            .document
+            .get("pushed")
+            .and_then(Value::as_array)
+            .map_or(0, |a| {
+                a.iter()
+                    .filter(|p| p.get("ok").and_then(Value::as_bool) == Some(true))
+                    .count()
+            });
+        Ok(Set {
+            version,
+            held: pushed + 1,
+        })
+    }
+
+    fn now(&self) -> u64 {
+        pigeonhole_io::sys::boot_clock_ns()
+    }
+
+    async fn survey(&self) -> Result<HashMap<String, Option<proto::NodeStatus>>, Failure> {
+        // In parallel, so a node that doesn't answer costs one wait, not one each: the
+        // time between the two surveys is bounded.
+        let mut asks = tokio::task::JoinSet::new();
+        for n in &self.map.nodes {
+            let (args, id) = (self.args.clone(), n.id.clone());
+            let url = url_of(self.args, &n.address);
+            asks.spawn(async move {
+                let st = tokio::time::timeout(SURVEY_WAIT, async {
+                    let (mut c, token) = connect(&args, &url).await.ok()?;
+                    c.status(request(StatusRequest::default(), token.as_deref()).ok()?)
+                        .await
+                        .ok()
+                        .map(tonic::Response::into_inner)
+                })
+                .await
+                .ok()
+                .flatten();
+                (id, st)
+            });
+        }
+        Ok(asks.join_all().await.into_iter().collect())
     }
 
     async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<(), Failure> {
@@ -752,6 +1076,365 @@ mod tests {
         m.failovers.push(ev("p3", "a", 8, S::Pending));
         m.failovers.push(ev("p9", "a", 20, S::Pending));
         assert_eq!(promote_floor(&m, "p3"), 8);
+    }
+
+    // ---- #2152: an owner back between a promote's first map and its last ----
+
+    use proto::{LeaseWithheld, LocalPartition, NodeStatus};
+    use std::cell::{Cell, RefCell};
+
+    type Survey = HashMap<String, Option<NodeStatus>>;
+
+    /// A scripted [`Promoter`]: each survey answers the next of `surveys`, each `set_map`
+    /// reaches `held` nodes, and each clock read moves `step` ns on. Nothing waits.
+    struct Fake {
+        map: RefCell<ClusterMap>,
+        surveys: RefCell<Vec<Survey>>,
+        held: usize,
+        clock: Cell<u64>,
+        step: u64,
+        stamped: Cell<bool>,
+    }
+
+    impl Promoter for Fake {
+        async fn row(&self, _id: &str, partition: &str) -> Result<Option<LocalPartition>, Failure> {
+            // b's copy: a replica from its bootstrap at epoch 3, until it's stamped at 4.
+            let mut lp = LocalPartition {
+                id: partition.into(),
+                epoch: 3,
+                replica_applied_seqno: 7,
+                ..Default::default()
+            };
+            if self.stamped.get() {
+                lp.epoch = 4;
+                lp.set_role(proto::PartitionRole::Owner);
+            } else {
+                lp.set_role(proto::PartitionRole::Replica);
+            }
+            Ok(Some(lp))
+        }
+
+        async fn map(&self) -> Result<ClusterMap, Failure> {
+            Ok(self.map.borrow().clone())
+        }
+
+        async fn set_map(&self, m: ClusterMap) -> Result<Set, Failure> {
+            let version = m.map_version;
+            *self.map.borrow_mut() = m;
+            Ok(Set {
+                version,
+                held: self.held,
+            })
+        }
+
+        fn now(&self) -> u64 {
+            let t = self.clock.get() + self.step;
+            self.clock.set(t);
+            t
+        }
+
+        async fn sleep(&self, d: Duration) {
+            self.clock
+                .set(self.clock.get() + u64::try_from(d.as_nanos()).unwrap());
+        }
+
+        async fn survey(&self) -> Result<Survey, Failure> {
+            let mut s = self.surveys.borrow_mut();
+            assert!(!s.is_empty(), "a survey the test didn't expect");
+            Ok(s.remove(0))
+        }
+
+        async fn stamp(&self, _id: &str, _req: proto::StampRequest) -> Result<(), Failure> {
+            self.stamped.set(true);
+            Ok(())
+        }
+
+        async fn wait_closed(&self, _id: &str, _partition: &str) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        async fn wait_serving(&self, _id: &str, _p: &str, _epoch: u64) -> Result<(), Failure> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` to its end: the fake never waits, so it's ready at once.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match f.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("the fake promote waited"),
+        }
+    }
+
+    /// Three nodes with writer terms; p3 on c at epoch 3, b its replica.
+    fn three() -> ClusterMap {
+        ClusterMap {
+            writer_term: 1,
+            map_version: 10,
+            nodes: ["a", "b", "c"]
+                .map(|id| proto::Node {
+                    id: id.into(),
+                    ..Default::default()
+                })
+                .to_vec(),
+            partitions: vec![Partition {
+                id: "p3".into(),
+                node: "c".into(),
+                epoch: 3,
+                history_epoch: 1,
+                replicas: vec!["b".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// a and b answer with no grant and `lease_ms`; c, the owner, doesn't answer.
+    fn quiet(lease_ms: u64) -> Survey {
+        let mut s: Survey = ["a", "b"]
+            .map(|id| {
+                let st = NodeStatus {
+                    node_id: id.into(),
+                    lease_ms,
+                    ..Default::default()
+                };
+                (id.to_owned(), Some(st))
+            })
+            .into_iter()
+            .collect();
+        s.insert("c".into(), None);
+        s
+    }
+
+    fn fake(surveys: Vec<Survey>, held: usize, step: Duration) -> Fake {
+        Fake {
+            map: RefCell::new(three()),
+            surveys: RefCell::new(surveys),
+            held,
+            clock: Cell::new(0),
+            step: u64::try_from(step.as_nanos()).unwrap(),
+            stamped: Cell::new(false),
+        }
+    }
+
+    fn failover() -> How {
+        How::Failover {
+            in_doubt_xids: Vec::new(),
+            in_doubt_count: 0,
+        }
+    }
+
+    #[test]
+    fn a_failover_finishes_when_both_surveys_find_no_grant_to_the_owner() {
+        let f = fake(
+            vec![quiet(10_000), quiet(10_000)],
+            2,
+            Duration::from_secs(1),
+        );
+        let done = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap();
+        assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+        assert!(f.stamped.get());
+        let m = f.map.borrow();
+        assert_eq!(
+            (m.partitions[0].node.as_str(), m.partitions[0].epoch),
+            ("b", 4)
+        );
+        assert_eq!(m.failovers[0].state(), S::Done);
+    }
+
+    #[test]
+    fn a_failover_whose_owner_took_a_grant_before_its_first_map_landed_is_abandoned_unstamped() {
+        // The issue's race: the owner renewed at the old map before the pending promote
+        // reached the grantors. The second survey sees the grant, and the promote stops
+        // before its stamp, with b back among p3's replicas.
+        let mut back = quiet(10_000);
+        back.get_mut("a")
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(LeaseWithheld {
+                partition: "p3".into(),
+                holder: "c".into(),
+                remaining_ms: 4_000,
+            });
+        let f = fake(vec![quiet(10_000), back], 2, Duration::from_secs(1));
+        let e = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap_err();
+        assert!(
+            e.message().contains("grants p3's lease to its owner"),
+            "{}",
+            e.message()
+        );
+        assert!(!f.stamped.get());
+        let m = f.map.borrow();
+        assert_eq!(m.failovers[0].state(), S::Abandoned);
+        assert_eq!(
+            (m.partitions[0].node.as_str(), m.partitions[0].epoch),
+            ("c", 3)
+        );
+        assert_eq!(m.partitions[0].replicas, ["b"]);
+    }
+
+    #[test]
+    fn a_failover_whose_first_map_misses_a_majority_stays_pending_unstamped() {
+        let f = fake(vec![quiet(10_000)], 1, Duration::from_secs(1));
+        let e = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap_err();
+        assert!(e.message().contains("not a majority"), "{}", e.message());
+        assert!(!f.stamped.get());
+        assert_eq!(f.map.borrow().failovers[0].state(), S::Pending);
+    }
+
+    #[test]
+    fn surveys_more_than_a_lease_apart_abandon_the_promote() {
+        // 11 s between the clock reads, with 10 s leases: a grant taken after the first
+        // survey could have run out before the second (L·0.99/1.01 is 9.8 s).
+        let f = fake(
+            vec![quiet(10_000), quiet(10_000)],
+            2,
+            Duration::from_secs(11),
+        );
+        let e = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap_err();
+        assert!(e.message().contains("more than a lease"), "{}", e.message());
+        assert!(!f.stamped.get());
+        assert_eq!(f.map.borrow().failovers[0].state(), S::Abandoned);
+    }
+
+    #[test]
+    fn with_no_lease_reported_the_promote_goes_on_with_a_warning_naming_the_nodes() {
+        // The coordinator's ruling: older nodes (lease_ms 0) don't stop it.
+        let f = fake(vec![quiet(0), quiet(0)], 2, Duration::from_secs(30));
+        let done = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap();
+        assert_eq!(done.warnings.len(), 1, "{:?}", done.warnings);
+        assert!(done.warnings[0].contains("a, b"), "{}", done.warnings[0]);
+        assert!(f.stamped.get());
+    }
+
+    /// The owner just stopped: `--old-unreachable` waits its grants out, then goes on;
+    /// grants still live after two leases mean the owner renews, so it doesn't start.
+    #[test]
+    fn an_unreachable_owners_grants_are_waited_out() {
+        let granted = |ms| {
+            let mut s = quiet(10_000);
+            s.get_mut("a")
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .grants
+                .push(LeaseWithheld {
+                    partition: "p3".into(),
+                    holder: "c".into(),
+                    remaining_ms: ms,
+                });
+            s
+        };
+        let how = How::Manual {
+            old_unreachable: true,
+        };
+        let f = fake(
+            vec![granted(4_000), quiet(10_000), quiet(10_000)],
+            2,
+            Duration::from_millis(10),
+        );
+        block_on(run(&f, &three(), "p3", "b", &how)).unwrap();
+        assert!(f.stamped.get());
+        // A renewal on its way down is waited out too.
+        let f = fake(
+            vec![granted(4_000), granted(9_000), quiet(10_000), quiet(10_000)],
+            2,
+            Duration::from_millis(10),
+        );
+        block_on(run(&f, &three(), "p3", "b", &how)).unwrap();
+        assert!(f.stamped.get());
+        // 4.5 + 9.5 + 9.5 s of grants: past two 10 s leases, the owner renews.
+        let f = fake(
+            vec![
+                granted(4_000),
+                granted(9_000),
+                granted(9_000),
+                granted(9_000),
+            ],
+            2,
+            Duration::from_millis(10),
+        );
+        let e = block_on(run(&f, &three(), "p3", "b", &how)).unwrap_err();
+        assert!(e.message().contains("didn't start"), "{}", e.message());
+        assert!(!f.stamped.get());
+        assert!(f.map.borrow().failovers.is_empty());
+    }
+
+    #[test]
+    fn a_promote_of_a_fenced_reachable_owner_doesnt_survey() {
+        // The operator fenced or closed it, so it can't take writes: no survey (the fake
+        // panics on one), and its first map needn't reach a majority (held 1 of 3).
+        let f = fake(Vec::new(), 1, Duration::from_secs(1));
+        let how = How::Manual {
+            old_unreachable: false,
+        };
+        block_on(run(&f, &three(), "p3", "b", &how)).unwrap();
+        assert!(f.stamped.get());
+    }
+
+    #[test]
+    fn the_owner_back_test_needs_all_but_majority_minus_two_of_the_others() {
+        let m = three();
+        let p = &m.partitions[0];
+        assert_eq!(owner_back(&m, p, &quiet(10_000)), None);
+        // Three nodes: a lease needs one other grant, so both others must be asked.
+        let mut s = quiet(10_000);
+        s.insert("a".into(), None);
+        assert!(owner_back(&m, p, &s).unwrap().contains("a didn't answer"));
+        let mut s = quiet(10_000);
+        s.get_mut("b").unwrap().as_mut().unwrap().grace_remaining_ms = 500;
+        assert!(owner_back(&m, p, &s).unwrap().contains("b restarted"));
+        // The owner answers with no lease of p3: the others' silence doesn't matter.
+        let mut s = quiet(10_000);
+        s.insert("a".into(), None);
+        let mut lp = LocalPartition {
+            id: "p3".into(),
+            epoch: 3,
+            ..Default::default()
+        };
+        lp.set_role(proto::PartitionRole::Owner);
+        lp.set_state(proto::LocalPartitionState::Fenced);
+        let owner = NodeStatus {
+            node_id: "c".into(),
+            partitions: vec![lp.clone()],
+            ..Default::default()
+        };
+        s.insert("c".into(), Some(owner.clone()));
+        assert_eq!(owner_back(&m, p, &s), None);
+        // With a lease running there, it does.
+        lp.lease_remaining_ms = 700;
+        s.insert(
+            "c".into(),
+            Some(NodeStatus {
+                partitions: vec![lp],
+                ..owner
+            }),
+        );
+        assert!(owner_back(&m, p, &s).unwrap().contains("a didn't answer"));
+        // Five nodes: a lease needs two other grants, so one of four may be missing.
+        let mut m5 = three();
+        for id in ["d", "e"] {
+            m5.nodes.push(proto::Node {
+                id: id.into(),
+                ..Default::default()
+            });
+        }
+        let mut s = quiet(10_000);
+        s.insert(
+            "d".into(),
+            Some(NodeStatus {
+                node_id: "d".into(),
+                ..Default::default()
+            }),
+        );
+        s.insert("e".into(), None);
+        assert_eq!(owner_back(&m5, &m5.partitions[0], &s), None);
+        s.insert("d".into(), None);
+        assert!(owner_back(&m5, &m5.partitions[0], &s).is_some());
     }
 
     /// D331 (the coordinator's ruling): from HANDING_OVER through CLEANING a range move
