@@ -1019,11 +1019,11 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
             .await
             .unwrap_err();
         assert_eq!(code(&e), "InvalidArgument", "{e}");
-        // A forward that times out on a slow runner answers `Unknown` ("the write may have
-        // been applied"): the transaction's outcome then says what was decided (#2147).
+        // A forward that times out on a slow runner answers `OutcomeUnknown` ("the write may
+        // have been applied"): the transaction's outcome then says what was decided (#2147).
         match commit(id.clone(), vec![incr_row("alice", 1), put_row("zed", "1")]).await {
             Ok(_) => {}
-            Err(e) if code(&e) == "Unknown" => committed_after(c, &id, settle, &e).await,
+            Err(e) if code(&e) == "OutcomeUnknown" => committed_after(c, &id, settle, &e).await,
             Err(e) => panic!("the corrected commit: {e}"),
         }
         eventually_within(settle, "alice's increment to apply", async || {
@@ -1031,6 +1031,7 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
         })
         .await;
         assert_eq!(counter(c, "alice").await, 1, "counted once");
+        assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"1".to_vec()));
         // A bad row for the second branch (p2), after p1 took its rows: the transaction
         // ends, its retry answers that outcome, and p1's row is never committed.
         let id = begin_spanning(b).await;
@@ -1046,22 +1047,28 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
         assert_eq!(get_row(c, "hank").await.unwrap(), None);
         // p1's branch was aborted: bob takes a plain write at once.
         put(c, "bob", "2").await;
+        assert_eq!(counter(c, "alice").await, 1, "still counted once");
     });
 }
 
 /// Waits up to `limit` for `id`'s outcome, through `port`, to be decided, and requires it
-/// committed: `first` (a commit's ambiguous answer) is in the panic.
+/// committed: `first` (a commit's ambiguous answer) is in the panic. An `Outcome` call that
+/// fails (it crosses the hop that just timed out) counts as not decided yet; the last
+/// answer is in the panic (perf287 on #2175).
 async fn committed_after(port: u16, id: &str, limit: std::time::Duration, first: &tonic::Status) {
     use crate::serve::proto::TxnOutcomeState as St;
-    let mut state = St::InProgress;
-    eventually_within(
-        limit,
-        "the transaction's outcome to be decided",
-        async || {
-            state = super::spanning::outcome(port, id).await.unwrap().state();
-            state != St::InProgress
-        },
-    )
-    .await;
-    assert_eq!(state, St::Committed, "after {first}");
+    let until = tokio::time::Instant::now() + limit;
+    let mut last = String::from("no answer yet");
+    while tokio::time::Instant::now() < until {
+        match super::spanning::outcome(port, id).await {
+            Ok(r) if r.state() == St::InProgress => last = "IN_PROGRESS".into(),
+            Ok(r) => {
+                assert_eq!(r.state(), St::Committed, "after {first}: {r:?}");
+                return;
+            }
+            Err(e) => last = format!("Outcome failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the outcome after {first} was never decided within {limit:?}; last: {last}");
 }
