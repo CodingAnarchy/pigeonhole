@@ -41,6 +41,19 @@ use crate::serve::proto::{
 /// doubt on the range) before the move aborts and lifts it (simp724's bounded wait).
 pub(super) const FENCE_BOUND: Duration = Duration::from_secs(30);
 
+/// The most the whole of HANDING_OVER may take on a running driver, its fence's drain
+/// included, before the move aborts and lifts the fence (#2160): with the catch-up within
+/// [`CATCH_UP_LAG_MS`] at its start, the target applies through the fence's seqno in
+/// moments, so a wait this long is a target that can't (its node down, its follower
+/// stopped) and the range's writes shouldn't stay refused for it.
+pub(super) const HANDING_OVER_BOUND: Duration = Duration::from_secs(60);
+
+/// How long the map's writer lets a record sit at HANDING_OVER, since it first saw it there,
+/// before it aborts it as orphaned (#2160): no driver bounds it any more (its command was
+/// killed or timed out), and nothing on the nodes lifts the fence. Above a running driver's
+/// [`HANDING_OVER_BOUND`], so it never races one that's still within its own.
+pub(super) const ORPHANED_HAND_OVER: Duration = Duration::from_secs(120);
+
 /// The catch-up's lag at which the source fences the range: the fence stalls the range's
 /// writes about this long while the target closes the gap (simp724's bound).
 const CATCH_UP_LAG_MS: u64 = 1_000;
@@ -678,6 +691,17 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
                     hand_over(args, id).await?;
                     continue;
                 }
+                // #2160: the whole phase is bounded, not the drain alone, so a target that
+                // can't apply through the fence's seqno doesn't keep the range's writes refused.
+                if since.elapsed() >= HANDING_OVER_BOUND {
+                    abort_record(args, &r, timeout).await?;
+                    return Err(Failure::usage(&format!(
+                        "move {id} aborted: its target {} didn't apply through the fence's seqno \
+                         {} within {:?} (it applied through {applied}). The range takes writes \
+                         again on {}; run the move again to retry",
+                        r.to, r.final_seqno, HANDING_OVER_BOUND, r.from
+                    )));
+                }
                 wait.tick(&format!(
                     "the target applied through {applied} of {}",
                     r.final_seqno
@@ -1233,10 +1257,125 @@ pub(super) async fn abort(
     ))
 }
 
+/// Notes, in `seen`, when each range move now at HANDING_OVER (`at`) was first seen there,
+/// forgetting the rest, and returns those at it for `bound` or longer at `now` whose abort
+/// doesn't run already (#2160).
+fn orphaned(
+    seen: &mut std::collections::HashMap<String, (tokio::time::Instant, bool)>,
+    at: &[String],
+    now: tokio::time::Instant,
+    bound: Duration,
+) -> Vec<String> {
+    seen.retain(|id, _| at.contains(id));
+    for id in at {
+        seen.entry(id.clone()).or_insert((now, false));
+    }
+    let mut due: Vec<String> = seen
+        .iter()
+        .filter(|(_, (since, aborting))| !aborting && now.duration_since(*since) >= bound)
+        .map(|(id, _)| id.clone())
+        .collect();
+    due.sort();
+    due
+}
+
+impl super::Node {
+    /// The map's writer's duty (#2160): a range move left at HANDING_OVER past
+    /// [`ORPHANED_HAND_OVER`] since this node first saw it there is aborted, which lifts its
+    /// fence: its driver stopped (its command killed or past `--timeout`), and nothing else
+    /// would. Every node notes when it first saw each such record, so a new writer goes on
+    /// from its own sighting rather than from zero. The abort runs on a task of its own, so
+    /// the other duties don't wait on it.
+    pub(crate) fn abort_orphaned_hand_overs(self: &std::sync::Arc<Self>) {
+        let Ok(map) = self.get_map() else { return };
+        let at: Vec<String> = map
+            .moves
+            .iter()
+            .filter(|r| !map::node_move(r) && map::phase(r) == MovePhase::HandingOver)
+            .map(|r| r.id.clone())
+            .collect();
+        let now = tokio::time::Instant::now();
+        let due: Vec<String> = {
+            let mut seen = self
+                .hand_overs_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = orphaned(&mut seen, &at, now, self.peers.orphaned_hand_over);
+            if super::schema::writer(&map) != self.id || self.writer_may_change(&map).is_err() {
+                return;
+            }
+            for id in &due {
+                if let Some(e) = seen.get_mut(id) {
+                    e.1 = true;
+                }
+            }
+            due
+        };
+        let Some(args) = self.own_args(&map) else {
+            return;
+        };
+        let node = std::sync::Arc::downgrade(self);
+        let bound = self.peers.orphaned_hand_over;
+        for id in due {
+            let (args, node) = (args.clone(), node.clone());
+            tokio::spawn(async move {
+                eprintln!(
+                    "phdb serve: aborting range move {id}, left at HANDING_OVER for over {bound:?}: \
+                     its range takes writes again (#2160)"
+                );
+                if let Err(f) = abort(&args, &id, Some(Duration::from_secs(60))).await {
+                    eprintln!(
+                        "phdb serve: aborting range move {id} left at HANDING_OVER: {}",
+                        f.message()
+                    );
+                }
+                if let Some(node) = node.upgrade()
+                    && let Some(e) = node
+                        .hand_overs_seen
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_mut(&id)
+                {
+                    e.1 = false;
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serve::proto::{Partition, SplitKey, TablePlacement, split_key};
+
+    #[test]
+    fn the_writer_aborts_a_hand_over_only_once_its_record_sat_there_for_the_bound() {
+        // #2160: a record at HANDING_OVER is due once this node has seen it there for the
+        // bound; seen again it keeps its first time; one that left the phase is forgotten
+        // (so a later HANDING_OVER of the same id starts over); one whose abort runs isn't
+        // due twice.
+        let bound = Duration::from_secs(120);
+        let t0 = tokio::time::Instant::now();
+        let mut seen = std::collections::HashMap::new();
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(orphaned(&mut seen, &ids(&["mv1"]), t0, bound).is_empty());
+        let later = t0 + Duration::from_secs(60);
+        assert!(orphaned(&mut seen, &ids(&["mv1", "mv2"]), later, bound).is_empty());
+        let due = t0 + bound;
+        assert_eq!(
+            orphaned(&mut seen, &ids(&["mv1", "mv2"]), due, bound),
+            ids(&["mv1"])
+        );
+        seen.get_mut("mv1").unwrap().1 = true;
+        assert!(orphaned(&mut seen, &ids(&["mv1", "mv2"]), due, bound).is_empty());
+        // mv1 left HANDING_OVER (aborted, or handed over): forgotten.
+        assert_eq!(
+            orphaned(&mut seen, &ids(&["mv2"]), later + bound, bound),
+            ids(&["mv2"])
+        );
+        assert!(!seen.contains_key("mv1"));
+        assert!(orphaned(&mut seen, &ids(&["mv1"]), due + bound, bound).is_empty());
+    }
 
     fn text(s: &str) -> SplitKey {
         SplitKey {

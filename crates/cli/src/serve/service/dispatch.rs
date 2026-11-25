@@ -31,11 +31,17 @@ impl Service {
         // D331: a range a move fences, moved away or doesn't serve here yet. One load while
         // no move names the partition. A transaction's `Commit` is checked where it's
         // answered, its rows as writes, with its snapshot (`commit`).
+        let mut touched = None;
         if let Some(gate) = &self.gate
             && !matches!(op, ServiceOp::Commit(_))
             && let Some(ranges) = &*gate.ranges().load()
         {
             ranges.check(&op, op.writes())?;
+            // #2160: a read's keys, for the check again past its snapshot. Only while a
+            // move names the partition, so other reads copy nothing.
+            if read.is_some() {
+                touched = Some(crate::serve::ranges::Touched::of(&op));
+            }
         }
         self.copy_ranges(&op)?;
         // D332: a cluster partition's sampled loads. A read's first key, one read in 64 per
@@ -84,6 +90,15 @@ impl Service {
             } else if let Some(gate) = read
                 && let Err(e) = gate.serving()
             {
+                reply = Err(e);
+            } else if let (Some(gate), Some(touched)) = (read, &touched)
+                && let Some(ranges) = &*gate.ranges().load()
+                && let Err(e) = ranges.check_touched(touched)
+            {
+                // #2160: the range check again, past the snapshot. A move only takes a
+                // range away from here, so one still served now was served when the read
+                // took its snapshot; one handed over since may have taken it after the
+                // target began to serve, so it's refused (retry-safe, at the new owner).
                 reply = Err(e);
             }
         }

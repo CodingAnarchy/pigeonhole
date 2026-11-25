@@ -1189,7 +1189,7 @@ impl Node {
     /// This node as `phdb cluster` reaches it, with its own cluster token and CA.
     /// `None`, said in the balancer's state, when the map doesn't list this node (audit120's
     /// nit on #2103).
-    fn own_args(self: &Arc<Self>, map: &ClusterMap) -> Option<super::cli::NodeArgs> {
+    pub(super) fn own_args(self: &Arc<Self>, map: &ClusterMap) -> Option<super::cli::NodeArgs> {
         let Some(n) = map.nodes.iter().find(|n| n.id == self.id) else {
             self.set_balancer_state(format!(
                 "waiting: the map doesn't list this node ({}), so it can't run a move",

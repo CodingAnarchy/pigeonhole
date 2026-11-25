@@ -56,6 +56,9 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             balance_window: Duration::from_secs(300),
             load_interval: Duration::from_millis(500),
             prune_interval: Duration::from_millis(500),
+            // Long: many tests hold a hand-built move at HANDING_OVER (#2160's duty has its
+            // own unit test).
+            orphaned_hand_over: Duration::from_secs(3600),
         },
         state,
         super::read_voted(dir).unwrap(),
