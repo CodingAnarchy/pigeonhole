@@ -48,6 +48,12 @@ pub(crate) const READ_EVERY: u32 = 64;
 pub(crate) const READ_SLOTS: usize = 256;
 /// A load interval: how often the averages take a new reading.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(30);
+/// The device rate, in bytes a second, under which a partition's `load_device` is 0 (#2174).
+/// The share is over the node's own highest second, so a node that only ever trickles (its
+/// map, lease and decision writes, and Status reads: a few KiB/s) has a ceiling near its
+/// partitions' own rates, and a lone such partition read as near 1.0: too hot, never cold.
+/// 1 MiB/s is a small part of any device's rate, so nothing under it is a real load.
+pub(crate) const DEVICE_FLOOR: f64 = (1 << 20) as f64;
 /// The longest `--balance-window`, in seconds (a day): it bounds the ceiling's seconds kept.
 pub(crate) const MAX_WINDOW_SECS: u64 = 86_400;
 
@@ -119,6 +125,27 @@ fn draw_below(n: u64) -> u64 {
 /// `interval` apart: `1 − e^(−interval/window)`.
 pub(crate) fn alpha(interval: Duration, window: Duration) -> f64 {
     1.0 - (-(interval.as_secs_f64() / window.as_secs_f64().max(1e-9))).exp()
+}
+
+/// A measurement seam (tests): every partition of the node in each listed cluster directory
+/// reports this load in `Status` (cpu, device and their larger), in place of its measured
+/// one. A balancer test that isn't about load pins it, so its decisions don't hang on how
+/// busy the runner is: on a slow one, a lone partition's steady I/O measured "too hot"
+/// against its node's own peak, and never cold enough to merge (#2164's Windows red). An
+/// entry of `None` keeps the measured load: a test that covers the measured path says so.
+#[cfg(test)]
+pub(crate) static LOAD_FOR: std::sync::Mutex<Vec<(std::path::PathBuf, Option<f64>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The load [`LOAD_FOR`] pins for the node in `dir`, if any.
+#[cfg(test)]
+pub(crate) fn load_for(dir: &std::path::Path) -> Option<f64> {
+    LOAD_FOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(d, _)| d == dir)
+        .and_then(|(_, l)| *l)
 }
 
 /// The number of cores the loads' CPU share is over: read once per process.
@@ -376,7 +403,8 @@ impl PartitionLoad {
         }
         Load {
             cpu: w.cpu,
-            device: if ceiling > 0.0 {
+            // Under the floor, none (#2174): however close the rate runs to the ceiling.
+            device: if ceiling > 0.0 && w.device_rate >= DEVICE_FLOOR {
                 (w.device_rate / ceiling).min(1.0)
             } else {
                 0.0
@@ -634,7 +662,7 @@ mod tests {
         let r = Reading {
             busy_nanos: 2_000_000_000,
             sync_nanos: 1_000_000_000,
-            device_bytes: 30 << 20,
+            device_bytes: 120 << 20,
             written_bytes: 15 << 20,
         };
         let t1 = t0 + INTERVAL;
@@ -642,10 +670,11 @@ mod tests {
         assert!(!l.due(t1 - Duration::from_secs(1), INTERVAL));
         assert_eq!(fold(t1 - Duration::from_secs(1), r, 0.0), Load::default());
         assert!(l.due(t1, INTERVAL));
-        let ceiling = 4.0 * (1 << 20) as f64;
+        let ceiling = 16.0 * (1 << 20) as f64;
         let got = fold(t1, r, ceiling);
         assert!((got.cpu - 3.0 / 30.0 / 4.0).abs() < 1e-9, "{got:?}");
-        // 1 MiB/s over a 4 MiB/s ceiling.
+        // 4 MiB/s over a 16 MiB/s ceiling (over `DEVICE_FLOOR` through the idle intervals
+        // below: 4 MiB/s × 0.8⁴ is 1.6 MiB/s).
         assert!((got.device - 0.25).abs() < 1e-9, "{got:?}");
         // D331 PR 5: half of it written, in bytes a second (no ceiling).
         assert_eq!(got.write_rate, Some(512.0 * 1024.0), "{got:?}");
@@ -662,6 +691,31 @@ mod tests {
             (three.device - 0.25 * (1.0 - A).powi(4)).abs() < 1e-9,
             "{three:?}"
         );
+    }
+
+    /// #2174: a partition alone on its node, with a steady trickle under the floor, has a
+    /// device share of 0, though its rate is the node's whole ceiling; the same shape over
+    /// the floor is its whole share, as before.
+    #[test]
+    fn a_device_rate_under_the_floor_is_no_load_however_near_the_ceiling() {
+        let at = |rate: f64| {
+            let l = PartitionLoad::default();
+            let t0 = Instant::now();
+            l.fold(t0, Reading::default(), 4, 0.0, INTERVAL, A);
+            let r = Reading {
+                device_bytes: (rate * INTERVAL.as_secs_f64()) as u64,
+                ..Reading::default()
+            };
+            // Its own steady rate is the node's highest second.
+            l.fold(t0 + INTERVAL, r, 4, rate, INTERVAL, A)
+        };
+        let under = at(DEVICE_FLOOR - 4096.0);
+        assert_eq!(under.device, 0.0, "{under:?}");
+        assert_eq!(under.load(), 0.0, "{under:?}");
+        let trickle = at(8.0 * 1024.0);
+        assert_eq!(trickle.device, 0.0, "{trickle:?}");
+        let over = at(DEVICE_FLOOR + 4096.0);
+        assert!((over.device - 1.0).abs() < 1e-9, "{over:?}");
     }
 
     #[test]

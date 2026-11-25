@@ -332,7 +332,14 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let msg = req.into_inner();
         // A spanning transaction's branch call (D329): served on the partition it names.
         if spanning::is_branch(&msg) {
-            let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
+            // The nodes' own arms carry no client to check (#2165): on a cluster with tokens,
+            // the resolver's and the sweep's anonymous caller would be refused. The data arms
+            // bind their sessions to the client's token, as on a single node.
+            let caller = if spanning::is_node_arm(&msg) {
+                crate::serve::auth::Caller::anonymous()
+            } else {
+                forward::caller_of(msg.caller, &self.0.tokens)?
+            };
             let Some(cluster) = shared.router.cluster.as_ref() else {
                 return Err(ApiError::unsupported("this node isn't a cluster node").into());
             };

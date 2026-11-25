@@ -2805,10 +2805,19 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
     use crate::serve::proto::FailoverState as S;
     let t = failover_rig_with(true, &["b", "a"]);
     let [a, b, c] = t.ports;
-    super::super::failover::STOP_AFTER_STAMP
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(t.dirs[0].clone());
+    // Held, not one shot (#2184's CI): a's next pass would resume b's stamped promote and
+    // finish it, as D330 does, if it came before b's cut below. a's passes stop after the
+    // stamp until then.
+    let hold = |on: bool| {
+        let mut held = super::super::failover::HOLD_AFTER_STAMP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|d| *d != t.dirs[0]);
+        if on {
+            held.push(t.dirs[0].clone());
+        }
+    };
+    hold(true);
     let pair = |from: usize, to: u16| (t.dirs[from].clone(), format!("127.0.0.1:{to}"));
     let one_way = [pair(2, a), pair(2, b)];
     super::super::CUT_BETWEEN
@@ -2837,9 +2846,11 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
         epoch
     });
     cut(&t, 1, true);
+    hold(false);
     t.rt.block_on(async {
-        // Twice on CI (#2166, #2170) a never failed over within the window: the reason a
-        // gives, and its p3 rows, say which step stalled next time.
+        // Three times on CI (#2166, #2170, #2184) a never failed over within the window: a's
+        // next pass had finished b's promote before the cut (now held above). The reason a
+        // gives, and its p3 rows, say which step stalled if it happens again.
         eventually_why(FAILOVER_WINDOW, "p3 to fail over to a", async || {
             let m = map_of(a).await;
             let p3 = m.partitions.iter().find(|p| p.id == "p3");
@@ -3029,6 +3040,13 @@ const BALANCER_ADMIN: &str = "adm1n-bal";
 /// Changes the map at the writer `a` by `change` (retrying while its lease comes back),
 /// with the balancer's pass at 100 ms on every node (D332 PR 3's tests), asking with
 /// `token`. The new map's version.
+///
+/// Every node's partitions report a load of 0 ([`load::LOAD_FOR`]), unless the test
+/// registered its own first (`None` keeps the measured load): these tests aren't about load,
+/// and a measured one made a lone partition "too hot" on a slow runner, and never cold
+/// enough to merge (#2164's Windows red).
+///
+/// [`load::LOAD_FOR`]: super::super::load::LOAD_FOR
 async fn balancer_map(
     t: &Rig,
     token: Option<&str>,
@@ -3040,6 +3058,13 @@ async fn balancer_map(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !pass.iter().any(|(d, _)| d == dir) {
             pass.push((dir.clone(), Duration::from_millis(100)));
+        }
+        drop(pass);
+        let mut load = super::super::load::LOAD_FOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !load.iter().any(|(d, _)| d == dir) {
+            load.push((dir.clone(), Some(0.0)));
         }
     }
     let a = t.ports[0];
@@ -3143,7 +3168,15 @@ fn a_paused_or_idle_balancer_changes_no_map() {
     // nothing writes nothing to the map; its reason is in the writer's status. Paused, it
     // says so; on, an even cluster is within bounds, and ten passes and more leave the
     // map's version where it was.
+    //
+    // On the nodes' measured loads, not pinned ones (the coordinator on #2164's flake fix):
+    // the one balancer test that keeps the real measure under the pass. An idle rig does
+    // nothing whatever it measures: no partition has a tablet boundary to split at.
     let mut t = Rig::start();
+    super::super::load::LOAD_FOR
+        .lock()
+        .unwrap()
+        .extend(t.dirs.iter().map(|d| (d.clone(), None)));
     writer_leased(&mut t);
     let a = t.ports[0];
     t.rt.block_on(async {

@@ -1,0 +1,4 @@
+### Fixed
+
+- Punching free space (`punch_freed`, on by default since 1.3.0): in application-owned mode (`Pigeonhole::open_application_owned`) a punch could land after the close had released the file's writer lock. If another process (or a `close_for_reopen` handover) opened the file right after the close and wrote an SST into that block, the punch zeroed it. No punch now starts once the close begins, and the close waits for one in flight before it releases the locks. The default engine-owned mode was not affected (#2181).
+- Punching free space: after one failed punch (any error but `Unsupported`), punching could stop until free space grew past everything unpunched at the failure, perhaps until the next open. After a failed punch, punching now resumes once new free space appears, or at the first manifest commit (a flush, compaction or catalog change, say) 10 s after the failure, whichever comes first (#2181).

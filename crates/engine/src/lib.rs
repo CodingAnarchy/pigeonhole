@@ -118,8 +118,8 @@ pub use write::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use engine::hooks::{
-    AppendedKind, AppendedRecord, ArenaDiscard, CompactionRecord, Fault, FlushGcMutation, HookSite,
-    LoadTerm, ManifestInfo, MemoryRelease, RawEntry, TabletOwner, TabletRange,
+    AppendedKind, AppendedRecord, ArenaDiscard, CompactionRecord, Fault, FlushGcMutation, HeldView,
+    HookSite, LoadTerm, ManifestInfo, MemoryRelease, RawEntry, TabletOwner, TabletRange,
 };
 
 pub use pigeonhole_compaction::{

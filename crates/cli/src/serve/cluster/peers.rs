@@ -77,7 +77,12 @@ impl Node {
             let Ok(Ok(theirs)) = fetched else {
                 continue;
             };
-            if theirs.map_version > self.state().version()
+            // Newer by `(writer_term, map_version)` (#2159 item 4): an elected writer's map
+            // can be at or below this node's version.
+            if self
+                .get_map()
+                .ok()
+                .is_none_or(|mine| map::newer(&theirs, &mine))
                 && let Err(e) = self
                     .push_map_async(theirs.clone(), Some(n.id.clone()))
                     .await
@@ -231,7 +236,14 @@ impl Node {
         let map = tokio::time::timeout(self.peers.push_timeout, self.fetch_map(address))
             .await
             .map_err(|_| "timed out".to_owned())??;
-        if map.map_version <= past {
+        // A higher writer term is newer at any version (#2159 item 4): the elected writer's
+        // map can be at or below the version this node holds from the deposed one. The early
+        // return above compares versions only, which is safe: a map at the same version and
+        // another term is pulled, not skipped.
+        let higher_term = self
+            .get_map()
+            .is_ok_and(|mine| map.writer_term > mine.writer_term);
+        if map.map_version <= past && !higher_term {
             return Err(format!(
                 "node {from}'s map is version {}, no newer than this node's",
                 map.map_version
@@ -299,6 +311,11 @@ impl Node {
             });
             (st.version(), address)
         };
+        // Versions only: the header carries no term (#2159 item 4). A forwarder at the same
+        // version under a higher term isn't pulled from here; the next lease round or push
+        // brings that map, and a call routed on a deposed writer's map still meets the
+        // owner's own lease and epoch checks (D326), so nothing is served wrongly. A term
+        // header is a protocol addition, left for a release that changes the protocol.
         if version <= mine {
             return Ok(());
         }
@@ -336,6 +353,7 @@ impl Node {
         };
         let address = {
             let mut st = self.state();
+            // Versions only, as `catch_up` compares them (#2159 item 4).
             if version <= st.version() || !st.pulled.insert(version) {
                 return;
             }

@@ -2823,6 +2823,88 @@ fn a_capped_reader_never_jumps_the_decision_of_a_round_in_flight_across_its_cuto
     }
 }
 
+/// #2180: the same for a round prepared for an external coordinator (D329, ICR 0140). Its
+/// shares are never evicted when the cutoff falls (a share in doubt has no Decision to wait
+/// for), so a capped pass could hold one with its id at or past the cutoff and still jump the
+/// chunk with its Decision. The share then looked undecided with its checkpoint past it: rule
+/// C dropped it as aborted, and the Decision, read on a later pass, expired the feed as a
+/// gap. Rounds whose coordinator is either shard, decided a few commits after their prepare,
+/// with flushes so the checkpoints pass the shares: every commit is delivered once, whole and
+/// in order.
+#[test]
+fn a_capped_reader_never_jumps_the_decision_of_an_external_round_it_holds_a_share_of() {
+    let vfs = SimVfs::new(3206);
+    let db = open(&vfs, Some(feed(16 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    // As the test above: every record but a Decision is a chunk of its own.
+    r.set_read_ahead(2000);
+    let value = [5u8; 300];
+    let mut want = Vec::new();
+    let mut got = Vec::new();
+    for i in 0..300u32 {
+        // The coordinator's stream (where the Decision goes) is its first row's.
+        let (first, second) = if i % 2 == 0 { (&a, &b) } else { (&b, &a) };
+        let xid = format!("p1:h1-{i:04}");
+        for j in 0..=((i / 2) % 3) {
+            let row = format!("s{i:04}-{j}");
+            want.push(single(&db, first, row.as_bytes(), Durability::Buffered));
+        }
+        let mut txn = db.begin().unwrap();
+        for (t, side) in [(first, "x"), (second, "y")] {
+            txn.batch()
+                .put(
+                    t.id,
+                    t.families[0].id,
+                    format!("r{i:04}{side}").as_bytes(),
+                    b"q",
+                    None,
+                    ValueRef::Bytes(&value),
+                )
+                .unwrap();
+        }
+        // Singles on the coordinator's shard before the prepare and on the other shard after
+        // it: the other shard's share is then the first thing its stream has past what a
+        // pass keeps, with nothing passed over before it.
+        txn.prepare(xid.as_bytes(), Durability::Buffered).unwrap();
+        for j in 0..=(i % 3) {
+            let row = format!("t{i:04}-{j}");
+            want.push(single(&db, second, row.as_bytes(), Durability::Buffered));
+        }
+        let decided = db.decide(xid.as_bytes(), true).unwrap().expect("in doubt");
+        want.push(decided.seqno);
+        if i % 25 == 24 {
+            db.flush().unwrap();
+        }
+        // Behind by a few hundred records, then drained, three times over.
+        if i % 100 == 99 {
+            loop {
+                match r.wait(Duration::from_millis(200)).unwrap() {
+                    Next::Commit(c) => {
+                        assert!(!c.changes.is_empty());
+                        got.push(c.seqno);
+                    }
+                    Next::Pending => break,
+                    Next::Expired(e) => panic!(
+                        "expired after {} of {} commits: {e:?}",
+                        got.len(),
+                        want.len()
+                    ),
+                    Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
+                }
+            }
+        }
+    }
+    want.sort_unstable();
+    assert_eq!(got, want, "every commit once, in order");
+    assert!(
+        r.chunk_skips() > 0,
+        "no chunk was jumped: the index never bit"
+    );
+    drop(r);
+    db.close().unwrap();
+}
+
 /// #1827: a capped reader's skip index leaves tokens and retention as they were. A token
 /// taken mid-drain, with the index built, resumes to the same commits on a reader with none;
 /// and once retention passes the reader while it's behind, it expires for retention, never as

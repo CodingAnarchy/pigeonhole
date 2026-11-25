@@ -222,7 +222,8 @@ pub struct Metrics {
     pub file_punched_bytes: u64,
     /// Punch passes started, and punches that failed. A filesystem that cannot punch fails
     /// once, and punching stops until the next open; any other failure ends its pass, and the
-    /// next waits for new free space.
+    /// next waits for new free space, or for the first manifest commit (a flush, compaction or
+    /// catalog change, say) 10 s after the failure.
     pub file_punch_passes: (u64, u64),
     /// File reads made synchronously inside async reads: a separated value too large to
     /// cache (D196, #398), a block the cache could not keep, or a read that missed too
