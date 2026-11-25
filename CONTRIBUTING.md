@@ -78,6 +78,8 @@ Several agents often build and test on one machine, so local runs stay small:
 
   `-f tools=gdb` installs `gdb` on the runner, so a seed the hang watchdog catches leaves every thread's stack in the chunk's log. Runners don't have it, and #1205's first hang left none.
 
+  Each run's title names what it tests (`Sweep pigeonhole-engine model_check PIGEONHOLE_DEFERRED_IO=1 seeds=1+300`), so `gh run list --workflow sweep.yml --branch <branch>` shows which sweeps a head has. A required count means distinct sweeps: two runs of the same package, test, filter and environment count once, whatever their seeds.
+
   **Change-feed PRs** (the WAL's feed cursor, the engine's feed reader, retention, the sidecar, the written and synced holds, D310) add two more, seven in all:
   - engine `feed_model` plain;
   - engine `feed_model` with `PIGEONHOLE_DEFERRED_IO=1`. It's the only sweep where syncs, rollovers and power losses land between a feed's polls, and it found a resumed token past recovery's cut that failed as corruption instead of expiring (#1248).
