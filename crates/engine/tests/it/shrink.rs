@@ -318,6 +318,114 @@ fn shrink_moves_the_manifest_once_a_pin_of_its_first_round_is_gone() {
     rig.close();
 }
 
+/// The load and deletes of #1107's test, with `view` (a plain view, no seqno pin) taken
+/// before the last compaction, so it keeps the SSTs that compaction retires from being
+/// reclaimed while it lives.
+fn emptied_behind_a_view(rig: &Rig) -> (Arc<TableInfo>, pigeonhole_engine::HeldView) {
+    let db = &rig.db;
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    write_rows(rig, &t, 0..3000);
+    rig.flush();
+    rig.compact(None);
+    delete_rows(rig, t.id, 0..3000);
+    rig.flush();
+    let view = db.hold_view();
+    rig.compact(None);
+    assert_eq!(row_count(db, &t), 0);
+    (t, view)
+}
+
+/// Counts `shrink` rounds from now on (each `ShrinkRound` re-arms the hook).
+fn count_rounds(db: &Arc<Engine>, n: &Arc<std::sync::atomic::AtomicUsize>) {
+    let (db2, n2) = (Arc::clone(db), Arc::clone(n));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkRound,
+        Box::new(move || {
+            n2.fetch_add(1, Ordering::Relaxed);
+            count_rounds(&db2, &n2);
+        }),
+    );
+}
+
+#[test]
+fn shrink_moves_the_manifest_a_passing_view_kept_in_place() {
+    // #2199's CI failure (Linux, 1 in thousands): an in-process view older than the current
+    // manifest, held for a moment (a shard's maintenance), was still alive when a round
+    // checked what pins retired space. The round kept the manifest in place, had nothing
+    // else to move, and ended the call; the final reclaim freed the space, but the
+    // truncate stops at the manifest's end, so the file kept 4 MiB with no row left. Here
+    // the view lives through the first round and goes right after the second's check: the
+    // call takes another round, which moves the manifest.
+    let vfs = SimVfs::new(2199);
+    let rig = Rig::open(&vfs);
+    let db = &rig.db;
+    let (_t, view) = emptied_behind_a_view(&rig);
+    let before = file_len(&vfs);
+    assert!(before >= 4 << 20, "the load grew the file: {before}");
+    // The first round runs pinned and keeps the manifest in place (#1098); the view goes
+    // right after the second round's check, which saw it too.
+    let held = Arc::new(Mutex::new(Some(view)));
+    let (db2, dropped) = (Arc::clone(db), Arc::clone(&held));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkPlanned,
+        Box::new(move || {
+            db2.on_next(
+                pigeonhole_engine::HookSite::ShrinkPlanned,
+                Box::new(move || {
+                    dropped
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                }),
+            );
+        }),
+    );
+    db.shrink().unwrap();
+    assert!(
+        held.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none(),
+        "the hook ran inside shrink"
+    );
+    let after = file_len(&vfs);
+    assert!(
+        after <= 512 << 10,
+        "only the manifest is live, yet the file is {after} bytes"
+    );
+    assert_eq!(db.unreferenced_bytes(), 0);
+    rig.close();
+}
+
+#[test]
+fn shrink_ends_while_a_view_pins_it_for_the_whole_call() {
+    // perf287 on #2199: a view that outlives the call (a long-lived iterator's, say) looks
+    // like a passing one to the extra-round check. The call still ends, Ok, within its
+    // rounds and the extra ones (a reclaim frees nothing while the view lives, so none is
+    // added), and a later call, once the view is gone, shrinks the file.
+    let vfs = SimVfs::new(21992);
+    let rig = Rig::open(&vfs);
+    let db = &rig.db;
+    let (_t, view) = emptied_behind_a_view(&rig);
+    let before = file_len(&vfs);
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    count_rounds(db, &rounds);
+    db.shrink().unwrap();
+    let n = rounds.load(Ordering::Relaxed);
+    assert!((1..=12).contains(&n), "{n} rounds");
+    assert!(file_len(&vfs) <= before);
+    drop(view);
+    db.shrink().unwrap();
+    let after = file_len(&vfs);
+    assert!(
+        after <= 512 << 10,
+        "only the manifest is live, yet the file is {after} bytes"
+    );
+    assert_eq!(db.unreferenced_bytes(), 0);
+    rig.close();
+}
+
 #[test]
 fn shrink_right_after_a_compaction_finds_its_inputs_free() {
     // #1765's CI failure: the compaction task reported to its shard (so `compact` returned)
