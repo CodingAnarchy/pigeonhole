@@ -1045,7 +1045,7 @@ static SPECS: &[Spec] = &[
         false,
         "By",
         [],
-        "Free bytes of the file that are holes now; the file's length less this is about what it occupies on disk.",
+        "Free bytes of the file this process has punched into holes (0 after a reopen until passes punch that space again); the file's length less this is about what it occupies on disk.",
         |s, out| one(out, s.m.file_punched_bytes)
     ),
     spec!(
@@ -1063,7 +1063,7 @@ static SPECS: &[Spec] = &[
         false,
         "{refusal}",
         [],
-        "Punches that failed; a filesystem that cannot punch fails once, and punching stops until the next open.",
+        "Punches that failed; a filesystem that cannot punch fails once, and punching stops until the next open; after any other failure the next pass waits for new free space, or for the first flush, compaction or catalog change after 10 s.",
         |s, out| one(out, s.e.file_punch_refusals)
     ),
     spec!(
