@@ -524,8 +524,15 @@ fn a_promoted_replica_stamps_above_what_it_applied_after_a_crash_before_any_flus
         rv.crash(kind);
         drop(replica);
         let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
-        replica.promote().unwrap();
         let r = replica.table("t").unwrap().open().unwrap();
+        // The applied cell survived the crash, so the check below isn't vacuous (simp724).
+        let kept = r.get(b"r", "a", b"q").unwrap().expect("the applied cell");
+        assert_eq!(
+            (kept.value(), kept.timestamp()),
+            (&b"old"[..], old),
+            "{kind:?}"
+        );
+        replica.promote().unwrap();
         r.mutate(b"r").put("a", b"q", b"new").commit().unwrap();
         let got = r.get(b"r", "a", b"q").unwrap().unwrap();
         assert_eq!(
