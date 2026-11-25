@@ -11,8 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, Error, FamilyOptions, Predicate, TableInfo, ValueRef,
-    WriteBatch,
+    Engine, EngineOptions, EngineShard, Error, Failure, FailureCause, FamilyOptions, Fault,
+    Predicate, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
@@ -950,7 +950,7 @@ fn a_shard_panic_inside_the_flush_commit_does_not_hang_close() {
     let t = table(&db, "t");
     db.commit(put(&t, "row"), Some(Durability::Buffered))
         .unwrap();
-    db.panic_next_manifest_begin();
+    db.inject(Fault::NextManifestBeginPanic, true);
     let db2 = Arc::clone(&db);
     let flushed = gate::within(10, move || db2.flush())
         .expect("a flush whose manifest commit panicked hung (or panicked on this thread)");
@@ -964,12 +964,56 @@ fn a_shard_panic_inside_the_flush_commit_does_not_hang_close() {
         created.is_err(),
         "a manifest commit went ahead after the panic"
     );
+    assert_eq!(db.failure().map(|f| f.cause), Some(FailureCause::Panic));
     let closed =
         gate::within(10, move || db.close()).expect("close hung after a panic in the flush commit");
     assert!(
         matches!(closed, Err(Error::Io(ref e)) if e.to_string().contains("panicked")),
         "{closed:?}"
     );
+}
+
+/// As above, on an application thread: a catalog change commits inline on its caller's
+/// thread when the manifest writer is free (`commit_req_from_thread`), and panics there
+/// (#2129, perf287's review). No shard dies, so the instance's failure, the refusal of
+/// later manifest commits and the close's error all come from the release on unwind alone.
+#[test]
+fn an_application_thread_panic_inside_a_catalog_commit_does_not_hang_close() {
+    let (vfs, _gate) = gate::vfs(2167);
+    let db = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let _t = table(&db, "t");
+    db.inject(Fault::NextManifestBeginPanic, true);
+    let db2 = Arc::clone(&db);
+    let panicked = gate::within(10, move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db2.create_table("boom", &[("f".into(), FamilyOptions::default())])
+        }))
+        .is_err()
+    })
+    .expect("a catalog change whose manifest commit panicked hung");
+    assert!(
+        panicked,
+        "the catalog change's commit did not run (and panic) on its caller"
+    );
+    assert_eq!(
+        db.failure(),
+        Some(Failure {
+            shard: Failure::MAIN_FILE,
+            cause: FailureCause::Panic,
+        })
+    );
+    let db2 = Arc::clone(&db);
+    let created = gate::within(10, move || {
+        db2.create_table("after", &[("f".into(), FamilyOptions::default())])
+    })
+    .expect("a manifest commit after the panic hung");
+    assert!(
+        created.is_err(),
+        "a manifest commit went ahead after the panic"
+    );
+    let closed = gate::within(10, move || db.close())
+        .expect("close hung after a panic in a catalog change's commit");
+    assert!(closed.is_err(), "the close after a panic reported clean");
 }
 
 /// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A

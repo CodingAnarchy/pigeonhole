@@ -842,8 +842,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     #[cfg(feature = "test-hooks")]
     if shared
         .hooks
-        .manifest_begin_panic
-        .swap(false, Ordering::AcqRel)
+        .faults
+        .take(crate::engine::hooks::Fault::NextManifestBeginPanic)
     {
         panic!("injected panic in manifest::begin (test hook)");
     }
@@ -1416,9 +1416,22 @@ pub(crate) fn release(shared: &Shared) {
 /// until the holder releases or hands the exclusion to an in-flight commit (whose pump's
 /// drop finishes it). A panic in between (in `begin` or `end`, say) would otherwise leave
 /// the exclusion held for ever, and the final close, which runs only once it is free,
-/// with it: `Engine::close` and the drop of the last handle would wait for ever. The
-/// writer is poisoned first, so no commit goes ahead on whatever state the panic left
-/// (the close is unclean already: the dead shard failed it).
+/// with it: `Engine::close` and the drop of the last handle would wait for ever.
+///
+/// Before it releases, it poisons the writer and the pager and records the failure
+/// ([`Failure::MAIN_FILE`](crate::health::Failure::MAIN_FILE), `Panic`), as a failed
+/// manifest commit does: no commit goes ahead on whatever state the panic left, and
+/// `check_open`, maintenance and health see it at once, not at the next commit's attempt.
+/// That matters most on an application thread, where no shard dies with the panic.
+///
+/// `release` may run the final close on the unwinding thread (`try_final_close`), when
+/// every shard has already reported: it must stay panic-free there, as `report_panicked`'s
+/// own final close must (a panic while unwinding aborts the process).
+///
+/// Not armed across `ManifestPump::start`: its commit is in flight (`inflight` is set)
+/// before `submit_commit_root` is called, and the pump's drop finishes and releases it. The
+/// unwind runs that drop: the runtime's scheduler takes a task out of its slot to run it
+/// (`Scheduler::begin_one`), so the running pump is owned by the frame that unwinds.
 #[must_use]
 pub(crate) struct UnwindRelease<'a>(Option<&'a Shared>);
 
@@ -1445,6 +1458,11 @@ impl Drop for UnwindRelease<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .poison();
+        shared.pager_poisoned.store(true, Ordering::Release);
+        shared.failure.record(
+            crate::health::Failure::MAIN_FILE,
+            crate::health::FailureCause::Panic,
+        );
         release(shared);
     }
 }
