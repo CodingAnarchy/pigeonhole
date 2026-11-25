@@ -189,7 +189,7 @@ impl FeedReader {
         loop {
             let (top_ready, top_held) = self.trim_tops();
             if !self.trim_due(top_ready, top_held) {
-                return;
+                break;
             }
             match (top_ready, top_held) {
                 (Some(k), None) => self.evict_ready(k),
@@ -202,8 +202,29 @@ impl FeedReader {
                     self.evict_round(id);
                     self.ahead.lower_cutoff(id);
                 }
-                (None, None) => return,
+                (None, None) => break,
             }
+        }
+        self.evict_external_past_cutoff();
+    }
+
+    /// #2180: passes over the external shares held with an id at or past the cutoff, once it
+    /// has fallen. An external share never causes an eviction or lowers the cutoff
+    /// ([`trim_tops`](Self::trim_tops)), but one held before the cutoff fell to its id is no
+    /// different from one read after, which is passed over by its id: its Decision is keyed
+    /// past the cutoff, so a chunk jump may pass the Decision over (`Chunk::min_key`), and
+    /// rule C would then drop the share as aborted and the Decision, read later, expire the
+    /// feed as a gap. Passed over, the share is read again after the rewind.
+    fn evict_external_past_cutoff(&mut self) {
+        let cutoff = self.ahead.cutoff;
+        let ids: Vec<Seqno> = self
+            .held
+            .range((cutoff, 0)..)
+            .filter(|(_, h)| h.external)
+            .map(|(&(id, _), _)| id)
+            .collect();
+        for id in ids {
+            self.evict_round(id);
         }
     }
 

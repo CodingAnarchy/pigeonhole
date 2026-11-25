@@ -183,7 +183,7 @@ assert_eq!(stats.tombstones, 4, "until the next pack");
 # }
 ```
 
-- **It runs beside searches and writes.** A pack works a chunk at a time, one transaction a chunk, and every search sees the same postings before, during and after.
+- **It runs beside searches and writes.** A pack works a chunk at a time, one transaction a chunk, and every search sees the same postings before, during and after. A chunk whose commit conflicts with writers, or is too large for the database (a common word in very long documents carries long position lists), is retried smaller.
 - **Writes after a pack are cells again,** and a delete leaves a small marker over the packed posting (`IndexStats::tombstones`). Searches read both, so nothing is stale. Pack again when they have built up: a pack takes only what was written since the last one. `verify()` reports how many postings are packed (`IndexStats::packed`).
 - **A few postings stay cells.** A term with fewer than 32 new postings and no block near them is left for a later pack, so rare terms aren't cut into tiny blocks.
 - **Stopping and resuming:** `pack_with(options, step)` calls `step` after each chunk, and a `Break` stops it there. `pack_pending()` is then true, and the next `pack` carries on from where it stopped.
@@ -287,5 +287,7 @@ The write rate stays flat from the first document to the millionth. A full compa
 | `InvalidArgument` | A phrase on an index without positions, a document over `max_terms`, a bad option, or a table that isn't an index. Also query statistics of another query or other fuzzy options, statistics that don't parse, or a newer version's. |
 | `Busy` | A write or search while `repair` runs: retry after it finishes. |
 | `PackRefused` | `pack` before an index's first pack while reader processes are attached, or while a rebuild is pending. Its message says which. Code `Busy`. |
+| `Db` with code `Conflict` | `pack`, when writers kept changing a chunk's postings through its retries, even at its smallest. The index is consistent and the pack's place is kept: pack again, and it carries on from there. |
+| `Db` with code `BatchTooLarge` or `RecordTooLarge` | `pack`, when one posting's chunk doesn't fit a commit: a posting written while the database was opened with a larger `memtable_budget` than now. Open it with that budget to pack the term. The index is consistent and the pack's place is kept. |
 | `Mismatch` | `open` with another tokeniser or tokeniser version than the index was made with, or a packed block in a format a later release wrote. |
 | `Db` | The database's own error, passed through. |
