@@ -310,8 +310,12 @@ pub(crate) trait Promoter {
     async fn set_map(&self, m: proto::ClusterMap) -> Result<Set, Failure>;
     /// Now, in nanoseconds, on a clock that counts a suspend (the lease clock's).
     fn now(&self) -> u64;
-    /// Every node of the map's `Status`, by id: `None` for one that didn't answer (#2152).
-    async fn survey(&self) -> Result<HashMap<String, Option<proto::NodeStatus>>, Failure>;
+    /// Every node of the map's `Status`, by id: `None` for one that didn't answer (#2152),
+    /// each waited for `wait` at most (the writer's own survey waits less still).
+    async fn survey(
+        &self,
+        wait: Duration,
+    ) -> Result<HashMap<String, Option<proto::NodeStatus>>, Failure>;
     /// Waits `d` (#2152: for an unreachable owner's grants to run out).
     async fn sleep(&self, d: Duration) {
         tokio::time::sleep(d).await;
@@ -562,17 +566,21 @@ pub(crate) fn surveyed_lease(
 /// Abandons the pending promote of `partition` to `to` at `target` before its stamp
 /// (#2152): the event ABANDONED, and `to` back in P's replicas, since its copy is still
 /// unstamped. Waits for that copy to close first, so the node opens it again from the new
-/// map rather than finishing a close begun on the old one.
+/// map rather than finishing a close begun on the old one. Adding a replica needs every
+/// node to answer (D328's map-feature check), so with one down the promote is abandoned
+/// without it (#2171). The map version, and whether `to` is back among the replicas.
 async fn abandon_unstamped(
     ops: &impl Promoter,
     partition: &str,
     to: &str,
     target: u64,
-) -> Result<u64, Failure> {
+) -> Result<(u64, bool), Failure> {
     use proto::{FailoverKind as K, FailoverState as St};
     let _ = ops.wait_closed(to, partition).await;
-    let mut m = ops.map().await?;
-    let mut changed = false;
+    let base = ops.map().await?;
+    let mut m = base.clone();
+    m.map_version += 1;
+    let mut abandoned = false;
     for e in m.failovers.iter_mut().filter(|e| {
         e.kind() == K::Partition
             && e.partition == partition
@@ -581,19 +589,37 @@ async fn abandon_unstamped(
             && e.state() == St::Pending
     }) {
         e.set_state(St::Abandoned);
-        changed = true;
+        abandoned = true;
     }
-    for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
+    let mut back = m.clone();
+    let mut readd = false;
+    for q in back.partitions.iter_mut().filter(|q| q.id == partition) {
         if q.node != to && !q.replicas.iter().any(|r| r == to) {
             q.replicas.push(to.to_owned());
-            changed = true;
+            readd = true;
         }
     }
-    if !changed {
-        return Ok(m.map_version);
+    if readd {
+        if let Ok(set) = ops.set_map(back).await {
+            return Ok((set.version, true));
+        }
+    } else if !abandoned {
+        return Ok((base.map_version, true));
     }
-    m.map_version += 1;
-    Ok(ops.set_map(m).await?.version)
+    if !abandoned {
+        return Ok((base.map_version, false));
+    }
+    Ok((ops.set_map(m).await?.version, false))
+}
+
+/// How long each survey after the first waits for a node (#2171): a sixth of the lease the
+/// first one learned, so two surveys and the first map between them (each push within
+/// `--cluster-push-timeout-ms`, at most a third of it) fit inside the bound with a node
+/// down. A connect to a stopped node took about 2 s on Windows, past a short lease.
+fn survey_wait(statuses: &HashMap<String, Option<proto::NodeStatus>>) -> Duration {
+    surveyed_lease(statuses)
+        .0
+        .map_or(SURVEY_WAIT, |l| (l / 6).min(SURVEY_WAIT))
 }
 
 /// Promotes node `to`'s copy of `partition` in `m` (D328 PR 3, with D330 PR 2's pending
@@ -668,7 +694,14 @@ pub(crate) async fn run(
     let mut warnings = Vec::new();
     let first = if guard {
         let mut t0 = ops.now();
-        let mut statuses = ops.survey().await?;
+        let mut statuses = ops.survey(SURVEY_WAIT).await?;
+        // A first survey that waited longer on a node that's down than the later ones
+        // will is taken again, at their wait, to start the clock (#2171).
+        let wait = survey_wait(&statuses);
+        if Duration::from_nanos(ops.now().saturating_sub(t0)) > wait {
+            t0 = ops.now();
+            statuses = ops.survey(wait).await?;
+        }
         // `--old-unreachable` right after the owner stopped: the others' grants to it end
         // within their time left, so the promote waits them out, two leases at most (a
         // stopping owner may renew once more on its way down). Grants still live after that
@@ -683,7 +716,7 @@ pub(crate) async fn run(
                 }
                 ops.sleep(left + GRANT_SLACK).await;
                 t0 = ops.now();
-                statuses = ops.survey().await?;
+                statuses = ops.survey(wait).await?;
             }
         }
         if let Some(why) = owner_back(m, &p, &statuses) {
@@ -691,7 +724,7 @@ pub(crate) async fn run(
                 "{why}: the promote of {partition} to node {to:?} didn't start"
             )));
         }
-        Some((t0, surveyed_lease(&statuses).0))
+        Some((t0, surveyed_lease(&statuses).0, wait))
     } else {
         None
     };
@@ -757,8 +790,8 @@ pub(crate) async fn run(
             )));
         }
     }
-    if let Some((t0, lease)) = first {
-        let statuses = ops.survey().await?;
+    if let Some((t0, lease, wait)) = first {
+        let statuses = ops.survey(wait).await?;
         let now = ops.now();
         let (reported, silent) = surveyed_lease(&statuses);
         let why = owner_back(m, &p, &statuses).or_else(|| match lease.or(reported) {
@@ -782,10 +815,18 @@ pub(crate) async fn run(
             }
         });
         if let Some(why) = why {
-            let v = abandon_unstamped(ops, partition, to, target).await?;
+            let (v, back) = abandon_unstamped(ops, partition, to, target).await?;
+            let replicas = if back {
+                format!("node {to:?} is one of its replicas again")
+            } else {
+                format!(
+                    "add node {to:?} back to {partition}'s replicas (phdb cluster set-map) once \
+                     every node answers"
+                )
+            };
             return Err(Failure::usage(&format!(
                 "{why}. The promote of {partition} to node {to:?} is abandoned at map version \
-                 {v}, before its stamp: node {to:?} is one of its replicas again"
+                 {v}, before its stamp: {replicas}"
             )));
         }
     }
@@ -953,15 +994,19 @@ impl Promoter for CliOps<'_> {
         pigeonhole_io::sys::boot_clock_ns()
     }
 
-    async fn survey(&self) -> Result<HashMap<String, Option<proto::NodeStatus>>, Failure> {
+    async fn survey(
+        &self,
+        wait: Duration,
+    ) -> Result<HashMap<String, Option<proto::NodeStatus>>, Failure> {
         // In parallel, so a node that doesn't answer costs one wait, not one each: the
         // time between the two surveys is bounded.
+        let wait = wait.min(SURVEY_WAIT);
         let mut asks = tokio::task::JoinSet::new();
         for n in &self.map.nodes {
             let (args, id) = (self.args.clone(), n.id.clone());
             let url = url_of(self.args, &n.address);
             asks.spawn(async move {
-                let st = tokio::time::timeout(SURVEY_WAIT, async {
+                let st = tokio::time::timeout(wait, async {
                     let (mut c, token) = connect(&args, &url).await.ok()?;
                     c.status(request(StatusRequest::default(), token.as_deref()).ok()?)
                         .await
@@ -1138,7 +1183,7 @@ mod tests {
                 .set(self.clock.get() + u64::try_from(d.as_nanos()).unwrap());
         }
 
-        async fn survey(&self) -> Result<Survey, Failure> {
+        async fn survey(&self, _wait: Duration) -> Result<Survey, Failure> {
             let mut s = self.surveys.borrow_mut();
             assert!(!s.is_empty(), "a survey the test didn't expect");
             Ok(s.remove(0))
@@ -1290,8 +1335,9 @@ mod tests {
     fn surveys_more_than_a_lease_apart_abandon_the_promote() {
         // 11 s between the clock reads, with 10 s leases: a grant taken after the first
         // survey could have run out before the second (L·0.99/1.01 is 9.8 s).
+        // The first survey, slower than a sixth of the lease, is taken again (#2171).
         let f = fake(
-            vec![quiet(10_000), quiet(10_000)],
+            vec![quiet(10_000), quiet(10_000), quiet(10_000)],
             2,
             Duration::from_secs(11),
         );
@@ -1304,7 +1350,11 @@ mod tests {
     #[test]
     fn with_no_lease_reported_the_promote_goes_on_with_a_warning_naming_the_nodes() {
         // The coordinator's ruling: older nodes (lease_ms 0) don't stop it.
-        let f = fake(vec![quiet(0), quiet(0)], 2, Duration::from_secs(30));
+        let f = fake(
+            vec![quiet(0), quiet(0), quiet(0)],
+            2,
+            Duration::from_secs(30),
+        );
         let done = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap();
         assert_eq!(done.warnings.len(), 1, "{:?}", done.warnings);
         assert!(done.warnings[0].contains("a, b"), "{}", done.warnings[0]);
@@ -1374,6 +1424,68 @@ mod tests {
         };
         block_on(run(&f, &three(), "p3", "b", &how)).unwrap();
         assert!(f.stamped.get());
+    }
+
+    /// #2171: with a node down, putting the copy back among the replicas is refused (every
+    /// node must answer to add one), so the abandon goes ahead without it and says so.
+    #[test]
+    fn an_abandon_whose_re_add_is_refused_abandons_without_it() {
+        struct Refusing(Fake);
+        impl Promoter for Refusing {
+            async fn row(&self, id: &str, p: &str) -> Result<Option<LocalPartition>, Failure> {
+                self.0.row(id, p).await
+            }
+            async fn map(&self) -> Result<ClusterMap, Failure> {
+                self.0.map().await
+            }
+            async fn set_map(&self, m: ClusterMap) -> Result<Set, Failure> {
+                let readds = m.partitions[0].replicas.iter().any(|r| r == "b")
+                    && m.failovers.iter().any(|e| e.state() == S::Abandoned);
+                if readds {
+                    return Err(Failure::usage("the map can't add a read replica"));
+                }
+                self.0.set_map(m).await
+            }
+            fn now(&self) -> u64 {
+                self.0.now()
+            }
+            async fn survey(&self, wait: Duration) -> Result<Survey, Failure> {
+                self.0.survey(wait).await
+            }
+            async fn sleep(&self, d: Duration) {
+                self.0.sleep(d).await;
+            }
+            async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<(), Failure> {
+                self.0.stamp(id, req).await
+            }
+            async fn wait_closed(&self, id: &str, p: &str) -> Result<(), Failure> {
+                self.0.wait_closed(id, p).await
+            }
+            async fn wait_serving(&self, id: &str, p: &str, e: u64) -> Result<(), Failure> {
+                self.0.wait_serving(id, p, e).await
+            }
+        }
+        let mut back = quiet(10_000);
+        back.get_mut("a")
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(LeaseWithheld {
+                partition: "p3".into(),
+                holder: "c".into(),
+                remaining_ms: 4_000,
+            });
+        let f = Refusing(fake(vec![quiet(10_000), back], 2, Duration::from_secs(1)));
+        let e = block_on(run(&f, &three(), "p3", "b", &failover())).unwrap_err();
+        assert!(
+            e.message().contains("once every node answers"),
+            "{}",
+            e.message()
+        );
+        let m = f.0.map.borrow();
+        assert_eq!(m.failovers[0].state(), S::Abandoned);
+        assert!(m.partitions[0].replicas.is_empty());
     }
 
     #[test]

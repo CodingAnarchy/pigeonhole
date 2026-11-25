@@ -987,7 +987,12 @@ impl Promoter for NodeOps {
             })
     }
 
-    async fn survey(&self) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
+    async fn survey(
+        &self,
+        _wait: Duration,
+    ) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
+        // The writer's survey waits `--cluster-push-timeout-ms`, at most a sixth of the
+        // lease, for each node already.
         let node = self.node()?;
         let map = node.get_map().map_err(|e| Failure::usage(&e.message))?;
         let mut statuses: HashMap<String, Option<NodeStatus>> =

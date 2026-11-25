@@ -1748,7 +1748,10 @@ mod model {
             self.world.borrow().nodes[self.writer].clock.now()
         }
 
-        async fn survey(&self) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
+        async fn survey(
+            &self,
+            _wait: Duration,
+        ) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
             let world = self.world.borrow();
             Ok((0..NODES)
                 .map(|j| {
