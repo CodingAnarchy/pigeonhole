@@ -1843,7 +1843,7 @@ fn a_targets_copy_reports_its_moves_progress_from_its_own_rows() {
             });
         })
         .await;
-        let source = put_after_move(a, "r", "zy").await;
+        put_after_move(a, "r", "zy").await;
         // The owner's follower first: b copies and catches up past the write.
         let owner = async || {
             client(ports[1])
@@ -1861,7 +1861,18 @@ fn a_targets_copy_reports_its_moves_progress_from_its_own_rows() {
         };
         eventually_within(
             Duration::from_secs(60),
-            "b's follower to copy mv1 and catch up past the write",
+            "b's follower to copy mv1",
+            async || owner().await.is_some_and(|s| s.copy_done),
+        )
+        .await;
+        // A write in the range past the copy: its seqno is past every chunk's snapshot, so the
+        // catch-up commits it, with its token row (#2209's linux red: a write the copy's
+        // snapshot already held left the catch-up nothing to commit, and its row is stored
+        // only with a commit, so the replica's row stayed behind the owner's in-memory count).
+        let source = put_after_move(a, "r", "zx").await;
+        eventually_within(
+            Duration::from_secs(60),
+            "b's follower to catch up past the write",
             async || {
                 owner()
                     .await
