@@ -1,0 +1,2 @@
+### Fixed
+- **Range moves: a follower waits for an earlier drop of its own move id** (#2141). A map that brought back an aborted move record under the same id, while the abort's drop of its copy was still pending on the target, could let the new follower read the old copy's progress and the old drop then delete the range under it. Only a hand-built map reuses an id; the follower now waits for that drop before it starts, and copies from the beginning.

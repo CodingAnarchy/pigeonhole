@@ -199,6 +199,23 @@ async fn subscribe(
     Ok(feed(port).await.subscribe(req).await?.into_inner())
 }
 
+/// [`subscribe`], retried while `port` answers `NotFound` (retryable): a node learns of a
+/// table created through another node's writer only once the new map reaches it, so a
+/// test's first subscribe right after creating one races it (#2175's Windows run). 30 s,
+/// for a slow runner.
+async fn subscribe_known(port: u16, req: SubscribeRequest) -> tonic::Streaming<FeedEvent> {
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match subscribe(port, req.clone()).await {
+            Ok(s) => return s,
+            Err(e) if code(&e) == "NotFound" && tokio::time::Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("subscribe through {port}: {e}"),
+        }
+    }
+}
+
 fn users() -> SubscribeRequest {
     SubscribeRequest {
         tables: vec!["users".into()],
@@ -2476,7 +2493,7 @@ fn a_move_to_a_partition_the_subscription_doesnt_read_reroutes_it_and_its_resume
                 start,
                 ..Default::default()
             };
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             put_order(c, "a1").await;
             let (seen, _) = commits(&mut s, 1).await;
             assert_eq!(seen[0].partition, "p1");
@@ -2544,7 +2561,7 @@ fn a_token_from_before_a_whole_table_move_resumes_through_the_source_then_the_ta
         let (a, c) = (ports[0], ports[2]);
         t.rt.block_on(async {
             orders_on_p1(a).await;
-            let mut s = subscribe(
+            let mut s = subscribe_known(
                 c,
                 SubscribeRequest {
                     tables: vec!["orders".into()],
@@ -2552,8 +2569,7 @@ fn a_token_from_before_a_whole_table_move_resumes_through_the_source_then_the_ta
                     ..Default::default()
                 },
             )
-            .await
-            .unwrap();
+            .await;
             put_order(c, "k1").await;
             let (first, _) = commits(&mut s, 1).await;
             let token = first[0].token.clone().unwrap();
@@ -2611,7 +2627,7 @@ fn a_token_from_before_a_pruned_whole_table_move_expires() {
         };
         let token = t.rt.block_on(async {
             orders_on_p1(a).await;
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             put_order(c, "k1").await;
             let (first, _) = commits(&mut s, 1).await;
             let token = first[0].token.clone().unwrap();
@@ -2682,7 +2698,7 @@ fn a_token_at_a_pruned_moves_end_retires_the_emptied_source_on_resume() {
         };
         let (token, last) = t.rt.block_on(async {
             orders_on_p1(a).await;
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             put_order(c, "k1").await;
             let last = put_order(c, "k2").await;
             let (seen, _) = commits(&mut s, 2).await;
@@ -2749,7 +2765,7 @@ fn a_token_naming_a_partition_a_merge_removed_expires() {
         };
         t.rt.block_on(async {
             orders_on_p1(a).await;
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             let last = put_order(c, "k1").await;
             let (seen, _) = commits(&mut s, 1).await;
             drop(s);
@@ -2831,7 +2847,7 @@ fn a_resume_from_a_newer_map_through_a_node_behind_it_is_retried_not_expired() {
         };
         let real = t.rt.block_on(async {
             orders_on_p1(a).await;
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             put_order(c, "k1").await;
             let (seen, _) = commits(&mut s, 1).await;
             ClusterToken::decode(&seen[0].token.clone().unwrap()).unwrap()
@@ -2933,7 +2949,7 @@ fn a_resume_whose_position_is_another_databases_expires() {
             orders_on_p1(a).await;
             table_on(a, "items", "p2").await;
             let token_of = async |table: &str| {
-                let mut s = subscribe(c, req(table, None)).await.unwrap();
+                let mut s = subscribe_known(c, req(table, None)).await;
                 put_in(c, table, "k1").await;
                 let (seen, _) = commits(&mut s, 1).await;
                 ClusterToken::decode(&seen[0].token.clone().unwrap()).unwrap()
@@ -2993,7 +3009,7 @@ async fn resume_ends(port: u16, req: SubscribeRequest) -> tonic::Status {
 async fn token_before_an_orders_move(ports: &[u16], start: &str) -> Bytes {
     let (a, c) = (ports[0], ports[2]);
     orders_on_p1(a).await;
-    let mut s = subscribe(
+    let mut s = subscribe_known(
         c,
         SubscribeRequest {
             tables: vec!["orders".into()],
@@ -3001,8 +3017,7 @@ async fn token_before_an_orders_move(ports: &[u16], start: &str) -> Bytes {
             ..Default::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
     put_order(c, "k1").await;
     let (first, _) = commits(&mut s, 1).await;
     let token = first[0].token.clone().unwrap();
@@ -3331,7 +3346,7 @@ fn between_the_hand_over_and_cleaning_a_resume_waits_rather_than_expiring() {
                 start,
                 ..Default::default()
             };
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             let last = put_order(c, "a1").await;
             let (seen, _) = commits(&mut s, 1).await;
             let token = seen[0].token.clone().unwrap();
@@ -3405,7 +3420,7 @@ fn whole_table_move_beside_another_table(items_on: &str) {
                 start,
                 ..Default::default()
             };
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             put_in(c, "items", "i1").await;
             let (first, _) = commits(&mut s, 1).await;
             let token = first[0].token.clone().unwrap();
@@ -3461,7 +3476,7 @@ fn a_subscription_connected_across_a_whole_table_move_retires_the_source_part() 
                 start,
                 ..Default::default()
             };
-            let mut s = subscribe(c, req(None)).await.unwrap();
+            let mut s = subscribe_known(c, req(None)).await;
             let last = put_order(c, "k1").await;
             let (seen, _) = commits(&mut s, 1).await;
             let mut token = seen[0].token.clone().unwrap();
