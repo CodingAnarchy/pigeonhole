@@ -52,6 +52,22 @@ pub(crate) const PASS: Duration = Duration::from_secs(30);
 pub(crate) static PASS_FOR: std::sync::Mutex<Vec<(std::path::PathBuf, Duration)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// A fault seam (tests): the next unfence the balancer on the node in the listed cluster
+/// directory sends after an abort fails, once per entry, as a node that doesn't answer
+/// would fail it (#2151).
+#[cfg(test)]
+pub(crate) static FAIL_UNFENCE: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A partition an aborted balancer move left fenced and closed on its node, whose unfence
+/// failed (#2151): each pass tries again, and `state` names it.
+#[derive(Debug, Clone)]
+struct Unfence {
+    partition: String,
+    move_id: String,
+    error: String,
+}
+
 /// The writer's balancer state: in memory, new with each writer term (S3).
 #[derive(Debug, Default)]
 pub(crate) struct Run {
@@ -73,6 +89,9 @@ pub(crate) struct Run {
     /// owner didn't answer it, or the split couldn't start (perf2's and ai1249's S1 on
     /// #2137). `state` names them.
     no_cut: HashMap<String, (u64, String)>,
+    /// Partitions still to unfence after an abort (#2151). Kept across terms: the fence
+    /// stands whoever the writer is.
+    unfence: Vec<Unfence>,
 }
 
 fn wall_ms() -> u64 {
@@ -375,6 +394,14 @@ fn emptied(m: &ClusterMap) -> Vec<String> {
 
 /// What an abort's state line adds when its ABORT event's map change failed (audit120's
 /// nit on #2137): the abort happened, the event wasn't recorded.
+/// What `state` says of a partition an aborted move left fenced (#2151).
+fn still_fenced(partition: &str, move_id: &str, error: &str) -> String {
+    format!(
+        "{partition} is still fenced and closed after aborted move {move_id} ({error}): the \
+         balancer tries again each pass, or run phdb cluster unfence {partition} on its node"
+    )
+}
+
 fn unrecorded(recorded: Result<(), String>) -> String {
     recorded
         .err()
@@ -512,6 +539,7 @@ impl Node {
                     moving: r.moving.take(),
                     actions: std::mem::take(&mut r.actions),
                     passing: r.passing,
+                    unfence: std::mem::take(&mut r.unfence),
                     ..Run::default()
                 };
             }
@@ -523,6 +551,11 @@ impl Node {
                 return;
             }
             r.last_pass = Some(now);
+        }
+        // A partition an abort left fenced (#2151): nothing else is decided until it serves
+        // again, since a closed partition's size and load read as nothing.
+        if self.retry_unfences(&map).await {
+            return;
         }
         // An earlier writer's balancer move, which no task of this writer's runs (M1).
         if let Some(rec) = map
@@ -1225,34 +1258,26 @@ impl Node {
             ));
             return;
         }
-        // The move fenced and closed P on its node: serve it there again.
-        let owner = map
-            .partitions
-            .iter()
-            .find(|p| p.id == rec.from)
-            .map(|p| p.node.clone())
-            .unwrap_or_default();
-        if let Some(n) = map.nodes.iter().find(|n| n.id == owner) {
-            let req = PartitionRequest {
-                partition: rec.from.clone(),
-                ..PartitionRequest::default()
-            };
-            let lifted = async {
-                let mut c = self.client(&n.address).await?;
-                c.unfence(self.request(req)?)
-                    .await
-                    .map(drop)
-                    .map_err(|s| s.message().to_owned())
-            }
-            .await;
-            if let Err(e) = lifted {
+        // The move fenced and closed P on its node: serve it there again. The record is gone
+        // (first, so a rerun of the move loses its compare-and-set before P takes writes), so
+        // an unfence that fails is kept and tried again each pass (#2151).
+        let still_fenced = match self.unfence_after_abort(map, &rec.from).await {
+            Ok(()) => String::new(),
+            Err(e) => {
                 eprintln!(
-                    "phdb serve: the balancer unfencing {} on node {owner} after aborting move \
-                     {}: {e}",
+                    "phdb serve: the balancer unfencing {} after aborting move {}: {e}; it \
+                     tries again each pass",
                     rec.from, rec.id
                 );
+                let note = format!("; {}", still_fenced(&rec.from, &rec.id, &e));
+                self.balancing().unfence.push(Unfence {
+                    partition: rec.from.clone(),
+                    move_id: rec.id.clone(),
+                    error: e,
+                });
+                note
             }
-        }
+        };
         let Ok(now) = self.get_map() else { return };
         let mut m = now.clone();
         m.map_version += 1;
@@ -1269,12 +1294,87 @@ impl Node {
         let recorded = self.balancer_change(&now, m).await;
         *self.balancing().actions.entry("abort").or_insert(0) += 1;
         self.set_balancer_state(format!(
-            "aborted an earlier writer's move {} of {} to node {}{}",
+            "aborted an earlier writer's move {} of {} to node {}{}{still_fenced}",
             rec.id,
             rec.from,
             rec.to,
             unrecorded(recorded)
         ));
+    }
+
+    /// Unfences `partition` on the node `map` gives it to, after a balancer move's abort.
+    async fn unfence_after_abort(&self, map: &ClusterMap, partition: &str) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let mut fail = FAIL_UNFENCE.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(i) = fail.iter().position(|d| d == self.dir()) {
+                fail.swap_remove(i);
+                return Err("the unfence failed (a test's fault)".to_owned());
+            }
+        }
+        let owner = map
+            .partitions
+            .iter()
+            .find(|p| p.id == partition)
+            .map(|p| p.node.as_str())
+            .ok_or_else(|| format!("the map has no partition {partition}"))?;
+        let n = map
+            .nodes
+            .iter()
+            .find(|n| n.id == owner)
+            .ok_or_else(|| format!("the map has no node {owner}"))?;
+        let req = PartitionRequest {
+            partition: partition.to_owned(),
+            ..PartitionRequest::default()
+        };
+        let mut c = self.client(&n.address).await?;
+        c.unfence(self.request(req)?)
+            .await
+            .map(drop)
+            .map_err(|s| format!("node {owner}: {}", s.message()))
+    }
+
+    /// Tries again each unfence an abort left ([`Run::unfence`], #2151). One is dropped once
+    /// it succeeds, or once the map has moved on for its partition (a move names it, or the
+    /// map no longer has it): that move, or its operator, owns the fence then. Whether any
+    /// is still waiting, with `state` naming them: the pass decides nothing else meanwhile.
+    async fn retry_unfences(&self, map: &ClusterMap) -> bool {
+        let pending = self.balancing().unfence.clone();
+        if pending.is_empty() {
+            return false;
+        }
+        let mut left = Vec::new();
+        for mut u in pending {
+            let moved_on = !map.partitions.iter().any(|p| p.id == u.partition)
+                || map
+                    .moves
+                    .iter()
+                    .any(|m| m.from == u.partition || (!map::node_move(m) && m.to == u.partition));
+            if moved_on {
+                continue;
+            }
+            match self.unfence_after_abort(map, &u.partition).await {
+                Ok(()) => eprintln!(
+                    "phdb serve: the balancer unfenced {} (left fenced by aborted move {})",
+                    u.partition, u.move_id
+                ),
+                Err(e) => {
+                    u.error = e;
+                    left.push(u);
+                }
+            }
+        }
+        let waiting = left
+            .iter()
+            .map(|u| still_fenced(&u.partition, &u.move_id, &u.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let any = !left.is_empty();
+        self.balancing().unfence = left;
+        if any {
+            self.set_balancer_state(format!("waiting: {waiting}"));
+        }
+        any
     }
 
     /// An auto-pin, or its expiry.
