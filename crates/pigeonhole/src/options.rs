@@ -545,6 +545,16 @@ impl Options {
     /// - **The cost:** a pass punches one free block (up to 64 MiB) at a time, at most
     ///   256 MiB, paced to 64 MiB/s, on a background thread. Writes into a punched range
     ///   allocate on the filesystem again.
+    /// - **A full filesystem:** punched space is no longer reserved for the file. Without
+    ///   punching, a full disk can only fail the file's growth, cleanly, with nothing
+    ///   written. With it, a write into a punched range can fail for lack of space too; if
+    ///   that write is a root commit's, writes stop until the database is reopened, as
+    ///   after any failed root commit. Keep free space on the filesystem, or turn punching
+    ///   off.
+    /// - **After a reopen:** holes are tracked in memory only. `file_punched_bytes` reads 0
+    ///   though the holes are still there, until passes punch that space again (counting
+    ///   it again in `file_punches` and `file_punch_bytes`). A pass starts only after a
+    ///   flush, compaction or catalog change.
     /// - **Where it does nothing:** Windows, other platforms, and filesystems that cannot
     ///   punch (the first refusal stops it until the next open). The metrics count passes,
     ///   punches and bytes (`file_punch_*`).
