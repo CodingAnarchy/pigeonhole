@@ -2604,10 +2604,9 @@ impl FeedReader {
     ///   nothing re-logs a record. So `K` is at least the start (the rule `start_at` keeps
     ///   for the writer's history). One exception: an external share still in doubt when
     ///   the session opened (D329) is before its first segment, and its key, its Decision's
-    ///   apply seqno, is allocated later. A start in that session passes over the share,
-    ///   so its Decision there is a gap, or, from a later session, a round dropped. That
-    ///   needs the share's own session not to qualify (unfed, or partly recycled) while the
-    ///   share's segment is kept; `start_at`'s history starts before it (#2189).
+    ///   apply seqno, is allocated later. Such a session isn't started in (#2190, from
+    ///   [`external_rounds`](Self::external_rounds)): a later one or the current history,
+    ///   whose `start_at` starts before such a share (#2189), decides.
     /// - **It skips none of the session's commits.** A single's seqno is allocated in the
     ///   group that logs it, after that stream's first record. A cross-shard commit is keyed
     ///   by its apply seqno, reserved once every participant logged its PREPARE: after each
@@ -2664,13 +2663,22 @@ impl FeedReader {
             .map(|(&id, &epoch)| (epoch, id))
             .collect();
         sessions.sort_unstable();
+        if sessions.is_empty() {
+            return None;
+        }
+        // #2190: every stream's external PREPAREs, and every Decision and abort, from its
+        // floor: a session that opened with a share in doubt isn't started in (below).
+        let rounds = self.external_rounds(&open, &firsts)?;
         'sessions: for (_, session) in sessions {
             let mut first = None::<Seqno>;
+            // The smallest seqno the session's first records were allocated in it: a round
+            // with a smaller id was prepared before it.
+            let mut alloc = Seqno::MAX;
             for (s, f) in firsts.iter().enumerate() {
                 let Some(mut c) = open(s, Lsn::new(f[&session], 0)) else {
                     continue 'sessions;
                 };
-                let id = match c.step() {
+                let (id, own) = match c.step() {
                     // The stream logged nothing in the session: no id from it.
                     Ok(Step::End) => continue,
                     Ok(Step::Record {
@@ -2681,14 +2689,14 @@ impl FeedReader {
                         WalRecord::Batch { seqno, .. }
                         | WalRecord::Prepare { seqno, .. }
                         | WalRecord::Commit { seqno, .. }
-                        | WalRecord::ExternalPrepare { seqno, .. } => seqno,
+                        | WalRecord::ExternalPrepare { seqno, .. } => (seqno, seqno),
                         WalRecord::Decision {
                             seqno, apply_seqno, ..
-                        } => seqno.min(apply_seqno),
+                        } => (seqno.min(apply_seqno), apply_seqno),
                         WalRecord::ExternalAbort {
                             seqno, abort_seqno, ..
-                        } => seqno.min(abort_seqno),
-                        WalRecord::RangeDrop { seqno, .. } => seqno,
+                        } => (seqno.min(abort_seqno), abort_seqno),
+                        WalRecord::RangeDrop { seqno, .. } => (seqno, seqno),
                         // A kind this build can't key: the session can't be started in.
                         _ => continue 'sessions,
                     },
@@ -2700,13 +2708,80 @@ impl FeedReader {
                     _ => continue 'sessions,
                 };
                 first = Some(first.map_or(id, |f| f.min(id)));
+                alloc = alloc.min(own);
             }
             // A session that logged nothing: the next one decides.
             let Some(first) = first else { continue };
+            // #2190: a share in doubt when the session opened is before its first segments,
+            // and its key, its Decision's apply seqno, was allocated after the session's
+            // start: a start here would pass the share over, and its Decision would be a gap
+            // or, read in a session before the current one, a round recovery dropped,
+            // passed over silently. A later session or the current history (`start_at`,
+            // which starts before such a share, #2189) decides instead: a later start, never
+            // a skip. Such a share shows as a PREPARE kept before the session with no
+            // Decision or abort before it, or, once retention recycled the PREPARE, as a
+            // Decision or abort in the session or after for a round older than it.
+            let before = |s: usize, epoch: u32| epoch < firsts[s][&session];
+            let open_doubt = rounds.prepared.iter().any(|&(s, epoch, id)| {
+                before(s, epoch)
+                    && !rounds
+                        .resolved
+                        .iter()
+                        .any(|&(c, at, r)| r == id && before(c, at))
+            });
+            let decided_after = rounds
+                .resolved
+                .iter()
+                .any(|&(c, at, id)| !before(c, at) && id < alloc);
+            if open_doubt || decided_after {
+                continue;
+            }
             let at = firsts.iter().map(|f| Lsn::new(f[&session], 0)).collect();
             return Some((first.saturating_sub(1), at, session));
         }
         None
+    }
+
+    /// [`earlier_start`](Self::earlier_start)'s scan (#2190): each stream's external PREPAREs
+    /// (D329), and every Decision and external abort, from its floor to its end, each with
+    /// its segment's epoch. `None` (the current history decides) when a stream can't be read
+    /// through: a segment gone or cut, or a read that failed.
+    ///
+    /// A share recovery dropped as aborted (a participant's PREPARE torn) leaves no record,
+    /// so it counts as in doubt: the start is then later than it could be, never past a
+    /// share whose round commits after it. The read is of what an `Oldest` start reads
+    /// anyway, and only when an earlier session could be started in.
+    fn external_rounds(
+        &self,
+        open: &impl Fn(usize, Lsn) -> Option<FeedCursor>,
+        firsts: &[HashMap<u64, u32>],
+    ) -> Option<ExternalRounds> {
+        let mut rounds = ExternalRounds::default();
+        for s in 0..firsts.len() {
+            let mut c = open(s, Lsn::new(self.floor(s), 0))?;
+            loop {
+                match c.step() {
+                    Ok(Step::Record { end, record, .. }) => {
+                        // The record's segment: `end` is in it (`start` may be in the one
+                        // before, past a pad).
+                        let epoch = end.epoch();
+                        match record {
+                            WalRecord::ExternalPrepare { seqno, .. } => {
+                                rounds.prepared.push((s, epoch, seqno));
+                            }
+                            WalRecord::Decision { seqno, .. }
+                            | WalRecord::ExternalAbort { seqno, .. } => {
+                                rounds.resolved.push((s, epoch, seqno));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Step::End) => break,
+                    _ => return None,
+                }
+            }
+        }
+        Some(rounds)
     }
 
     /// The token's session from now on: `session`'s, if it came later in the history than
@@ -2724,6 +2799,15 @@ impl FeedReader {
     fn floor(&self, s: usize) -> u32 {
         self.shm.feed_marks(s as u32).floor
     }
+}
+
+/// [`FeedReader::external_rounds`]'s scan (#2190).
+#[derive(Default)]
+struct ExternalRounds {
+    /// Each external PREPARE: its stream, its segment's epoch, and its round's id.
+    prepared: Vec<(usize, u32, Seqno)>,
+    /// Each Decision or external abort: its stream, its segment's epoch, and its round's id.
+    resolved: Vec<(usize, u32, Seqno)>,
 }
 
 /// A feed-silent batch a feed read (D331, ICR 0141): `Corruption` unless the database has
