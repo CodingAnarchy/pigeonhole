@@ -2236,6 +2236,7 @@ dependencies = [
  "h2",
  "half",
  "http-body",
+ "hyper",
  "hyper-util",
  "insta",
  "nix 0.29.0",

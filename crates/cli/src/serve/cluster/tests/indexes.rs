@@ -1276,7 +1276,9 @@ fn a_bulk_load_through_any_node_splits_by_id_across_partitions() {
         // message's vectors, keeps them, and the error says so.
         stops.remove(1).send(()).unwrap();
         // Once b refuses connections: a forward that reached it while it shut down answers
-        // OutcomeUnknown instead, rightly (a Linux CI race on #2087).
+        // OutcomeUnknown instead, rightly (a Linux CI race on #2087). One still queued for
+        // a's pooled connection to b when b closed it was never sent: PartitionUnavailable
+        // (#2212).
         eventually("b to stop", async || {
             tokio::net::TcpStream::connect(("127.0.0.1", b))
                 .await
