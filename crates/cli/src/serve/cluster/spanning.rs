@@ -1255,6 +1255,8 @@ pub(crate) async fn serve_home(
             let rows = home.txn_rows(&mine).await?;
             if !mine.is_empty() {
                 home.writable()?;
+                // D331 (#2155): the home's rows, as a plain `TxnWrite`'s are checked.
+                home.home_ranges(&mine, None)?;
             }
             driver.room(span, others.keys())?;
             for (p, rows) in others {
@@ -1285,6 +1287,9 @@ pub(crate) async fn serve_home(
                 return Err(ApiError::permission_denied("commit writes"));
             }
             drop(home.txn_rows(&mine).await?);
+            // D331 (#2155): the home's rows, before any row goes to a branch. The commit
+            // checks them again, with M3, under its gate hold.
+            home.home_ranges(&mine, None)?;
             if writes {
                 drop(home.decisions_table().await?);
             }
