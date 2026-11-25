@@ -569,7 +569,7 @@ mod tests {
         // An open: marked, served (with no lease yet), and the mark lifted.
         n.fences.set_opening("p1", true);
         assert_eq!(state(), Opening);
-        let _gate = n.open_gate("p1", 1);
+        n.serve_gate("p1", &n.new_gate("p1"), 1);
         assert_eq!(state(), Fenced);
         assert!(n.fences.is_opening("p1"), "until the open ends");
         n.fences.set_opening("p1", false);
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(state(), IsClosed);
         n.fences.set_opening("p1", false);
         assert_eq!(state(), IsClosed);
-        let _gate = n.open_gate("p1", 2);
+        n.serve_gate("p1", &n.new_gate("p1"), 2);
         assert!(n.fences.closed("p1", |_| ()).is_none());
         assert_eq!(n.fences.gate("p1").map(|(_, epoch)| epoch), Some(2));
         // Closed again, then its close forgotten (stamped over, or dropped): nothing.

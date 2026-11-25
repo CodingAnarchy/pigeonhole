@@ -215,8 +215,8 @@ fn an_opening_partition_gates_a_moved_range_from_its_file() {
         },
     )
     .unwrap();
-    let gate = n.open_gate("p1", 2);
-    n.arm_ranges(&gate, "p1", &db, || ()).unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 2, &db, || ()).unwrap();
     let state = (*gate.ranges().load())
         .clone()
         .expect("the row gates the range");
@@ -289,8 +289,8 @@ fn an_opening_source_fences_a_handing_over_range() {
         pigeonhole::Options::default().shards(1),
     )
     .unwrap();
-    let gate = n.open_gate("p1", 1);
-    n.arm_ranges(&gate, "p1", &db, || ()).unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 1, &db, || ()).unwrap();
     let state = (*gate.ranges().load()).clone().expect("fenced");
     let put = crate::serve::service::ServiceOp::Mutate(crate::serve::proto::MutateRequest {
         writes: Some(put_row("d", "x")),

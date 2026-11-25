@@ -29,9 +29,15 @@ async fn local(port: u16, p: &str) -> LocalPartition {
         .unwrap()
 }
 
-#[test]
-fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+/// Three nodes: a serves p1, b p2, and c routes only.
+struct Nodes {
+    ports: [u16; 3],
+    dirs: [std::path::PathBuf; 3],
+    stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    dbs: Vec<pigeonhole::Pigeonhole>,
+}
+
+fn nodes(rt: &tokio::runtime::Runtime) -> Nodes {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -48,24 +54,45 @@ fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
             .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
     {
         super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        let (stop, db) = data_node_tokens(rt, dir, id, local, l, "");
         stops.push(stop);
         dbs.extend(db);
     }
+    Nodes {
+        ports,
+        dirs,
+        stops,
+        dbs,
+    }
+}
+
+async fn fence(port: u16, p: &str) {
+    client(port)
+        .await
+        .fence(PartitionRequest {
+            partition: p.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[test]
+fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let Nodes {
+        ports,
+        dirs,
+        stops,
+        dbs,
+    } = nodes(&rt);
     let [a, _, c] = ports;
     rt.block_on(async {
         put(c, "alice", "1").await;
         let e = close(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert!(e.message().contains("fence it first"), "{e}");
-        client(a)
-            .await
-            .fence(PartitionRequest {
-                partition: "p1".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        fence(a, "p1").await;
         let lp = close(a, "p1").await.unwrap();
         assert_eq!(lp.state(), LocalPartitionState::Closed, "{lp:?}");
         // Its calls, here and forwarded, answer PartitionUnavailable.
@@ -205,26 +232,12 @@ fn a_call_on_a_partition_closed_under_it_answers_partition_unavailable() {
 #[test]
 fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let listeners: Vec<std::net::TcpListener> = (0..3)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
-    let mut map = the_map(1, &ports);
-    map.partitions.retain(|p| p.id != "p3");
-    let dirs = [test_dir(), test_dir(), test_dir()];
-    let mut stops = Vec::new();
-    let mut dbs = Vec::new();
-    for ((l, dir), (id, local)) in
-        listeners
-            .into_iter()
-            .zip(&dirs)
-            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
-    {
-        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
-        stops.push(stop);
-        dbs.extend(db);
-    }
+    let Nodes {
+        ports,
+        dirs,
+        stops,
+        dbs,
+    } = nodes(&rt);
     let a = ports[0];
     let drop_p1 = async || {
         client(a)
@@ -237,14 +250,7 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
             .map(tonic::Response::into_inner)
     };
     rt.block_on(async {
-        client(a)
-            .await
-            .fence(PartitionRequest {
-                partition: "p1".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        fence(a, "p1").await;
         close(a, "p1").await.unwrap();
         let e = drop_p1().await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
@@ -299,38 +305,17 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
 #[test]
 fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let listeners: Vec<std::net::TcpListener> = (0..3)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
-    let mut map = the_map(1, &ports);
-    map.partitions.retain(|p| p.id != "p3");
-    let dirs = [test_dir(), test_dir(), test_dir()];
-    let mut stops = Vec::new();
-    let mut dbs = Vec::new();
-    for ((l, dir), (id, local)) in
-        listeners
-            .into_iter()
-            .zip(&dirs)
-            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
-    {
-        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
-        stops.push(stop);
-        dbs.extend(db);
-    }
+    let Nodes {
+        ports,
+        dirs,
+        stops,
+        dbs,
+    } = nodes(&rt);
     let a = ports[0];
     let (release, wait) = std::sync::mpsc::channel::<()>();
     *super::super::close::HOLD_BEFORE_DB_CLOSE.lock().unwrap() = Some((dirs[0].clone(), wait));
     rt.block_on(async {
-        client(a)
-            .await
-            .fence(PartitionRequest {
-                partition: "p1".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        fence(a, "p1").await;
         let closing = tokio::spawn(async move { close(a, "p1").await });
         eventually("p1 to be closing", async || {
             local(a, "p1").await.state() == LocalPartitionState::Closed
@@ -379,6 +364,69 @@ fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
     }
 }
 
+/// #2113: `Status` shows a partition open only once a write can route to it. A closed p1
+/// reopens (unfence), held with its engine open and its service made, before it joins a's
+/// parts: `Status` still shows it closed, and a write, here or forwarded, answers
+/// `PartitionUnavailable`. Released, it serves, with its row.
+#[test]
+fn a_reopening_partition_shows_open_only_once_its_writes_route() {
+    use crate::serve::proto::MutateRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let Nodes {
+        ports,
+        dirs,
+        stops,
+        dbs,
+    } = nodes(&rt);
+    let [a, _, c] = ports;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    rt.block_on(async {
+        put(c, "alice", "1").await;
+        fence(a, "p1").await;
+        close(a, "p1").await.unwrap();
+        super::super::open::HOLD_SERVE.lock().unwrap().push((
+            dirs[0].clone(),
+            Arc::clone(&reached),
+            wait,
+        ));
+        let reopen = tokio::spawn(async move {
+            client(a)
+                .await
+                .unfence(PartitionRequest {
+                    partition: "p1".into(),
+                    ..Default::default()
+                })
+                .await
+                .map(tonic::Response::into_inner)
+        });
+        tokio::time::timeout(Duration::from_secs(30), reached.notified())
+            .await
+            .expect("the reopen to reach the hold");
+        let lp = local(a, "p1").await;
+        assert_eq!(lp.state(), LocalPartitionState::Closed, "{lp:?}");
+        for entry in [a, c] {
+            let e = data(entry)
+                .await
+                .mutate(MutateRequest {
+                    writes: Some(put_row("alice", "2")),
+                    durability: 0,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(code(&e), "PartitionUnavailable", "through {entry}: {e}");
+        }
+        release.send(()).unwrap();
+        let lp = reopen.await.unwrap().unwrap();
+        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
 /// A file's mode changed until dropped, so a test that fails leaves no unreadable file.
 #[cfg(unix)]
 struct Mode {
@@ -411,38 +459,17 @@ impl Drop for Mode {
 #[test]
 fn a_close_again_after_a_failed_hash_hashes_again() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let listeners: Vec<std::net::TcpListener> = (0..3)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
-    let mut map = the_map(1, &ports);
-    map.partitions.retain(|p| p.id != "p3");
-    let dirs = [test_dir(), test_dir(), test_dir()];
-    let mut stops = Vec::new();
-    let mut dbs = Vec::new();
-    for ((l, dir), (id, local)) in
-        listeners
-            .into_iter()
-            .zip(&dirs)
-            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
-    {
-        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
-        stops.push(stop);
-        dbs.extend(db);
-    }
+    let Nodes {
+        ports,
+        dirs,
+        stops,
+        dbs,
+    } = nodes(&rt);
     let [a, _, c] = ports;
     let file = dirs[0].join("p1.phdb");
     rt.block_on(async {
         put(c, "alice", "1").await;
-        client(a)
-            .await
-            .fence(PartitionRequest {
-                partition: "p1".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        fence(a, "p1").await;
         // Unreadable once closed: the open database keeps its descriptor, the hash can't
         // open the file.
         let unreadable = Mode::set(&file, 0o000);

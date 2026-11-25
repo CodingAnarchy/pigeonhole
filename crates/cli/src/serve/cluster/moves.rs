@@ -124,11 +124,15 @@ impl Node {
     /// Arms partition `id`'s range gate as it opens here (its file's moved-away rows), then
     /// settles it with the node's map, under the install lock, so an install either ran
     /// before (and this sees its map) or runs after `join` (and sees the partition).
-    /// `join` publishes the partition (its service into the node's parts). **Blocking.**
+    /// `join` publishes the partition (its service into the node's parts); then it's served
+    /// behind `gate`, at its file's `epoch` or the one its hand-over raised it to, in the
+    /// same step: `Status` shows it open only once a write routes to it (#2113).
+    /// **Blocking.**
     pub(crate) fn arm_ranges(
         &self,
-        gate: &WriteGate,
+        gate: &std::sync::Arc<WriteGate>,
         id: &str,
+        epoch: u64,
         db: &Pigeonhole,
         join: impl FnOnce(),
     ) -> Result<(), String> {
@@ -144,13 +148,14 @@ impl Node {
                 if let Some(drops) = self.range_drops() {
                     drops.write_rows(&map, id, db)?;
                 }
-                self.settle(gate, id, db, &map)?
+                self.settle(gate, id, db, &map, epoch)?
             }
-            Err(_) => false,
+            Err(_) => None,
         };
         join();
+        self.serve_gate(id, gate, raised.unwrap_or(epoch));
         drop(_one);
-        if raised {
+        if raised.is_some() {
             self.ask_after_raise();
         }
         // D331 PR 5: a fence it holds as a move's source reports its seqno, and its drops
@@ -273,10 +278,13 @@ impl Node {
         cluster.range_fences.forget_gone(map);
         let mut raised = false;
         for (id, service) in cluster.parts.load().iter() {
-            let (Some((gate, _)), Ok(part)) = (self.fences.gate(id), service.part()) else {
+            let (Some((gate, served)), Ok(part)) = (self.fences.gate(id), service.part()) else {
                 continue;
             };
-            let settled = self.settle(&gate, id, &part.db, map);
+            let settled = self.settle(&gate, id, &part.db, map, served);
+            if let Ok(Some(epoch)) = settled {
+                self.fences.raise_epoch(id, epoch);
+            }
             // D331 PR 5: its fences as a move's source report their seqnos.
             cluster.range_fences.sync(
                 &self.me,
@@ -294,7 +302,7 @@ impl Node {
                 eprintln!("phdb serve: partition {id} couldn't start its range drops: {e}");
             }
             match settled {
-                Ok(up) => raised |= up,
+                Ok(up) => raised |= up.is_some(),
                 Err(e) => eprintln!(
                     "phdb serve: partition {id} couldn't take map version {}'s range moves: \
                      {e}; it gates them from the map meanwhile, and the next map or its next \
@@ -332,17 +340,18 @@ impl Node {
         self.confirm_soon();
     }
 
-    /// Brings partition `id`, served here behind `gate`, up to `map`: puts up a new fence's
-    /// marker, finishes a hand-over of a move from it (the module's doc), and derives its
-    /// range gate. Whether its served epoch rose. Each step is idempotent.
+    /// Brings partition `id`, served here (or about to be) behind `gate` at epoch `served`,
+    /// up to `map`: puts up a new fence's marker, finishes a hand-over of a move from it (the
+    /// module's doc), and derives its range gate. The epoch it's served at from now if that
+    /// rose (the caller raises it in the fences). Each step is idempotent.
     fn settle(
         &self,
         gate: &WriteGate,
         id: &str,
         db: &Pigeonhole,
         map: &ClusterMap,
-    ) -> Result<bool, String> {
-        let served = self.fences.gate(id).map_or(0, |(_, e)| e);
+        served: u64,
+    ) -> Result<Option<u64>, String> {
         let mine = map
             .partitions
             .iter()
@@ -405,7 +414,7 @@ impl Node {
             mine > served || !gate.ranges().has_moved(&m.id)
         }) else {
             gate.ranges().update(map, id, visible);
-            return Ok(false);
+            return Ok(None);
         };
         let raise = mine > served;
         // 1.
@@ -431,14 +440,13 @@ impl Node {
         gate.ranges().update(map, id, db.visible_seqno());
         finished?;
         if raise {
-            self.fences.raise_epoch(id, mine);
             eprintln!(
                 "phdb serve: partition {id} handed table {:?}'s range over (move {:?}): its \
                  epoch is {mine} now, and it asks for its lease at it",
                 m.table, m.id
             );
         }
-        Ok(raise)
+        Ok(raise.then_some(mine))
     }
 }
 
