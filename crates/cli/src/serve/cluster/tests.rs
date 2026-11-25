@@ -1293,7 +1293,8 @@ fn data_node_served(
             .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
         // Without a lease as `run` opens it (D326). A restarted node waits for its peers'
         // grants; a fresh one stands for a node already serving, with a lease for the test.
-        let gate = node.open_gate(p, 1);
+        let gate = node.new_gate(p);
+        node.serve_gate(p, &gate, 1);
         if !restart {
             gate.renew(node.grants.clock().now() + HOUR_NS);
         }

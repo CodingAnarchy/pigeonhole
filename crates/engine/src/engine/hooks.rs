@@ -178,6 +178,10 @@ pub enum Fault {
     /// sends them: a participant's turn between a share's decision and its apply there
     /// (D314's ordering tests).
     HoldDecides = 12,
+    /// Panics the next manifest commit's `begin`, on whichever thread runs it (a shard's
+    /// pump or an application thread), with the writer's exclusion and the writer held
+    /// (#2129).
+    NextManifestBeginPanic = 13,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).

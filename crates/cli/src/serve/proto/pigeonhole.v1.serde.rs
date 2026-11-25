@@ -18615,6 +18615,9 @@ impl serde::Serialize for NodeStatus {
         if self.max_move_followers != 0 {
             len += 1;
         }
+        if self.lease_ms != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.NodeStatus", len)?;
         if !self.node_id.is_empty() {
             struct_ser.serialize_field("node_id", &self.node_id)?;
@@ -18676,6 +18679,11 @@ impl serde::Serialize for NodeStatus {
         if self.max_move_followers != 0 {
             struct_ser.serialize_field("max_move_followers", &self.max_move_followers)?;
         }
+        if self.lease_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("lease_ms", ToString::to_string(&self.lease_ms).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -18713,6 +18721,8 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             "moveRetentionCap",
             "max_move_followers",
             "maxMoveFollowers",
+            "lease_ms",
+            "leaseMs",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -18733,6 +18743,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             MoveRateBytes,
             MoveRetentionCap,
             MaxMoveFollowers,
+            LeaseMs,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18770,6 +18781,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             "moveRateBytes" | "move_rate_bytes" => Ok(GeneratedField::MoveRateBytes),
                             "moveRetentionCap" | "move_retention_cap" => Ok(GeneratedField::MoveRetentionCap),
                             "maxMoveFollowers" | "max_move_followers" => Ok(GeneratedField::MaxMoveFollowers),
+                            "leaseMs" | "lease_ms" => Ok(GeneratedField::LeaseMs),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18805,6 +18817,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                 let mut move_rate_bytes__ = None;
                 let mut move_retention_cap__ = None;
                 let mut max_move_followers__ = None;
+                let mut lease_ms__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::NodeId => {
@@ -18919,6 +18932,14 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::LeaseMs => {
+                            if lease_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leaseMs"));
+                            }
+                            lease_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(NodeStatus {
@@ -18938,6 +18959,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                     move_rate_bytes: move_rate_bytes__.unwrap_or_default(),
                     move_retention_cap: move_retention_cap__.unwrap_or_default(),
                     max_move_followers: max_move_followers__.unwrap_or_default(),
+                    lease_ms: lease_ms__.unwrap_or_default(),
                 })
             }
         }

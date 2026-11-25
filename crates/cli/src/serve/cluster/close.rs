@@ -279,11 +279,22 @@ impl Node {
     /// File `name` of partition `id`, closed here ([`Closed::file`]), and its path: what
     /// `Admin.BackupDownload`'s `fenced_file` streams (D317 ticket 6). The name is one the
     /// close's hash listed, so the path is one of the partition's own files.
+    ///
+    /// Refused while the partition is being reopened. Its close record, and the hashes it
+    /// kept, last until the reopen serves it (#2113), but its engine is open and writing
+    /// before then. The stream reads the file directly, so no writer lock would refuse it
+    /// (perf287 on #2168).
     pub(crate) fn closed_file(
         &self,
         id: &str,
         name: &str,
     ) -> Result<(PathBuf, PartitionFile), ApiError> {
+        if self.fences.is_opening(id) {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {id:?} is being reopened on this node, so its files are changing: \
+                 close it again to copy them"
+            )));
+        }
         let file = self
             .fences
             .closed(id, |closed| closed.file(id, name).cloned())
@@ -569,7 +580,7 @@ mod tests {
         // An open: marked, served (with no lease yet), and the mark lifted.
         n.fences.set_opening("p1", true);
         assert_eq!(state(), Opening);
-        let _gate = n.open_gate("p1", 1);
+        n.serve_gate("p1", &n.new_gate("p1"), 1);
         assert_eq!(state(), Fenced);
         assert!(n.fences.is_opening("p1"), "until the open ends");
         n.fences.set_opening("p1", false);
@@ -588,7 +599,7 @@ mod tests {
         assert_eq!(state(), IsClosed);
         n.fences.set_opening("p1", false);
         assert_eq!(state(), IsClosed);
-        let _gate = n.open_gate("p1", 2);
+        n.serve_gate("p1", &n.new_gate("p1"), 2);
         assert!(n.fences.closed("p1", |_| ()).is_none());
         assert_eq!(n.fences.gate("p1").map(|(_, epoch)| epoch), Some(2));
         // Closed again, then its close forgotten (stamped over, or dropped): nothing.

@@ -256,9 +256,9 @@ pub(crate) fn run(
         .map(|o| -> Result<_, Failure> {
             // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
-            let gate = node.open_gate(&o.id, epoch);
+            let gate = node.new_gate(&o.id);
             // D331: its range gate, before it serves.
-            node.arm_ranges(&gate, &o.id, &o.db, || ())
+            node.arm_ranges(&gate, &o.id, epoch, &o.db, || ())
                 .map_err(|e| Failure::usage(&format!("partition {}: {e}", o.id)))?;
             let config = super::super::service::PartitionConfig {
                 backups: Arc::clone(&backups),
