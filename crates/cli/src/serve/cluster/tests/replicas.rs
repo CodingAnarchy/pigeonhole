@@ -104,8 +104,8 @@ fn bootstraps_in(dir: &Path) -> usize {
         .count()
 }
 
-/// How long a new replica copy may take to reach Following after its bootstrap (#2219's
-/// Windows CI: 5 s wasn't enough on a loaded runner). A dial to a port that isn't listening
+/// How long a replica copy may take to reach Following: after its bootstrap, or after its
+/// owner moved (#2219's and #2209's Windows CI: 5 s wasn't enough on a loaded runner). A dial to a port that isn't listening
 /// yet takes about 2 s on Windows' runners, and a follow that fails pauses before its next
 /// try, doubling up to the follower's MAX_BACKOFF (10 s).
 const FOLLOW: Duration = Duration::from_secs(30);
@@ -514,15 +514,21 @@ fn a_replica_copy_follows_a_moved_owner_without_bootstrapping_again() {
         let after = put_after_move(ports[0], "r", "k2").await;
         // The copy retried its old owner while the partition moved, its pause doubling up
         // to the follower's MAX_BACKOFF (10 s); the map that moved it wakes the copy (D330
-        // amendment 2), so `eventually`'s 5 s, not a wait past that pause (#2015).
-        eventually(
+        // amendment 2, #2015), but its dial of the new owner can still fail and pause again
+        // on a slow runner ([`FOLLOW`], #2209's Windows CI).
+        eventually_why(
+            FOLLOW,
             "a's replica of p3 to follow b past a write there",
             async || {
-                copy_of(ports[0], "p3").await.is_some_and(|lp| {
+                let lp = copy_of(ports[0], "p3").await;
+                if lp.as_ref().is_some_and(|lp| {
                     lp.replica_state() == ReplicaState::Following
                         && lp.replica_of == "b"
                         && lp.replica_applied_seqno >= after
-                })
+                }) {
+                    return Ok(());
+                }
+                Err(format!("past {after}: {}", copy_why(lp.as_ref())))
             },
         )
         .await;
@@ -560,15 +566,21 @@ fn a_replica_copy_bootstraps_again_after_a_relocate_without_copy() {
         let after = put_after_move(ports[0], "r", "k2").await;
         // The copy retried its old owner while the partition moved, its pause doubling up
         // to the follower's MAX_BACKOFF (10 s); the map that moved it wakes the copy (D330
-        // amendment 2), so `eventually`'s 5 s, not a wait past that pause (#2015).
-        eventually(
+        // amendment 2, #2015), but its dial of the new owner can still fail and pause again
+        // on a slow runner ([`FOLLOW`], #2209's Windows CI).
+        eventually_why(
+            FOLLOW,
             "a's replica of p3 to follow b past a write there",
             async || {
-                copy_of(ports[0], "p3").await.is_some_and(|lp| {
+                let lp = copy_of(ports[0], "p3").await;
+                if lp.as_ref().is_some_and(|lp| {
                     lp.replica_state() == ReplicaState::Following
                         && lp.replica_of == "b"
                         && lp.replica_applied_seqno >= after
-                })
+                }) {
+                    return Ok(());
+                }
+                Err(format!("past {after}: {}", copy_why(lp.as_ref())))
             },
         )
         .await;
