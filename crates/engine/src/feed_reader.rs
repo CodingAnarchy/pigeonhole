@@ -2681,7 +2681,24 @@ impl FeedReader {
         }
         // #2190: every stream's external PREPAREs, and every Decision and abort, from its
         // floor: a session that opened with a share in doubt isn't started in (below).
-        let rounds = self.external_rounds(&open, &firsts)?;
+        //
+        // Only once the database has logged an external PREPARE: `incompat` bit 2 is set
+        // before the first and never cleared (ICR 0140), so with it clear there is no share
+        // to find, and every database without spanning transactions skips the read (audit120
+        // on #2193). Read from disk too when the pager's copy lacks it (a reader process's
+        // pager sees it only once it reloads); a failed read scans.
+        let bit = pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE;
+        let externals = self.shared.pager.features().incompat & bit != 0
+            || self
+                .shared
+                .pager
+                .features_on_disk()
+                .map_or(true, |f| f.incompat & bit != 0);
+        let rounds = if externals {
+            self.external_rounds(&open, &firsts)?
+        } else {
+            ExternalRounds::default()
+        };
         'sessions: for (_, session) in sessions {
             let mut first = None::<Seqno>;
             // The smallest seqno the session's first records were allocated in it: a round
