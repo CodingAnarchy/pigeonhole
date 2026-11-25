@@ -163,6 +163,8 @@ A feed that can't continue without a gap fails with `ErrorCode::FeedExpired`, an
 - a power loss took commits a `visible()` feed had delivered;
 - a short window after any metadata commit (such as a flush's, a checkpoint's, a compaction's, a schema change's or a shrink's): a power loss before the feed's record of it is synced. A process crash there no longer expires a feed: the next open finishes the record from the metadata commit itself.
 
+  An externally prepared transaction (a `phdb serve` spanning transaction) still in doubt at such a power loss, or one prepared while the feed was off or didn't feed these tables, is outside the feed's history. Its expiry then comes later, when it commits, and it reaches feeds started after the power loss or the reopen too. It never comes as a skip.
+
 Once a feed has expired, `Feed::oldest_retained` says how far back the history it needed still goes, when that's known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
 
 ## Async

@@ -152,6 +152,12 @@ impl Drops {
                     .iter()
                     .any(|t| t.name == table && map::inside(t, &start, end.as_deref(), partition));
             if finished {
+                // #2153 (audit120's and simp724's P1 on #2214): a target that never took
+                // the move's CLEANING map never raised its floor in the settle; it does
+                // before its progress rows go, and before the gate opens the range (the
+                // settle after this, on this map, opens it).
+                let newest = super::range_follow::newest_ts(db, &id).map_err(|e| e.message)?;
+                super::range_follow::raise_floor(db, newest)?;
                 super::range_follow::prune(db, &id).map_err(|e| e.message)?;
                 continue;
             }
@@ -327,6 +333,14 @@ pub(crate) fn read_pending(db: &Pigeonhole) -> Result<Vec<Pending>, String> {
         });
     }
     Ok(out)
+}
+
+/// Whether a drop row of move `id` itself is here: the drop of an aborted record's copy
+/// under the same id, which a map brought back (#2141). Real records never reuse an id
+/// (`<prefix>-<ms>`, taken at their start), so only a hand-built map does. The follower waits
+/// for it before it reads its progress rows, which that drop deletes with the range.
+pub(crate) fn pending_own(db: &Pigeonhole, id: &str) -> Result<bool, String> {
+    Ok(read_pending(db)?.iter().any(|p| p.id == id))
 }
 
 /// A drop row here overlapping move `m`'s range, other than its own: its follower waits

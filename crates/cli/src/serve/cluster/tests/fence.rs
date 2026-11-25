@@ -2805,10 +2805,19 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
     use crate::serve::proto::FailoverState as S;
     let t = failover_rig_with(true, &["b", "a"]);
     let [a, b, c] = t.ports;
-    super::super::failover::STOP_AFTER_STAMP
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(t.dirs[0].clone());
+    // Held, not one shot (#2184's CI): a's next pass would resume b's stamped promote and
+    // finish it, as D330 does, if it came before b's cut below. a's passes stop after the
+    // stamp until a has given b's promote up (#2209's CI, below).
+    let hold = |on: bool| {
+        let mut held = super::super::failover::HOLD_AFTER_STAMP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|d| *d != t.dirs[0]);
+        if on {
+            held.push(t.dirs[0].clone());
+        }
+    };
+    hold(true);
     let pair = |from: usize, to: u16| (t.dirs[from].clone(), format!("127.0.0.1:{to}"));
     let one_way = [pair(2, a), pair(2, b)];
     super::super::CUT_BETWEEN
@@ -2837,9 +2846,45 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
         epoch
     });
     cut(&t, 1, true);
+    // The hold ends only once a has given b's promote up for one of its own (#2209's CI): a
+    // pass that surveyed b before the cut could still resume b's stamped promote, and
+    // released at once it got past the stamp and finished it on a and c. Passes run one at
+    // a time and a held one ends at the stamp, so the pass that writes a's pending promote
+    // surveyed after the cut, and none that saw b's stamp is left when the hold ends.
     t.rt.block_on(async {
-        // Twice on CI (#2166, #2170) a never failed over within the window: the reason a
-        // gives, and its p3 rows, say which step stalled next time.
+        eventually_why(
+            FAILOVER_WINDOW,
+            "b's promote given up for one to a",
+            async || {
+                let m = map_of(a).await;
+                let of = |to: &str, state: S| {
+                    m.failovers
+                        .iter()
+                        .any(|e| e.partition == "p3" && e.to == to && e.state() == state)
+                };
+                if of("b", S::Abandoned) && of("a", S::Pending) {
+                    return Ok(());
+                }
+                Err(format!(
+                    "map version {} has p3's events {:?}; a's failover_blocked {:?}",
+                    m.map_version,
+                    m.failovers
+                        .iter()
+                        .filter(|e| e.partition == "p3")
+                        .map(|e| (e.to.clone(), e.to_epoch, e.state()))
+                        .collect::<Vec<_>>(),
+                    status_of(a).await.failover_blocked
+                ))
+            },
+        )
+        .await;
+    });
+    hold(false);
+    t.rt.block_on(async {
+        // Three times on CI (#2166, #2170, #2184) a never failed over within the window, and
+        // once (#2209) a finished b's promote instead: a's pass had resumed it before the cut
+        // (now held above until a gives it up). The reason a gives, and its p3 rows, say which
+        // step stalled if it happens again.
         eventually_why(FAILOVER_WINDOW, "p3 to fail over to a", async || {
             let m = map_of(a).await;
             let p3 = m.partitions.iter().find(|p| p.id == "p3");

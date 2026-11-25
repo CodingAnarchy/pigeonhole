@@ -59,6 +59,9 @@ pub enum HookSite {
     /// In the next `shrink` round, after it has read the catalog and before it relocates
     /// anything: where a compaction or `drop_table` can commit under it.
     ShrinkRelocates,
+    /// In the next `shrink` round, right after it decided what pins retired space and read
+    /// its plan: where a test releases a view that pinned that round (#2199).
+    ShrinkPlanned,
     /// On the thread that `Engine::wait_failed` woke with a failure, before it returns:
     /// where the recovery supervisor has not marked the failure yet, and a `close()` can
     /// reach the failed engine first (D265).
@@ -521,6 +524,10 @@ pub struct ManifestInfo {
     /// Whether the last close was clean.
     pub clean: bool,
 }
+
+/// A view [`Engine::hold_view`] holds until it drops (test hook).
+#[derive(Debug)]
+pub struct HeldView(#[allow(dead_code)] Arc<crate::snapshot::View>);
 
 impl Engine {
     /// Runs `f` once, the next time the engine reaches `site` (test hook): see
@@ -1802,6 +1809,14 @@ impl Engine {
     #[doc(hidden)]
     pub fn final_close_pending(&self) -> bool {
         self.inner.shared.close.pending()
+    }
+
+    /// Holds the current view, with no seqno pin, until the guard drops (test hook: a view a
+    /// thread holds for a moment, as a shard's maintenance does, #2199). It keeps what a
+    /// later commit retires from being reclaimed, as any in-process view does.
+    #[doc(hidden)]
+    pub fn hold_view(&self) -> HeldView {
+        HeldView(self.inner.shared.view.load_full())
     }
 
     /// Whether the final close has run (test hook: application-owned shards finish the close

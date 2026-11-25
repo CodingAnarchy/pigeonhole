@@ -496,9 +496,11 @@ impl Node {
     }
 
     /// `Cluster.Fence`: from now, P's writes answer `Fenced`; answers once every write
-    /// admitted before has finished (within [`DRAIN_WAIT`]). Persisted, so it survives a
-    /// restart. Fencing a fenced partition waits again.
+    /// admitted before has finished, and its feed's durable frontier has reached the last of
+    /// them (both within [`DRAIN_WAIT`]). Persisted, so it survives a restart. Fencing a
+    /// fenced partition waits again.
     pub(crate) async fn fence(&self, id: &str) -> Result<(), ApiError> {
+        let deadline = tokio::time::Instant::now() + DRAIN_WAIT;
         let _one = self.fences.changing.lock().await;
         let (gate, _) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
         // The flag first (S4): from here no write is admitted, whatever happens next.
@@ -513,7 +515,38 @@ impl Node {
                 "partition {id:?} is fenced, but {n} write(s) admitted before the fence are \
                  still running: run fence again to wait for them"
             ))
-        })
+        })?;
+        // Then the frontier (feed1248's S1 on #2184): a fed `Buffered` or `None` commit
+        // answered before the fence passes the durable frontier, which the feed reports and a
+        // promote counts the loss from, only once the shard's background sync covers it
+        // (*T_sync*). Nothing commits now, so once the frontier reaches the visible seqno it
+        // is final. A flush wouldn't hasten it: the hold goes at the sync's timer either way.
+        let Some(db) = self
+            .server
+            .get()
+            .and_then(|s| s.shared.upgrade())
+            .and_then(|shared| shared.router.partition(id).ok())
+            .map(|part| part.db.clone())
+        else {
+            return Ok(());
+        };
+        // Read once (feed1248's point 1): a commit that doesn't pass the write gate (a D329
+        // decide, a D331 range copy's batch) can still raise it, and the wait mustn't chase
+        // those. They're replicated, so the frontier covers them too, but a fence vouches
+        // only for what committed before it answered.
+        let last = db.visible_seqno();
+        while db.replication_frontier() < last {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ApiError::deadline(format!(
+                    "partition {id:?} is fenced, but its feed's durable frontier is at {} of \
+                     {last}: its background sync hasn't covered its last writes yet; run \
+                     fence again to wait for it",
+                    db.replication_frontier()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     /// `Cluster.Unfence`: lifts the operator's fence, so P takes writes again once it also
@@ -1098,7 +1131,10 @@ impl Node {
     pub(crate) fn apply_leases(&self, round: &Round) {
         let end = super::lease::holder_end(round.t0, self.grants.lease());
         let st = self.state();
-        if st.version() != round.map.map_version {
+        // The round's map by `(writer_term, map_version)`, not the version alone (#2159 item
+        // 4): a deposed writer's map and the elected writer's can share a version.
+        let same = |m: &ClusterMap| (m.writer_term, m.map_version);
+        if st.map.as_ref().map(|(m, _)| same(m)) != Some(same(&round.map)) {
             return;
         }
         self.fences.for_served(|id, s| {

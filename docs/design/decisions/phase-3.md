@@ -5108,9 +5108,10 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 ## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
 
 **Decided:**
-- **The SST writer** calls `File::start_writeback` (ICR 0145) for each 1 MiB chunk right after writing it. On Linux that's `sync_file_range(SYNC_FILE_RANGE_WRITE)`; macOS, Windows, the simulator and direct-I/O handles do nothing.
+- **The SST writer** calls `File::start_writeback` (ICR 0145) for each 256 KiB chunk right after writing it (1 MiB as first decided; the amendment below). On Linux that's `sync_file_range(SYNC_FILE_RANGE_WRITE)`; macOS, Windows, the simulator and direct-I/O handles do nothing.
+- **The blob writer** does the same for its per-value writes, a hint per 256 KiB written, adjacent extents in one range (#2023, #2028).
 - **Durability is unchanged:** the pager's root commit still syncs the data file before its superblock. The sync now finds the output mostly written back.
-- **No option.** There's a follow-up for the blob writer's per-value writes.
+- **No option.**
 
 **Why (#1991, g130–g143 on the AX102):**
 - **The stall:** in g69's sustained GroupSync session at 55K puts/s, put p99.9 climbed through the session to 30–50 ms. The cause was a WAL group sync's small write waiting about 12 ms inside the NVMe drive, behind a burst of the data file's 128 KiB writes. SST output was written buffered and sent to the device all at once by the root commit's `sync_data` of the whole data file.

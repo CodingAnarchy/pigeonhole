@@ -115,7 +115,8 @@ pub struct EngineMetrics {
     pub file_punch_passes: u64,
     /// Punches that failed. A filesystem that cannot punch fails once, and punching stops
     /// until the next open; one that keeps failing otherwise retries as free space grows,
-    /// or every 10 s. Many of these point at the filesystem, not the database.
+    /// or at the first manifest commit (a flush, compaction or catalog change, say) 10 s
+    /// after a failure. Many of these point at the filesystem, not the database.
     pub file_punch_refusals: u64,
     /// File reads made synchronously inside async reads: a separated value too large to
     /// cache, a block the cache could not keep, or a read that missed too often. 0 when

@@ -2602,7 +2602,12 @@ impl FeedReader {
     ///   most the allocator's start then. Every id in the session's records was allocated
     ///   in it, above that start: replay applies a round only whole and writes nothing, and
     ///   nothing re-logs a record. So `K` is at least the start (the rule `start_at` keeps
-    ///   for the writer's history).
+    ///   for the writer's history). One exception: an external share still in doubt when
+    ///   the session opened (D329) is before its first segment, and its key, its Decision's
+    ///   apply seqno, is allocated later. A start in that session passes over the share,
+    ///   so its Decision there is a gap, or, from a later session, a round dropped. That
+    ///   needs the share's own session not to qualify (unfed, or partly recycled) while the
+    ///   share's segment is kept; `start_at`'s history starts before it (#2189).
     /// - **It skips none of the session's commits.** A single's seqno is allocated in the
     ///   group that logs it, after that stream's first record. A cross-shard commit is keyed
     ///   by its apply seqno, reserved once every participant logged its PREPARE: after each

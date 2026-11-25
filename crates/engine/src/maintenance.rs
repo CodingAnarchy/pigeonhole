@@ -629,6 +629,11 @@ enum Moved {
 /// holds nothing live (everything there was deleted and compacted away) shrinks without
 /// moving anything. An extent with no free extent of its class below it is skipped, not an
 /// error (the file then ends after it), and the extents past it still move.
+///
+/// A round whose only pin is in-process views older than the current manifest (a thread
+/// that held a view for a moment around this call's own commit, #2199) doesn't end the
+/// call: where the loop would stop, a reclaim that frees retired space now gives it up to
+/// [`EXTRA_ROUNDS`] more rounds, so the manifest the pin kept in place still moves.
 pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     let start = shared.pager.stats().file_bytes;
     let shrunk = || start.saturating_sub(shared.pager.stats().file_bytes);
@@ -641,7 +646,24 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     // A rewrite that could not grow the file found no free space below the manifest's
     // extents: ask for none again while rounds stay pinned.
     let mut manifest_stays = false;
-    for _round in 0..8 {
+    // Rounds added because only a passing view pinned one (#2199).
+    let mut extra = 0;
+    // Where the loop would stop: whether a round pinned only by in-process views gets
+    // another, because what they kept retired at its check (`retired_at`) is free now. The
+    // last view of a version reclaims as it goes (`LiveViews::on_oldest_released`), so the
+    // space may be free before this reclaim: compare with the check, not with this.
+    let again = |by_views: bool, retired_at: u64, extra: &mut u32| -> bool {
+        if !by_views || *extra >= EXTRA_ROUNDS {
+            return false;
+        }
+        shared.reclaim();
+        let freed = shared.pager.stats().retired_bytes < retired_at;
+        *extra += u32::from(freed);
+        freed
+    };
+    let mut round_no = 0;
+    while round_no < ROUNDS + extra {
+        round_no += 1;
         if shared.closing.load(Ordering::Acquire) {
             // The close waits for this call: stop between rounds.
             return Ok(shrunk());
@@ -661,19 +683,38 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         // reader process's slot, will once this round retires more. Its commit must not
         // grow the file then: the space would stay past the end, and the next round would
         // plan to move the manifest out of it again (#1098).
-        let pinned = shared.pager.stats().retired_bytes > 0
-            || !shared.live_seqnos.list().is_empty()
-            || shared.shm.oldest_reader_pin().is_some();
+        let retired_at = shared.pager.stats().retired_bytes;
+        let retired = retired_at > 0;
+        let others =
+            !shared.live_seqnos.list().is_empty() || shared.shm.oldest_reader_pin().is_some();
+        let pinned = retired || others;
+        // Only views older than the current manifest pin it: a heuristic for a view held for a
+        // moment around a commit (#2199), not a guard. A long-lived iterator's view looks the
+        // same, and costs at most `EXTRA_ROUNDS` rounds that free something each.
+        let by_views = retired
+            && !others
+            && shared
+                .live_views
+                .oldest()
+                .is_some_and(|v| v < shared.view.load().manifest_version);
         // An unpinned round may grow the file, so a pin that held the manifest in place in
         // an earlier round (a view dropped since, #1107) no longer keeps it there.
         manifest_stays &= pinned;
         let plan = shared.pager.shrink_plan();
+        #[cfg(feature = "test-hooks")]
+        shared
+            .hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::ShrinkPlanned);
         if held.as_ref().is_some_and(|h| !plan.contains(&h.big)) {
             // Moved or replaced otherwise: the region is not needed.
             held = None;
             wasted = true;
         }
         if plan.is_empty() {
+            if again(by_views, retired_at, &mut extra) {
+                continue;
+            }
             break;
         }
         let view = shared.view.load_full();
@@ -695,6 +736,9 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         if round.is_empty() {
             unclaim(shared, &round.claimed);
             if round.stale {
+                continue;
+            }
+            if again(by_views, retired_at, &mut extra) {
                 continue;
             }
             break;
@@ -720,6 +764,13 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     }
     Ok(shrunk())
 }
+
+/// Rounds [`shrink`] runs at most, before any [`EXTRA_ROUNDS`].
+const ROUNDS: u32 = 8;
+
+/// Rounds [`shrink`] adds at most where a round was pinned only by in-process views older
+/// than the current manifest and a reclaim then freed retired space (#2199).
+const EXTRA_ROUNDS: u32 = 4;
 
 /// One round of [`shrink`]: the catalog it plans against, and the moves it has made.
 struct Round<'a> {

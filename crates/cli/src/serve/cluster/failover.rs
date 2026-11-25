@@ -47,6 +47,13 @@ const STEP_WAIT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(crate) static STOP_AFTER_STAMP: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
+/// A test's hold seam: every failover by a node in each listed cluster directory stops after
+/// its stamp, before its map, for as long as the directory is listed. A rerun that resumes
+/// a stamped promote stops there too, so the test decides when the promote may go on
+/// (#2184's CI: with [`STOP_AFTER_STAMP`], the next pass could finish it first).
+#[cfg(test)]
+pub(crate) static HOLD_AFTER_STAMP: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
 /// The writer's failover state.
 #[derive(Debug, Default)]
 pub(crate) struct Failovers {
@@ -406,12 +413,22 @@ pub(crate) fn qualify(
         })
         .max_by_key(|e| e.to_epoch)
     {
-        let stamped = statuses.get(&e.to).is_some_and(|st| {
+        // Its copy, closed (out of the replicas since the pending map), at the promote's
+        // epoch if stamped, or still at its bootstrap epoch inside P's history if the
+        // promote stopped before its stamp or between the copy's promote and its identity
+        // (#2156). Both are finished from here: the stamp writes only what's left.
+        // The range can also match an old owner's closed file of the same history on that
+        // node: the stamp's exact match on the promote's intent is what admits a file, so
+        // that one is refused, the promote stays pending, and abandon handles it (simp724).
+        let resumable = statuses.get(&e.to).is_some_and(|st| {
             st.partitions.iter().any(|lp| {
-                lp.id == p.id && lp.role() != PartitionRole::Replica && lp.epoch == e.to_epoch
+                lp.id == p.id
+                    && lp.role() != PartitionRole::Replica
+                    && (lp.epoch == e.to_epoch
+                        || (p.history_epoch <= lp.epoch && lp.epoch <= p.epoch))
             })
         });
-        if stamped {
+        if resumable {
             return Ok(e.to.clone());
         }
     }
@@ -1056,6 +1073,13 @@ impl Promoter for NodeOps {
                 return Err(Failure::usage(
                     "the test's fault after the failover's stamp",
                 ));
+            }
+            drop(armed);
+            let held = HOLD_AFTER_STAMP
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if held.iter().any(|d| Some(d) == dir.as_ref()) {
+                return Err(Failure::usage("the test's hold after the failover's stamp"));
             }
         }
         Ok(())
