@@ -121,6 +121,27 @@ pub(crate) fn alpha(interval: Duration, window: Duration) -> f64 {
     1.0 - (-(interval.as_secs_f64() / window.as_secs_f64().max(1e-9))).exp()
 }
 
+/// A measurement seam (tests): every partition of the node in each listed cluster directory
+/// reports this load in `Status` (cpu, device and their larger), in place of its measured
+/// one. A balancer test that isn't about load pins it, so its decisions don't hang on how
+/// busy the runner is: on a slow one, a lone partition's steady I/O measured "too hot"
+/// against its node's own peak, and never cold enough to merge (#2164's Windows red). An
+/// entry of `None` keeps the measured load: a test that covers the measured path says so.
+#[cfg(test)]
+pub(crate) static LOAD_FOR: std::sync::Mutex<Vec<(std::path::PathBuf, Option<f64>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The load [`LOAD_FOR`] pins for the node in `dir`, if any.
+#[cfg(test)]
+pub(crate) fn load_for(dir: &std::path::Path) -> Option<f64> {
+    LOAD_FOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(d, _)| d == dir)
+        .and_then(|(_, l)| *l)
+}
+
 /// The number of cores the loads' CPU share is over: read once per process.
 fn cores() -> usize {
     static CORES: OnceLock<usize> = OnceLock::new();

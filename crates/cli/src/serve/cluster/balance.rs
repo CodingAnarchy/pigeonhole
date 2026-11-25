@@ -99,8 +99,13 @@ pub(crate) struct NodeView {
     pub(crate) id: String,
     /// `Node.weight` (0 counts as 1).
     pub(crate) weight: f64,
-    /// It answered this pass, with numbers no older than a window.
+    /// It answered this pass, with numbers no older than a window, for every partition the
+    /// map places on it.
     pub(crate) fresh: bool,
+    /// Why a node that answered isn't fresh (#2158): a partition the map places on it that
+    /// it gave no numbers for (closed, opening, or not open). Its sums would leave that
+    /// partition out, and make the node look lighter and colder than it is.
+    pub(crate) incomplete: Option<String>,
 }
 
 /// One tablet of a table in a partition (ICR 0142's `tablets()`), with its sampled load.
@@ -258,6 +263,13 @@ impl Counters {
 
     fn resting(&self, key: &str, now: u64) -> bool {
         self.rest.get(key).is_some_and(|&t| now < t)
+    }
+
+    /// The whole seconds `key` still rests at `now`, rounded up (#2158's skip reasons).
+    fn rest_left_s(&self, key: &str, now: u64) -> u64 {
+        self.rest
+            .get(key)
+            .map_or(0, |&t| t.saturating_sub(now).div_ceil(1000))
     }
 
     /// Advances `key`'s streak if `held`, else resets it; whether it reached `passes`.
@@ -546,8 +558,14 @@ pub(crate) fn decide(
             counters.streak.remove(&format!("merge:{}", p.id));
         }
     }
+    // A node that answered without numbers for one of its partitions (#2158), named when
+    // nothing else is.
+    let incomplete = nodes.iter().find_map(|n| n.incomplete.clone());
     if fresh.len() < 2 {
-        return Decision::Skip("fewer than two nodes answered this pass".into());
+        return Decision::Skip(match incomplete {
+            Some(why) => format!("fewer than two nodes have complete numbers this pass: {why}"),
+            None => "fewer than two nodes answered this pass".into(),
+        });
     }
     let is_fresh = |id: &str| fresh.iter().any(|n| n.id == id);
     // Auto-pins that expired come first: they're bookkeeping, not a move.
@@ -590,10 +608,28 @@ pub(crate) fn decide(
         let key = format!("split:{}", p.id);
         let too_big = p.bytes > b.partition_max_bytes;
         let too_hot = p.load > b.partition_max_load;
+        let what = if too_big { "big" } else { "hot" };
         if !counters.hold(&key, too_big || too_hot, b.passes) {
+            if too_big || too_hot {
+                skip.get_or_insert_with(|| {
+                    format!(
+                        "{} is too {what}: {} of {} passes so far",
+                        p.id,
+                        counters.streak_of(&key),
+                        b.passes.max(1)
+                    )
+                });
+            }
             continue;
         }
         if counters.resting(&p.id, now) {
+            skip.get_or_insert_with(|| {
+                format!(
+                    "{} is too {what}, but rests {} s more",
+                    p.id,
+                    counters.rest_left_s(&p.id, now)
+                )
+            });
             continue;
         }
         if bounces(p, now, b) >= b.max_moves {
@@ -680,6 +716,14 @@ pub(crate) fn decide(
         };
         let acting = counters.acting_on.as_deref() == Some(n.id.as_str());
         let over = lr > b.load_ratio || sr > b.size_ratio;
+        let by_load = lr - b.load_ratio >= sr - b.size_ratio;
+        let at = || {
+            format!(
+                "{:.2}x the mean {}",
+                if by_load { lr } else { sr },
+                if by_load { "load" } else { "size" }
+            )
+        };
         let above_line = lr > line(b.load_ratio) || sr > line(b.size_ratio);
         let key = format!("move:{}", n.id);
         let ready = if acting && above_line {
@@ -691,10 +735,31 @@ pub(crate) fn decide(
             }
             counters.hold(&key, over, b.passes)
         };
-        if !ready || counters.resting(&n.id, now) {
+        if !ready {
+            if over {
+                skip.get_or_insert_with(|| {
+                    format!(
+                        "node {} is over its bound ({}): {} of {} passes so far",
+                        n.id,
+                        at(),
+                        counters.streak_of(&key),
+                        b.passes.max(1)
+                    )
+                });
+            }
             continue;
         }
-        let by_load = lr - b.load_ratio >= sr - b.size_ratio;
+        if counters.resting(&n.id, now) {
+            skip.get_or_insert_with(|| {
+                format!(
+                    "node {} is over its bound ({}), but rests {} s more",
+                    n.id,
+                    at(),
+                    counters.rest_left_s(&n.id, now)
+                )
+            });
+            continue;
+        }
         let mut best: Option<(&PartView, String, f64)> = None;
         for p in parts
             .iter()
@@ -715,30 +780,38 @@ pub(crate) fn decide(
             if move_rate > 0 && p.bytes / move_rate > b.dwell_ms / 1000 {
                 continue;
             }
-            let Some(to) = coldest(counters, by_load, &n.id, &p.replicas) else {
-                continue;
-            };
-            let Some((_, tl, ts)) = stats.iter().find(|s| s.0.id == to) else {
-                continue;
-            };
-            let tw = stats
-                .iter()
-                .find(|s| s.0.id == to)
-                .map_or(1.0, |s| if s.0.weight > 0.0 { s.0.weight } else { 1.0 });
+            // The target: the coldest by the measure that the move keeps within its bound
+            // on both measures (#2158). Else a load move could take it over on size, or the
+            // reverse, and once the dwell ended a move would take the partition back.
             let nw = if n.weight > 0.0 { n.weight } else { 1.0 };
-            let (from_after, to_after, mean) = if by_load {
-                (load - p.load / nw, tl + p.load / tw, mean_load)
-            } else {
-                (
-                    size - p.bytes as f64 / nw,
-                    ts + p.bytes as f64 / tw,
-                    mean_size,
-                )
-            };
-            let bound = if by_load { b.load_ratio } else { b.size_ratio };
-            if mean > 0.0 && to_after / mean > bound {
+            let within = |after: f64, mean: f64, bound: f64| mean <= 0.0 || after / mean <= bound;
+            let mut targets: Vec<&(&NodeView, f64, f64)> = stats
+                .iter()
+                .filter(|(t, _, _)| {
+                    t.id != n.id && !p.replicas.contains(&t.id) && !counters.resting(&t.id, now)
+                })
+                .collect();
+            targets.sort_by(|a, b| {
+                if by_load {
+                    a.1.total_cmp(&b.1)
+                } else {
+                    a.2.total_cmp(&b.2)
+                }
+            });
+            let Some((to, to_load, to_size)) = targets.into_iter().find_map(|(t, tl, ts)| {
+                let tw = if t.weight > 0.0 { t.weight } else { 1.0 };
+                let (load_after, size_after) = (tl + p.load / tw, ts + p.bytes as f64 / tw);
+                (within(load_after, mean_load, b.load_ratio)
+                    && within(size_after, mean_size, b.size_ratio))
+                .then(|| (t.id.clone(), load_after, size_after))
+            }) else {
                 continue;
-            }
+            };
+            let (from_after, to_after, mean) = if by_load {
+                (load - p.load / nw, to_load, mean_load)
+            } else {
+                (size - p.bytes as f64 / nw, to_size, mean_size)
+            };
             let distance = (from_after - mean).abs() + (to_after - mean).abs();
             let better = best.as_ref().is_none_or(|(q, _, d)| {
                 distance < *d - 1e-12 || ((distance - *d).abs() <= 1e-12 && p.bytes < q.bytes)
@@ -754,12 +827,7 @@ pub(crate) fn decide(
                     from: n.id.clone(),
                     to,
                 },
-                format!(
-                    "node {} is at {:.2}x the mean {}",
-                    n.id,
-                    if by_load { lr } else { sr },
-                    if by_load { "load" } else { "size" }
-                ),
+                format!("node {} is at {}", n.id, at()),
             );
         }
         skip.get_or_insert_with(|| {
@@ -819,7 +887,10 @@ pub(crate) fn decide(
             );
         }
     }
-    Decision::Skip(skip.unwrap_or_else(|| "within bounds".into()))
+    Decision::Skip(
+        skip.or(incomplete)
+            .unwrap_or_else(|| "within bounds".into()),
+    )
 }
 
 #[cfg(test)]
@@ -833,6 +904,7 @@ mod tests {
             id: id.into(),
             weight: 1.0,
             fresh: true,
+            incomplete: None,
         }
     }
 
@@ -888,7 +960,9 @@ mod tests {
         let nodes = [node("a"), node("b"), node("c")];
         let parts = [
             part("p1", "a", 0.3, 1 << 30),
-            part("p2", "a", 0.2, 2 << 30),
+            // Small, so b stays within its size bound too (#2158: at 2 GiB, b would be at
+            // 1.8x the mean size, and the move is refused).
+            part("p2", "a", 0.2, 1 << 28),
             part("p3", "b", 0.05, 1 << 30),
             part("p4", "c", 0.1, 1 << 30),
         ];
@@ -1627,6 +1701,160 @@ mod tests {
         assert!(
             matches!(&d, Decision::Act(Action::Split { key, .. }, _) if key == b"m" || key == b"t"),
             "{d:?}"
+        );
+    }
+
+    /// #2158 item 2: a load move's target stays within its size bound too. By load, b is the
+    /// coldest node, but p1's bytes would take b over its size bound: the move goes to c,
+    /// within both, where it went to b before.
+    #[test]
+    fn a_load_move_never_takes_its_target_over_its_size_bound() {
+        const G: u64 = 1 << 30;
+        let nodes = [node("a"), node("b"), node("c"), node("d")];
+        let parts = [
+            part("p1", "a", 0.05, 4 * G / 10),
+            part("p2", "a", 0.55, G / 10),
+            part("pb", "b", 0.0, 3 * G / 2),
+            part("pc", "c", 0.2, G / 2),
+            part("pd", "d", 0.2, G / 2),
+        ];
+        let b = Bounds {
+            partition_max_load: 1.0,
+            passes: 1,
+            ..bounds()
+        };
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 1);
+        assert!(
+            matches!(&d, Decision::Act(Action::Move { partition, to, .. }, _)
+                if partition == "p1" && to == "c"),
+            "{d:?}"
+        );
+    }
+
+    /// #2158 item 2, the reverse: a size move's target stays within its load bound. No node
+    /// would, so nothing moves, and the pass says why.
+    #[test]
+    fn a_size_move_never_takes_its_target_over_its_load_bound() {
+        const G: u64 = 1 << 30;
+        let nodes = [node("a"), node("b"), node("c")];
+        // a is over on size; b and c are small, but p1 alone would take either over on load.
+        let parts = [
+            part("p1", "a", 0.3, G),
+            part("p2", "a", 0.0, 2 * G),
+            part("pb", "b", 0.15, G / 2),
+            part("pc", "c", 0.15, G / 2),
+        ];
+        let b = Bounds {
+            partition_max_load: 1.0,
+            passes: 1,
+            ..bounds()
+        };
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 1);
+        assert_eq!(
+            d,
+            Decision::Skip(
+                "node a is over its bound, but no partition on it can move within the bounds"
+                    .into()
+            )
+        );
+    }
+
+    /// #2158 item 3: a node over its bound that is still counting its passes, then resting,
+    /// says so, not "within bounds".
+    #[test]
+    fn a_node_over_its_bound_but_counting_or_resting_says_so() {
+        const G: u64 = 1 << 30;
+        let nodes = [node("a"), node("b"), node("c")];
+        let parts = [
+            part("p1", "a", 0.0, 3 * G),
+            part("p2", "b", 0.0, G),
+            part("p3", "c", 0.0, G),
+        ];
+        let b = Bounds {
+            passes: 3,
+            ..bounds()
+        };
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 2);
+        assert_eq!(
+            d,
+            Decision::Skip(
+                "node a is over its bound (1.80x the mean size): 2 of 3 passes so far".into()
+            )
+        );
+        c.rest.insert("a".into(), t + 30 * 1000 + 90 * 1000);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 1);
+        assert_eq!(
+            d,
+            Decision::Skip(
+                "node a is over its bound (1.80x the mean size), but rests 90 s more".into()
+            )
+        );
+    }
+
+    /// #2158 item 3: a split candidate counting its passes, then resting, says so.
+    #[test]
+    fn a_split_candidate_counting_or_resting_says_so() {
+        let nodes = [node("a"), node("b")];
+        let parts = [part("p1", "a", 0.0, 2 << 20), part("p2", "b", 0.0, 2 << 20)];
+        let b = Bounds {
+            partition_max_bytes: 3 << 20,
+            size_ratio: 10.0,
+            passes: 3,
+            ..bounds()
+        };
+        let mut big = parts.clone();
+        big[0].bytes = 4 << 20;
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &big, &b, &mut c, &mut t, 1);
+        assert_eq!(
+            d,
+            Decision::Skip("p1 is too big: 1 of 3 passes so far".into())
+        );
+        c.rest.insert("p1".into(), t + 30 * 1000 + 61 * 1000);
+        let d = run(&nodes, &big, &b, &mut c, &mut t, 2);
+        assert_eq!(
+            d,
+            Decision::Skip("p1 is too big, but rests 31 s more".into())
+        );
+    }
+
+    /// #2158 item 1: a node that answered without numbers for one of its partitions is
+    /// neither source nor target, and the pass names it when nothing else is.
+    #[test]
+    fn a_node_with_a_partition_it_gave_no_numbers_for_is_left_out_and_named() {
+        let why = "node a's numbers are incomplete: partition p1 is closed there".to_owned();
+        let mut a = node("a");
+        a.fresh = false;
+        a.incomplete = Some(why.clone());
+        let parts = [
+            part("p1", "a", 0.0, 0),
+            part("p2", "b", 0.2, 1 << 30),
+            part("p3", "c", 0.2, 1 << 30),
+        ];
+        let b = Bounds {
+            passes: 1,
+            ..bounds()
+        };
+        let (mut c, mut t) = (Counters::default(), 0);
+        // Fresh, a would be a's p1's lighter node, and b's and c's target.
+        let d = run(
+            &[a.clone(), node("b"), node("c")],
+            &parts,
+            &b,
+            &mut c,
+            &mut t,
+            1,
+        );
+        assert_eq!(d, Decision::Skip(why.clone()));
+        let d = run(&[a, node("b")], &parts, &b, &mut c, &mut t, 1);
+        assert_eq!(
+            d,
+            Decision::Skip(format!(
+                "fewer than two nodes have complete numbers this pass: {why}"
+            ))
         );
     }
 }

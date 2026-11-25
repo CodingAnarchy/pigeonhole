@@ -1331,19 +1331,29 @@ impl Replica {
         self.set_state(State::Following);
         let mut run = Run::default();
         let mut peeked = None;
+        // When a read last had to wait: the queue was empty then, so a message read without
+        // waiting was made after the one read then. It's stamped with that time, not when
+        // the loop got to it after an apply or a stall (#2162 item 1: a stall of D made a
+        // copy look D fresher than it was).
+        let mut waited_at = Instant::now();
         loop {
-            let next = match peeked.take() {
-                Some(m) => m,
-                None => tokio::select! {
-                    m = stream.message() => m,
-                    _ = stop.changed() => {
-                        // Promote or shutdown: what arrived is applied first.
-                        return match self.apply_run(&db, &mut run).await {
-                            Ok(()) => Halt::Stopped,
-                            Err(halt) => halt,
-                        };
-                    }
-                },
+            let queued = peeked.take().or_else(|| ready(&mut stream));
+            let (next, at) = match queued {
+                Some(m) => (m, waited_at),
+                None => {
+                    let m = tokio::select! {
+                        m = stream.message() => m,
+                        _ = stop.changed() => {
+                            // Promote or shutdown: what arrived is applied first.
+                            return match self.apply_run(&db, &mut run).await {
+                                Ok(()) => Halt::Stopped,
+                                Err(halt) => halt,
+                            };
+                        }
+                    };
+                    waited_at = Instant::now();
+                    (m, waited_at)
+                }
             };
             let batch = match next {
                 Ok(Some(b)) => b,
@@ -1355,7 +1365,7 @@ impl Replica {
             {
                 let mut s = self.status();
                 s.primary_seqno = s.primary_seqno.max(batch.primary_seqno);
-                s.heard(batch.primary_seqno, Instant::now());
+                s.heard(batch.primary_seqno, at);
             }
             let quiet = batch.events.is_empty();
             for bytes in &batch.events {

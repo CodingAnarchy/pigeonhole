@@ -7,18 +7,30 @@
 //! ([`Pager::punch_free`](pigeonhole_pager::Pager::punch_free)), the largest past the
 //! reserve first. A pass stops when nothing is left, or after [`PunchTuning::pass_bytes`];
 //! one stopped there starts the next at once if the gate still passes, so an idle database
-//! keeps punching until it is done (g152 row 2), and sleeps between blocks to stay under [`PunchTuning::bytes_per_sec`] (on a real clock;
-//! a simulated one punches without pacing).
+//! keeps punching until it is done (g152 row 2), and sleeps between blocks to stay under
+//! [`PunchTuning::bytes_per_sec`] (on a real clock; a simulated one punches without
+//! pacing).
 //!
 //! Only free space is punched: what no recoverable root and no live view names, which
 //! the allocator would overwrite anyway. A filesystem that cannot punch (`Unsupported`)
 //! stops punching until the next open; any other error ends the pass and counts as a
 //! refusal, and the next pass waits for a trigger's worth of new free space, as after an
-//! empty one (simp724's S1 on #2034). A poisoned pager (a failed root commit) punches
-//! nothing: the failed root may be the one recovery opens (simp724's M1).
+//! empty one (simp724's S1 on #2034), or starts at the first manifest commit (a flush, a
+//! compaction or a catalog change, say) 10 s after the refusal, whichever comes first
+//! (#2181).
+//! A poisoned pager (a failed root commit) punches nothing: the failed root may be the one
+//! recovery opens (simp724's M1).
+//!
+//! No pass starts or punches once the close began (`Shared::closing`), and none punches
+//! after the close released the file's locks: another writer may then have the file, and
+//! its allocator knows nothing of a block a pass took. A slice holds [`Punch`]'s `stopped`
+//! lock across its last check and the punch, and `Shared::release_after_io` sets `stopped`
+//! under that lock before it drops the locks, so it waits for a punch in flight (#2181:
+//! in application-owned mode a shard that reported its part of the close is still driven,
+//! and the last shard's release runs on another thread).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_io::ErrorKind;
 use pigeonhole_runtime::{Task, TaskPoll, TaskWaker};
@@ -26,6 +38,13 @@ use pigeonhole_runtime::{Task, TaskPoll, TaskWaker};
 use crate::shard::Shared;
 
 const MIB: u64 = 1 << 20;
+
+/// How long after a refused punch the gate stops waiting for new free space and punches
+/// what is there again (#2181): a transient error doesn't park punching, and one that
+/// persists fails at most once per this, not once per manifest commit (simp724's S1). The
+/// gate is checked at a manifest commit's reclaim, so the retry comes at the first one
+/// after this, not on a timer.
+const RETRY_AFTER_NANOS: u64 = 10_000_000_000;
 
 /// How a punch pass runs (D333's defaults; tests override them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +93,17 @@ pub(crate) struct Punch {
     /// free space can move from inside the reserve to past it (allocations take low space
     /// while reclaims free high space) without the unpunched total growing.
     idle_at: AtomicU64,
+    /// After a refused punch: when (monotonic nanoseconds) the gate drops `idle_at` and
+    /// punches what is there again; 0 when no refusal waits (#2181).
+    retry_at: AtomicU64,
     /// When the next block may be punched (monotonic nanoseconds), carried from one pass to
     /// the next so chained passes keep `bytes_per_sec` (simp724's N2 on #2034). One pass at
     /// a time writes it.
     next_at: AtomicU64,
+    /// Set once the close is about to release the file's locks (`Punch::stop`); a slice
+    /// holds it across its last check and its punch, so no punch lands after the release
+    /// (#2181).
+    stopped: Mutex<bool>,
     /// Passes started.
     pub passes: AtomicU64,
     /// Punches that failed, the `Unsupported` one included.
@@ -94,7 +120,9 @@ impl Punch {
             running: AtomicBool::new(false),
             unsupported: AtomicBool::new(false),
             idle_at: AtomicU64::new(0),
+            retry_at: AtomicU64::new(0),
             next_at: AtomicU64::new(0),
+            stopped: Mutex::new(false),
             passes: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
         }
@@ -115,10 +143,12 @@ impl Punch {
         if self.unsupported.load(Ordering::Relaxed)
             || self.running.load(Ordering::Relaxed)
             || shared.pager_poisoned.load(Ordering::Acquire)
+            || shared.closing.load(Ordering::Acquire)
             || shared.closed.load(Ordering::Acquire)
         {
             return false;
         }
+        self.retry_if_due(shared.clock_vfs.monotonic_nanos());
         let s = shared.pager.stats();
         if !self.gate(unpunched_free(&s), s.file_bytes) {
             return false;
@@ -129,12 +159,32 @@ impl Punch {
     }
 
     /// Whether `free` unpunched bytes in a file of `file_bytes` call for a pass: a trigger's
-    /// worth past the reserve, and past the last empty pass's mark.
+    /// worth past the reserve, and a trigger's worth of new free space since the last empty
+    /// or refused pass. The mark follows free space down (#2181): space the workload reuses
+    /// after such a pass doesn't have to be freed again before the gate counts new space.
     fn gate(&self, free: u64, file_bytes: u64) -> bool {
-        let floor = self
-            .reserve(file_bytes)
-            .max(self.idle_at.load(Ordering::Relaxed));
+        let idle = self.idle_at.fetch_min(free, Ordering::Relaxed).min(free);
+        let floor = self.reserve(file_bytes).max(idle);
         free >= floor.saturating_add(self.tuning.trigger_bytes)
+    }
+
+    /// A refused punch's wait is over at `now`: the gate punches what is there again.
+    fn retry_if_due(&self, now: u64) {
+        let at = self.retry_at.load(Ordering::Relaxed);
+        if at != 0 && now >= at {
+            self.retry_at.store(0, Ordering::Relaxed);
+            self.idle_at.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A punch was refused at `now` with `free` unpunched bytes left: the gate waits for new
+    /// free space, as after an empty pass, or until [`RETRY_AFTER_NANOS`] pass.
+    fn refused(&self, now: u64, free: u64) {
+        self.ended(0, free);
+        self.retry_at.store(
+            now.saturating_add(RETRY_AFTER_NANOS).max(1),
+            Ordering::Relaxed,
+        );
     }
 
     /// A pass found nothing more to punch, having punched `punched` bytes, with `free`
@@ -142,6 +192,12 @@ impl Punch {
     fn ended(&self, punched: u64, free: u64) {
         let idle = if punched == 0 { free } else { 0 };
         self.idle_at.store(idle, Ordering::Relaxed);
+    }
+
+    /// No punch from now on, for good: called before the close releases the file's locks
+    /// (`Shared::release_after_io`). Waits for a punch in flight, at most one block's.
+    pub(crate) fn stop(&self) {
+        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
     }
 
     /// The pass ended (or never started): the next trigger may start another.
@@ -198,7 +254,8 @@ impl Task for PunchPass {
             return TaskPoll::Done;
         };
         // The pager refuses a poisoned punch itself (M1); this only stops the pass early.
-        if self.shared.closed.load(Ordering::Acquire)
+        if self.shared.closing.load(Ordering::Acquire)
+            || self.shared.closed.load(Ordering::Acquire)
             || self.shared.pager_poisoned.load(Ordering::Acquire)
         {
             return TaskPoll::Done;
@@ -214,7 +271,14 @@ impl Task for PunchPass {
             return TaskPoll::SleepUntil(next_at);
         }
         let reserve = punch.reserve(self.shared.pager.stats().file_bytes);
-        match self.shared.pager.punch_free(reserve) {
+        // Held across the check and the punch: the close's release waits for it (#2181).
+        let stopped = punch.stopped.lock().unwrap_or_else(PoisonError::into_inner);
+        if *stopped {
+            return TaskPoll::Done;
+        }
+        let result = self.shared.pager.punch_free(reserve);
+        drop(stopped);
+        match result {
             Ok(None) => {
                 // Nothing (more) to punch: the gate waits for free space to grow past this.
                 punch.ended(self.punched, unpunched_free(&self.shared.pager.stats()));
@@ -240,8 +304,9 @@ impl Task for PunchPass {
                     punch.unsupported.store(true, Ordering::Relaxed);
                 }
                 // A refusal that persists (EIO, EPERM) would otherwise fail once per manifest
-                // commit: wait for new free space, as after an empty pass (simp724's S1).
-                punch.ended(0, unpunched_free(&self.shared.pager.stats()));
+                // commit: wait for new free space, as after an empty pass (simp724's S1), but
+                // not for ever (#2181).
+                punch.refused(now, unpunched_free(&self.shared.pager.stats()));
                 TaskPoll::Done
             }
         }
@@ -273,10 +338,34 @@ mod tests {
         // A pass that punched clears the mark: back to the reserve's gate.
         p.ended(MIB, 0);
         assert!(p.gate(reserve + trigger, file));
+        // #2181: the mark follows free space down. After an empty pass at 200 MiB the
+        // workload reuses 50 MiB: a trigger's worth past 150 MiB is new space.
+        p.ended(0, 200 * MIB);
+        assert!(!p.gate(150 * MIB, file));
+        assert!(p.gate(150 * MIB + trigger, file));
         // The reserve: twice the memtable budgets, capped at a quarter of the file.
         let q = Punch::new(PunchTuning::default(), 128 * MIB, 4);
         assert_eq!(q.reserve(file), 1024 * MIB);
         assert_eq!(q.reserve(1024 * MIB), 256 * MIB);
         assert_eq!(p.reserve(file), 64 * MIB);
+    }
+
+    /// #2181 (2): one refused punch used to set the mark to all the unpunched space, so
+    /// punching waited for that much more free space, perhaps until reopen. Now the mark
+    /// goes after `RETRY_AFTER_NANOS`, and not before (a persistent refusal fails once
+    /// per that, simp724's S1).
+    #[test]
+    fn a_refused_punch_holds_the_gate_only_until_the_retry_time() {
+        let p = Punch::new(PunchTuning::default(), 0, 1);
+        let file = 64 * 1024 * MIB;
+        let free = 49 * 1024 * MIB;
+        p.refused(1_000, free);
+        p.retry_if_due(1_000 + RETRY_AFTER_NANOS - 1);
+        assert!(!p.gate(free, file), "before the retry time");
+        p.retry_if_due(1_000 + RETRY_AFTER_NANOS);
+        assert!(p.gate(free, file), "after it");
+        // Cleared: a later check finds nothing due.
+        p.retry_if_due(u64::MAX);
+        assert_eq!(p.retry_at.load(Ordering::Relaxed), 0);
     }
 }

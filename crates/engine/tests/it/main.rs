@@ -82,6 +82,7 @@ mod pager_growth;
 mod plain_lane;
 mod poisoned_flush_barrier;
 mod punch;
+mod punch_close;
 mod purge_bound;
 mod purge_race;
 mod range_drop_flush;

@@ -1177,6 +1177,11 @@ impl Shared {
         for tracker in self.wal_io.iter().filter_map(|t| t.get()) {
             tracker.wait_idle();
         }
+        // No punch lands once the locks go (#2181): another writer's allocator may then
+        // hand out the block a pass took. Waits for a punch in flight.
+        if let Some(p) = &self.punch {
+            p.stop();
+        }
         if !self.keep_locks.load(Ordering::Acquire) {
             let locks = self
                 .locks

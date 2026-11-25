@@ -714,6 +714,214 @@ fn a_node_that_voted_for_a_term_refuses_a_lower_terms_map_across_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #2159 item 1: a vote waits for an install that has passed the term fence, so the install
+/// publishes its map before the vote answers (the candidate's fetch then sees it), and a
+/// push after the vote meets the fence. Before, a vote took only the grants' locks and
+/// answered while the install was between its fence and its publish.
+#[test]
+fn a_vote_waits_for_an_install_past_the_term_fence() {
+    use super::proto::{LeasePart, LeaseRequest};
+    let dir = test_dir();
+    let ports = [7001, 7002, 7003];
+    let n = node(&dir, "b");
+    n.push_map(the_map(1, &ports), None).unwrap();
+    std::thread::sleep(n.grants.grace_remaining());
+    super::HOLD_INSTALL.lock().unwrap().push(dir.clone());
+    let installing = {
+        let n = Arc::clone(&n);
+        std::thread::spawn(move || n.push_map(the_map(2, &ports), Some("a")))
+    };
+    let held = || super::INSTALL_HELD.lock().unwrap().contains(&dir);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !held() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the install never reached its hold"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let req = LeaseRequest {
+        cluster_id: "c1".into(),
+        node_id: "c".into(),
+        map_version: 1,
+        round: 1,
+        parts: vec![LeasePart {
+            partition: super::lease::WRITER_LEASE.into(),
+            epoch: 0,
+            term: 1,
+            ..LeasePart::default()
+        }],
+        lease_ms: n.grants.lease_ms(),
+        start: 1,
+        writer_term: 0,
+        pre_vote: false,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let voting = {
+        let n = Arc::clone(&n);
+        let mine = n.get_map().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            tx.send(rt.block_on(n.vote_async(mine, req))).unwrap();
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        rx.try_recv().is_err(),
+        "the vote answered while the install was past its fence"
+    );
+    super::HOLD_INSTALL.lock().unwrap().retain(|d| *d != dir);
+    super::INSTALL_HELD.lock().unwrap().retain(|d| *d != dir);
+    assert_eq!(installing.join().unwrap().unwrap().map_version, 2);
+    let vote = rx.recv().unwrap().unwrap();
+    voting.join().unwrap();
+    assert!(!vote.granted.is_empty(), "{vote:?}");
+    assert_eq!(n.get_map().unwrap().map_version, 2);
+    let e = n.push_map(the_map(3, &ports), Some("a")).unwrap_err();
+    assert!(e.message.contains("voted for term 1"), "{}", e.message);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #2159 item 3: a candidate elected by a majority of its own map's nodes takes office only
+/// with a majority of the newest map's nodes too. Here c holds a map of a, b and c, and b a
+/// newer one that adds d; a is down. c and b are a majority of c's map but not of b's,
+/// so c asks d for the same vote: while d is down the election fails, and once d answers,
+/// c is elected on b's map. Before, c took office on two of the four nodes.
+#[test]
+fn an_election_counts_a_majority_of_the_newest_maps_nodes_too() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (pa, pd) = (free(), free());
+    let _a_down = HeldPort::take(pa);
+    let d_down = HeldPort::take(pd);
+    let listeners: Vec<std::net::TcpListener> = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports = [
+        pa,
+        listeners[0].local_addr().unwrap().port(),
+        listeners[1].local_addr().unwrap().port(),
+    ];
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (b, c, d) = (
+        node(&dirs[0], "b"),
+        node(&dirs[1], "c"),
+        node(&dirs[2], "d"),
+    );
+    let old = the_map(1, &ports);
+    let mut newer = the_map(2, &ports);
+    newer.nodes.push(MapNode {
+        weight: Default::default(),
+        id: "d".into(),
+        address: format!("127.0.0.1:{pd}"),
+    });
+    c.push_map(old.clone(), None).unwrap();
+    b.push_map(old.clone(), None).unwrap();
+    b.push_map(newer.clone(), Some("a")).unwrap();
+    d.push_map(newer.clone(), None).unwrap();
+    let mut stops: Vec<_> = [&b, &c]
+        .into_iter()
+        .zip(listeners)
+        .map(|(n, l)| serve(&rt, n, l))
+        .collect();
+    // Each node's start grace, and the failover margin a pre-vote waits out since the
+    // writer lease last ran there (the node's start, or a vote's grant).
+    let quiet = |nodes: &[&Arc<Node>]| {
+        for n in nodes {
+            std::thread::sleep(n.grants.grace_remaining());
+            while n.grants.writer_lapsed() < TEST_LEASE * 2 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    quiet(&[&b, &c, &d]);
+    let e = rt.block_on(c.elect(&old, 1)).unwrap_err();
+    assert!(
+        e.contains("2 of the 4 nodes of the newest map (version 2)"),
+        "d down: {e}"
+    );
+    assert_eq!(c.get_map().unwrap().map_version, 1);
+    stops.push(serve(&rt, &d, d_down.listen()));
+    quiet(&[&b, &c]);
+    rt.block_on(c.elect(&old, 2)).unwrap();
+    let elected = c.get_map().unwrap();
+    assert_eq!(
+        (
+            elected.map_version,
+            elected.writer_term,
+            elected.writer.as_str()
+        ),
+        (3, 2, "c")
+    );
+    assert_eq!(elected.nodes.len(), 4, "built on b's map: {elected:?}");
+    assert_eq!(d.get_map().unwrap().map_version, 3);
+    drop(stops);
+    for dir in &dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// #2159 item 4: a node holding a deposed writer's map takes the elected writer's at a higher
+/// term though its version is lower, at start and in a pull. Before, both compared versions
+/// alone: the start skipped it, and the pull refused it as no newer.
+#[test]
+fn a_higher_terms_map_is_taken_at_a_lower_version_at_start_and_in_a_pull() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    // a's and c's ports refuse dials: the start's pushes to its peers go nowhere else.
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (pa, pc) = (free(), free());
+    let _held = (HeldPort::take(pa), HeldPort::take(pc));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ports = [pa, listener.local_addr().unwrap().port(), pc];
+    let at = |term: u64, version: u64, writer: &str| {
+        let mut m = the_map(version, &ports);
+        m.writer = writer.into();
+        m.writer_term = term;
+        m
+    };
+    let db = test_dir();
+    let b = node(&db, "b");
+    b.push_map(at(1, 1, "a"), None).unwrap();
+    b.push_map(at(2, 2, "b"), Some("b")).unwrap();
+    let _stop = serve(&rt, &b, listener);
+    let address = format!("127.0.0.1:{}", ports[1]);
+    for start in [true, false] {
+        let dir = test_dir();
+        let c = node(&dir, "c");
+        c.push_map(at(1, 1, "a"), None).unwrap();
+        c.push_map(at(1, 3, "a"), Some("a")).unwrap();
+        if start {
+            rt.block_on(c.sync_on_start());
+        } else {
+            rt.block_on(c.pull_now("b", &address, 3)).unwrap();
+        }
+        let m = c.get_map().unwrap();
+        assert_eq!((m.writer_term, m.map_version), (2, 2), "start {start}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// audit120's S-C3: a forwarded call from a peer whose map is newer than this node's takes
 /// that map first, and waits for it, so the call isn't served under a schema the newer map
 /// dropped. A peer that can't give it answers `PartitionUnavailable`, nothing run.
@@ -1361,8 +1569,12 @@ fn data_node_served(
     } else {
         None
     };
-    let resolver =
-        super::spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    // The decision records' sweep every half second, as other passes run sooner in tests.
+    let resolver = super::spanning::start_resolver(
+        Arc::downgrade(&shared),
+        shared.limits.txn_resolve_delay,
+        Duration::from_millis(500),
+    );
     let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
         if let Some(sync) = sync {

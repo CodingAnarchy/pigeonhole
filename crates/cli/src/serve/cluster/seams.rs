@@ -80,6 +80,31 @@ pub(crate) static DROP_VOTES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static NO_ADOPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// A hold seam (tests, #2159): an install on a node whose cluster directory is listed waits
+/// after its term fence, before it persists the map, until the directory is unlisted. It
+/// lists the directory in [`INSTALL_HELD`] once it waits.
+#[cfg(test)]
+pub(crate) static HOLD_INSTALL: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The nodes whose install [`HOLD_INSTALL`] holds or held, by cluster directory.
+#[cfg(test)]
+pub(crate) static INSTALL_HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// [`HOLD_INSTALL`]'s wait, in an install.
+#[cfg(test)]
+pub(crate) fn hold_install(dir: &Path) {
+    if !seam(&HOLD_INSTALL, dir) {
+        return;
+    }
+    INSTALL_HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(dir.to_owned());
+    while seam(&HOLD_INSTALL, dir) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Whether the seam `list` names this node's directory `dir`.
 #[cfg(test)]
 pub(crate) fn seam(list: &Mutex<Vec<PathBuf>>, dir: &Path) -> bool {
