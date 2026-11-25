@@ -1820,6 +1820,68 @@ fn a_stop_inside_a_small_split_row_finishes_the_row_and_the_move_goes_on() {
     let _ = (t.db_a.close(), t.db_b.close());
 }
 
+/// #2141: a map that brings back an aborted record under its own id, while the abort's drop
+/// of its copy on the target is still pending, gets a follower that waits for that drop
+/// before it reads its progress rows: it never says `copy_done` from the old copy's
+/// progress, and the drop never deletes rows under it. Once the drop is done, the copy runs
+/// from the start and holds the range.
+#[test]
+fn a_record_brought_back_under_its_own_id_waits_for_its_old_copys_drop() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let id = "own-id-1";
+    let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (go, drop_held) = tokio::sync::oneshot::channel();
+    super::super::range_drop::HOLD.lock().unwrap().push((
+        id.into(),
+        std::sync::Arc::clone(&reached),
+        drop_held,
+    ));
+    let users = t.db_b.table("users").unwrap().open().unwrap();
+    let held = || users.get(b"d", "f", b"q0").unwrap().is_some();
+    t.rt.block_on(async {
+        mutate(c, wide_row("d", 1, 1 << 10)).await;
+        let mut first = moving(&t.v1, 2, Some(MovePhase::Copying));
+        first.moves[0].id = id.into();
+        push(&t.ports, &first).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", id)
+                .await
+                .is_some_and(|s| s.copy_done && s.follower_error.is_empty())
+        })
+        .await;
+        // The abort: b's drop of the copy starts and is held.
+        let mut aborted = t.v1.clone();
+        aborted.map_version = 3;
+        push(&t.ports, &aborted).await;
+        tokio::time::timeout(Duration::from_secs(30), reached.notified())
+            .await
+            .expect("b's drop of the copy started, and is held");
+        assert!(held(), "the copy, held from its drop");
+        // The same record again, by a hand-built map: its follower waits for the drop.
+        let mut back = t.v1.clone();
+        back.map_version = 3;
+        let mut again = moving(&back, 4, Some(MovePhase::Copying));
+        again.moves[0].id = id.into();
+        push(&t.ports, &again).await;
+        eventually("the follower waits for its own id's drop", async || {
+            move_status(b, "p2", id)
+                .await
+                .is_some_and(|s| s.follower_waiting.contains("an earlier drop") && !s.copy_done)
+        })
+        .await;
+        let _ = go.send(());
+        eventually("b copies the range again", async || {
+            move_status(b, "p2", id)
+                .await
+                .is_some_and(|s| s.copy_done && s.follower_error.is_empty())
+        })
+        .await;
+    });
+    assert!(held(), "the range, copied again after the drop");
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
 /// simp724 on the M-a fix: a stop inside a row with more of it left than a stop waits for
 /// leaves the row marked partial, as a crash would, and the next follower stops the move,
 /// naming the row, rather than copy any of it again.
