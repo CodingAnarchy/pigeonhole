@@ -194,7 +194,11 @@ impl Service {
     /// 2b): commits every branch acknowledged, and abort markers. Returns how many went.
     pub(crate) async fn sweep_decisions(&self, now_ms: u64) -> Result<usize, ApiError> {
         use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
-        let table = self.decisions_table().await?;
+        // A home that never decided anything has no table: nothing to sweep, and nothing
+        // written to create it (the balancer judges an idle partition's device bytes).
+        let Some(table) = self.existing_decisions_table()? else {
+            return Ok(0);
+        };
         let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
         let gone: Vec<Vec<u8>> = {
             let table = table.clone();
@@ -224,6 +228,47 @@ impl Service {
         }
         drop(held);
         Ok(n)
+    }
+
+    /// This home's committed decision rows past `--txn-outcome-retention` at `now_ms` that
+    /// some branch never acked, at most `limit` of them, after xid `after` if given (the
+    /// sweep's cursor): each xid with the branches it still waits on (#2098).
+    pub(crate) async fn unacked_decisions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<(String, Vec<String>)>, ApiError> {
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, unacked};
+        let Some(table) = self.existing_decisions_table()? else {
+            return Ok(Vec::new());
+        };
+        let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        let after = after.map(|a| a.as_bytes().to_vec());
+        self.blocking(move || {
+            let mut out = Vec::new();
+            for row in table.scan_prefix(b"").iter()? {
+                if out.len() >= limit {
+                    break;
+                }
+                let row = row?;
+                if after.as_deref().is_some_and(|a| row.key() <= a) {
+                    continue;
+                }
+                let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
+                    continue;
+                };
+                let (Ok(xid), Some(waiting)) = (
+                    std::str::from_utf8(row.key()),
+                    unacked(cell.value(), now_ms, retention),
+                ) else {
+                    continue;
+                };
+                out.push((xid.to_owned(), waiting));
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// What transaction `id` is now, without taking it (D329's `Outcome` and resolver), as
@@ -567,6 +612,14 @@ impl Service {
                 "the commit's task ended without an outcome",
             ))
         })
+    }
+
+    /// This home's decision table, if it has one: the decision sweeps read it, and never
+    /// create it, so an idle partition's sweep writes nothing (#2164: a catalog change on
+    /// every partition of an idle cluster showed in its device load).
+    pub(crate) fn existing_decisions_table(&self) -> Result<Option<Table>, ApiError> {
+        use super::super::cluster::spanning::DECISIONS;
+        Ok(self.part()?.db.table(DECISIONS).and_then(|t| t.open()).ok())
     }
 
     /// The home's decision table (D329). Created through the gate if it's missing (a write

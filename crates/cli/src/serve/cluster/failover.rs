@@ -47,6 +47,13 @@ const STEP_WAIT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(crate) static STOP_AFTER_STAMP: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
+/// A test's hold seam: every failover by a node in each listed cluster directory stops after
+/// its stamp, before its map, for as long as the directory is listed. A rerun that resumes
+/// a stamped promote stops there too, so the test decides when the promote may go on
+/// (#2184's CI: with [`STOP_AFTER_STAMP`], the next pass could finish it first).
+#[cfg(test)]
+pub(crate) static HOLD_AFTER_STAMP: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
 /// The writer's failover state.
 #[derive(Debug, Default)]
 pub(crate) struct Failovers {
@@ -1061,6 +1068,13 @@ impl Promoter for NodeOps {
                 return Err(Failure::usage(
                     "the test's fault after the failover's stamp",
                 ));
+            }
+            drop(armed);
+            let held = HOLD_AFTER_STAMP
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if held.iter().any(|d| Some(d) == dir.as_ref()) {
+                return Err(Failure::usage("the test's hold after the failover's stamp"));
             }
         }
         Ok(())

@@ -795,8 +795,10 @@ message LocalPartition {
   double load_cpu = 29;
   double load_device = 30;
   double load = 31;
-  // D332: the partition file's size here, from the file system (the database is one file,
-  // WAL included), for the balancer. Open partitions only; 0 when closed.
+  // D332: the bytes the partition's file holds here, for the balancer and a move's plan:
+  // the file's length less the free space inside it (#2150, 1.3.1; before, its length,
+  // which a split's cleanup or a large delete never shrank). Open partitions only; 0 when
+  // closed.
   uint64 file_bytes = 32;
   // D331 PR 6: on a partition the map places no range on (a merge emptied it), what still
   // holds it in the map, the first of: a moved-away row not yet pruned (its feed tail), a
