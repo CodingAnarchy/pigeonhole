@@ -1,6 +1,6 @@
 name: CI
 
-# Kept to four jobs to limit runner usage. During GitHub Actions outages jobs can
+# Kept to few jobs to limit runner usage. During GitHub Actions outages jobs can
 # fail with "not acquired by Runner"; re-run them once the outage clears.
 
 on:
@@ -54,12 +54,13 @@ env:
 
 jobs:
   linux:
-    name: linux (fmt, clippy, docs, test, deny, semver)
+    name: linux (fmt, clippy, docs, test, deny)
     runs-on: ubuntu-latest
     # A warm run took 36 min on 2026-11-09, and a run that rebuilt more than usual hit 45
-    # while still compiling the tests (#1622), so no test ran. By 2026-11-10 a green run on
-    # main took 56 min and #1671 (embed-local in the workspace tests) was cancelled at 60
-    # during semver. 75 leaves room; moving semver to its own job is the follow-up.
+    # while still compiling the tests (#1622), so no test ran. By 2026-11-25 green runs on
+    # main took 59-61 min with the API checks, and two PRs' runs on loaded runners (#2226,
+    # #2228: the workspace tests alone 33-34 min) were cancelled at 75 during semver. The
+    # API checks (12-13 min of that) now run in their own job, `api`, beside this one.
     timeout-minutes: 75
     env:
       RUSTFLAGS: -D warnings
@@ -87,7 +88,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-semver-checks,cargo-public-api@0.52.0
+          tool: cargo-deny
       # gdb, for the model tests' hang watchdog (#838): it prints every thread's stack before
       # the abort. ubuntu-latest no longer ships it, so #1732's hang aborted with no stacks.
       # Only diagnostics: a stalled apt mirror gives up after a few minutes (as sweep.yml's
@@ -192,6 +193,24 @@ jobs:
         env:
           PIGEONHOLE_DIRECT: "1"
       - run: cargo deny check
+
+  # The published crates' API checks, beside the linux job rather than after it: they build
+  # their own rustdoc (stable for semver, a pinned nightly for the snapshots) and need none of
+  # its builds, and they took 12-13 of its 75 min (#2228).
+  api:
+    name: api (public API, versions, semver)
+    runs-on: ubuntu-latest
+    # Semver took 10-11 min warm on main (2026-11-25); 30 leaves room for a cold cache.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks,cargo-public-api@0.52.0
       # The semver crates' public API against their committed snapshots (#695): any added,
       # changed or removed item fails until `scripts/public-api.sh bless` records it, so new
       # API is reviewed (and has an ICR) before 1.x freezes it. The nightly is pinned with the
