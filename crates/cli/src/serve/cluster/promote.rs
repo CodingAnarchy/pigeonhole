@@ -705,8 +705,10 @@ pub(crate) async fn run(
     };
     let replica = row.role() == proto::PartitionRole::Replica;
     let stamped = !replica && row.epoch == target;
-    // #2154: a copy taking over a range move's target must hold the copied range. A stamped
-    // copy passed this before its stamp.
+    // #2154: a copy taking over a range move's target must hold the copied range. A copy
+    // past this check (closed or stamped by an earlier run) was checked then, and no move
+    // can commit its hand-over while this promote is pending (map.rs's move steps, cli692's
+    // Q1 on #2209), so no range moved into P since.
     if replica && let Err(why) = target_copy_holds(m, partition, &row) {
         return Err(Failure::usage(&why));
     }

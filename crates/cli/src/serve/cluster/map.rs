@@ -1368,6 +1368,22 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
                     new.writer_term, new.map_version
                 ));
             }
+            // Nor the commit point while a promote of its source or target is pending
+            // (cli692's Q1 on #2209): a promote begun before it would resume after it with
+            // a copy that stopped following at the promote's first map, never checked
+            // against the range (`promote::target_copy_holds` checks only a copy still a
+            // replica). Refused, the move waits at HANDING_OVER, bounded (#2160), or the
+            // promote's epoch aborts it.
+            let parts = if node_move(m) { 1 } else { 2 };
+            for p in [&m.from, &m.to].into_iter().take(parts) {
+                if let Some(e) = pending_promote(new, p) {
+                    return Err(format!(
+                        "move {id:?} can't commit its hand-over while partition {p:?} has a \
+                         pending promote (to node {:?} at epoch {}): finish or abandon it first",
+                        e.to, e.to_epoch
+                    ));
+                }
+            }
             // A NODE move's commit point is P's relocation (D332 PR 2): to `to`, at its next
             // epoch past any promote's floor, from the epoch it started at.
             if node_move(m) {
@@ -2203,6 +2219,37 @@ mod tests {
             old.failovers.push(pending(p, "c", epoch));
             new.failovers = old.failovers.clone();
             validate_change(&old, &new).unwrap();
+        }
+    }
+
+    /// cli692's Q1 on #2209: nor does its hand-over commit while a promote of its source or
+    /// target is pending (one begun before the commit point would resume after it with a copy
+    /// never checked against the range); one finished is no bar.
+    #[test]
+    fn a_move_doesnt_commit_while_its_source_or_target_has_a_pending_promote() {
+        let at = |phase: MovePhase, version: u64| {
+            let mut m = moving(phase);
+            m.map_version = version;
+            m
+        };
+        for p in ["p1", "p2"] {
+            let epoch = map().partitions.iter().find(|q| q.id == p).unwrap().epoch;
+            let mut before = at(MovePhase::HandingOver, 4);
+            before.failovers.push(pending(p, "c", epoch + 1));
+            let mut after = at(MovePhase::HandedOver, 5);
+            after.moves[0].handed_over_version = 5;
+            after.tables[0] = handed_over(&after.tables[0], b"c", Some(b"f"), "p2");
+            after.partitions[0].epoch = 2;
+            after.failovers = before.failovers.clone();
+            // p1's hand-over raises its epoch to the promote's, which D330's epoch rule
+            // already refuses; p2's is refused by the new rule alone.
+            refused(validate_change(&before, &after), "promote");
+            if p == "p2" {
+                refused(
+                    validate_change(&before, &after),
+                    "can't commit its hand-over",
+                );
+            }
         }
     }
 

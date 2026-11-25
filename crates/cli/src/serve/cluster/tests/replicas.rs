@@ -1703,14 +1703,15 @@ fn a_targets_copy_reports_its_moves_progress_from_its_own_rows() {
             .await
             .unwrap()
             .into_inner();
-        m.moves[0].phase = MovePhase::HandedOver as i32;
-        m.moves[0].final_seqno = source;
+        let mv1 = m.moves.iter().position(|r| r.id == "mv1").unwrap();
+        m.moves[mv1].phase = MovePhase::HandedOver as i32;
+        m.moves[mv1].final_seqno = source;
         assert_eq!(
             super::super::promote::target_copy_holds(&m, "p2", &row),
             Ok(())
         );
         // A final seqno the copy hasn't passed: no.
-        m.moves[0].final_seqno = shown().await.unwrap().source_applied_seqno + 1_000;
+        m.moves[mv1].final_seqno = shown().await.unwrap().source_applied_seqno + 1_000;
         assert!(super::super::promote::target_copy_holds(&m, "p2", &row).is_err());
         step(a, &|m, _| m.moves.clear()).await;
     });
