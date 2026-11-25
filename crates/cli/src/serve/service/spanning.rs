@@ -164,16 +164,18 @@ impl Service {
     }
 
     /// This home's committed decision rows past `--txn-outcome-retention` at `now_ms` that
-    /// some branch never acked, at most `limit` of them: each xid with the branches it still
-    /// waits on (#2098).
+    /// some branch never acked, at most `limit` of them, after xid `after` if given (the
+    /// sweep's cursor): each xid with the branches it still waits on (#2098).
     pub(crate) async fn unacked_decisions(
         &self,
         now_ms: u64,
         limit: usize,
+        after: Option<&str>,
     ) -> Result<Vec<(String, Vec<String>)>, ApiError> {
         use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, unacked};
         let table = self.decisions_table().await?;
         let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        let after = after.map(|a| a.as_bytes().to_vec());
         self.blocking(move || {
             let mut out = Vec::new();
             for row in table.scan_prefix(b"").iter()? {
@@ -181,6 +183,9 @@ impl Service {
                     break;
                 }
                 let row = row?;
+                if after.as_deref().is_some_and(|a| row.key() <= a) {
+                    continue;
+                }
                 let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
                     continue;
                 };

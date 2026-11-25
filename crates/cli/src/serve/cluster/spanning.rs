@@ -581,6 +581,17 @@ pub(crate) fn is_branch(msg: &proto::ForwardRequest) -> bool {
     }
 }
 
+/// Whether branch call `msg` is one of the nodes' own arms (prepare, decide, resolve), which
+/// act for the transaction, not for its client: no forwarded caller is checked or used for
+/// them, as `Cluster.Forward` already takes only a cluster-scope bearer (#2165). The resolver
+/// and the decision sweep send them as the cluster itself, with no client token.
+pub(crate) fn is_node_arm(msg: &proto::ForwardRequest) -> bool {
+    matches!(
+        msg.op,
+        Some(Op::BranchPrepare(_) | Op::BranchDecide(_) | Op::ResolveTxn(_))
+    )
+}
+
 /// The table and row of each row a transaction call on a branch names.
 fn rows_of(op: &ServiceOp) -> Vec<(&str, &[u8])> {
     match op {
@@ -1001,8 +1012,9 @@ impl Driver {
     /// any more (#2098): each is sent the commit's decide again, which applies a share still
     /// in doubt and answers at once for one that isn't, so any answer means it holds none
     /// now. A partition the map no longer lists counts too: a merge removes one only once it
-    /// holds no share in doubt (D331 PR 6). One that doesn't answer doesn't count.
-    pub(crate) async fn confirm(&self, parts: &[String]) -> Vec<String> {
+    /// holds no share in doubt (D331 PR 6). One that doesn't answer doesn't count; the first
+    /// such refusal comes back beside the acked, for the sweep's log line.
+    pub(crate) async fn confirm(&self, parts: &[String]) -> (Vec<String>, Option<(String, ApiError)>) {
         let (gone, listed): (Vec<String>, Vec<String>) = {
             let routes = self.node.routes();
             parts
@@ -1026,14 +1038,16 @@ impl Driver {
             })
             .collect();
         let mut done = gone;
-        done.extend(
-            joined(&listed, calls)
-                .await
-                .into_iter()
-                .filter(|(_, r)| r.is_ok())
-                .map(|(p, _)| p),
-        );
-        done
+        let mut refused = None;
+        for (p, r) in joined(&listed, calls).await {
+            match r {
+                Ok(_) => done.push(p),
+                Err(e) => {
+                    refused.get_or_insert((p, e));
+                }
+            }
+        }
+        (done, refused)
     }
 
     /// Releases the read-only holds in `held`, at once: whether every one lasted.
@@ -1486,11 +1500,16 @@ async fn confirm_unacked(
     home: &str,
     service: &Arc<Service>,
     timeout: Duration,
+    cursor: &mut HashMap<String, String>,
 ) {
     if !service.gate().is_some_and(|g| g.leased()) {
         return;
     }
-    let rows = match service.unacked_decisions(now_ms(), CONFIRM_PER_SWEEP).await {
+    let after = cursor.get(home).cloned();
+    let rows = match service
+        .unacked_decisions(now_ms(), CONFIRM_PER_SWEEP, after.as_deref())
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => {
             if e.code != "Fenced" {
@@ -1502,12 +1521,40 @@ async fn confirm_unacked(
             return;
         }
     };
+    // The next sweep goes on after the last row asked, and starts over once none is left,
+    // so rows whose branch doesn't answer don't keep the others from being asked (audit120's
+    // S2 on #2164).
+    match rows.last() {
+        Some((xid, _)) => cursor.insert(home.to_owned(), xid.clone()),
+        None => cursor.remove(home),
+    };
+    // Every row at once, all within one request timeout, so a branch node that's down costs
+    // the resolver's pass one timeout, not one per row (audit120's S1 on #2164).
+    let mut set = tokio::task::JoinSet::new();
     for (xid, waiting) in rows {
         let d = cluster.sweep_driver(service, home, &xid);
-        let acked = match tokio::time::timeout(timeout, d.confirm(&waiting)).await {
-            Ok(acked) => acked,
-            Err(_) => continue,
-        };
+        set.spawn(async move {
+            let (acked, refused) = d.confirm(&waiting).await;
+            (xid, waiting.len(), acked, refused)
+        });
+    }
+    let mut answers = Vec::new();
+    let _ = tokio::time::timeout(timeout, async {
+        while let Some(done) = set.join_next().await {
+            if let Ok(done) = done {
+                answers.push(done);
+            }
+        }
+    })
+    .await;
+    set.abort_all();
+    let (mut asked, mut unanswered, mut first) = (0, 0, None);
+    for (xid, n, acked, refused) in answers {
+        asked += n;
+        unanswered += n - acked.len();
+        if let Some((p, e)) = refused {
+            first.get_or_insert(format!("partition {p} for {xid}: {}", e.message));
+        }
         if let Err(e) = service.ack_decision(&xid, &acked).await
             && e.code != "Fenced"
         {
@@ -1516,6 +1563,14 @@ async fn confirm_unacked(
                 e.message
             );
         }
+    }
+    // One line a sweep for a home whose rows stay (audit120's nit on #2164).
+    if let Some(first) = first {
+        eprintln!(
+            "phdb serve: {home}'s decision sweep: {unanswered} of {asked} branches that never \
+             acked a commit didn't answer its decide again, so those records stay (first: \
+             {first})"
+        );
     }
 }
 
@@ -1545,6 +1600,8 @@ pub(crate) fn start_resolver(
             // (partition, xid) → (when to ask again, the backoff's step).
             let mut next: HashMap<(String, Vec<u8>), (Instant, Duration)> = HashMap::new();
             let mut last_sweep = Instant::now();
+            // Each home's decision sweep cursor (#2098): the last unacked row it asked about.
+            let mut cursors: HashMap<String, String> = HashMap::new();
             loop {
                 tick.tick().await;
                 let Some(shared) = shared.upgrade() else {
@@ -1562,7 +1619,8 @@ pub(crate) fn start_resolver(
                 if last_sweep.elapsed() >= sweep_every {
                     last_sweep = Instant::now();
                     for (partition, service) in parts.iter() {
-                        confirm_unacked(cluster, partition, service, timeout).await;
+                        confirm_unacked(cluster, partition, service, timeout, &mut cursors)
+                            .await;
                         if let Err(e) = service.sweep_decisions(now_ms()).await
                             && e.code != "Fenced"
                         {

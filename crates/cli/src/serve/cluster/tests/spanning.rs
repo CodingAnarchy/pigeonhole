@@ -934,6 +934,154 @@ fn a_commit_whose_ack_was_lost_is_asked_again_and_collected_past_retention() {
     });
 }
 
+/// On a cluster with tokens (audit120's M1 on #2164): a spanning transaction homed on p2
+/// (node b) whose home dies before its decides leaves p1's share (node a) in doubt. Node a's
+/// resolver asks the home on another node, as the cluster itself, and decides it. With
+/// `lose`, p1 is instead decided by hand with its ack lost, and the home's sweep (#2098) asks
+/// p1 again on node a and collects the row. Either way the node's own calls are let through
+/// on a cluster whose nodes hold tokens.
+fn a_token_cluster_settles_a_share_across_nodes(lose: bool) {
+    use crate::serve::cluster::spanning::seams::{self, Step};
+    use crate::serve::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, DECISIONS};
+    use crate::serve::proto::{BeginRequest, DecideTxnRequest, TxnCommitRequest};
+    let tok = "t0ken-a";
+    let all = format!("write {tok}\ncluster {NODE_TOKEN}\n");
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_resolve_delay = if lose {
+        Duration::from_secs(3600)
+    } else {
+        Duration::from_millis(500)
+    };
+    let retention = limits.txn_outcome_retention;
+    let t = Three::start_limits([&all, &all, &all], limits);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        let r = BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        };
+        let id = txns(c)
+            .await
+            .begin(with(r, Some(tok)))
+            .await
+            .unwrap()
+            .into_inner()
+            .txn_id;
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            Some(tok),
+        )
+        .await
+        .unwrap();
+        let pause = seams::pause(&id, Step::Decide);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                txns(c)
+                    .await
+                    .commit(with(
+                        TxnCommitRequest {
+                            txn_id: id,
+                            rows: Vec::new(),
+                        },
+                        Some(tok),
+                    ))
+                    .await
+            })
+        };
+        pause.reached.notified().await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        assert!(in_doubt(&t, &id));
+        if !lose {
+            eventually_within(
+                Duration::from_secs(30),
+                "node a's resolver settles p1's share with the home on node b",
+                async || !in_doubt(&t, &id),
+            )
+            .await;
+            assert!(
+                t.dbs[0]
+                    .table("users")
+                    .unwrap()
+                    .open()
+                    .unwrap()
+                    .get(b"alice", "f", b"q")
+                    .unwrap()
+                    .is_some(),
+                "p1 applied the commit"
+            );
+            return;
+        }
+        seams::lose_ack(&id);
+        client(a)
+            .await
+            .decide_txn(with(
+                DecideTxnRequest {
+                    partition: "p1".into(),
+                    xid: id.clone(),
+                    commit: true,
+                    force: true,
+                },
+                Some(NODE_TOKEN),
+            ))
+            .await
+            .unwrap();
+        assert!(!in_doubt(&t, &id));
+        let text = String::from_utf8(decision_row(&t.dbs[1], &id).unwrap()).unwrap();
+        assert!(text.ends_with("\np1"), "{text:?}");
+        let (head, branches) = text.split_once('\n').unwrap();
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - retention.as_millis() as u64
+            - 1_000;
+        let head: Vec<String> = head
+            .split(' ')
+            .map(|w| {
+                if w.starts_with("at") {
+                    format!("at{old}")
+                } else {
+                    w.to_owned()
+                }
+            })
+            .collect();
+        t.dbs[1]
+            .table(DECISIONS)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(id.as_bytes())
+            .put(
+                DECISION_FAMILY,
+                DECISION_QUALIFIER,
+                format!("{}\n{branches}", head.join(" ")).as_bytes(),
+            )
+            .commit()
+            .unwrap();
+        eventually_within(
+            Duration::from_secs(30),
+            "the home's sweep asks p1 on node a and collects the row",
+            async || decision_row(&t.dbs[1], &id).is_none(),
+        )
+        .await;
+    });
+}
+
+#[test]
+fn on_a_token_cluster_the_resolver_asks_a_home_on_another_node() {
+    a_token_cluster_settles_a_share_across_nodes(false);
+}
+
+#[test]
+fn on_a_token_cluster_the_sweep_asks_a_branch_on_another_node() {
+    a_token_cluster_settles_a_share_across_nodes(true);
+}
+
 /// D331 PR 5 (simp724's M1 on the design, and the range-scoped in-doubt rule): a spanning
 /// transaction's branch on the moving range is prepared before the move, and its home is
 /// paused before the commit point, so the share stays in doubt on the source. The move
