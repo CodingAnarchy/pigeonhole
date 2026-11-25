@@ -2838,11 +2838,20 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
     });
     cut(&t, 1, true);
     t.rt.block_on(async {
-        eventually_within(FAILOVER_WINDOW, "p3 to fail over to a", async || {
+        // Twice on CI (#2166, #2170) a never failed over within the window: the reason a
+        // gives, and its p3 rows, say which step stalled next time.
+        eventually_why(FAILOVER_WINDOW, "p3 to fail over to a", async || {
             let m = map_of(a).await;
-            m.partitions
-                .iter()
-                .any(|p| p.id == "p3" && p.node == "a" && p.epoch > pending)
+            let p3 = m.partitions.iter().find(|p| p.id == "p3");
+            if p3.is_some_and(|p| p.node == "a" && p.epoch > pending) {
+                return Ok(());
+            }
+            let st = status_of(a).await;
+            let rows: Vec<_> = st.partitions.iter().filter(|lp| lp.id == "p3").collect();
+            Err(format!(
+                "map version {} has p3 {p3:?}; a's failover_blocked {:?}; a's p3 rows {rows:?}",
+                m.map_version, st.failover_blocked
+            ))
         })
         .await;
         let m = map_of(a).await;
@@ -3020,6 +3029,13 @@ const BALANCER_ADMIN: &str = "adm1n-bal";
 /// Changes the map at the writer `a` by `change` (retrying while its lease comes back),
 /// with the balancer's pass at 100 ms on every node (D332 PR 3's tests), asking with
 /// `token`. The new map's version.
+///
+/// Every node's partitions report a load of 0 ([`load::LOAD_FOR`]), unless the test
+/// registered its own first (`None` keeps the measured load): these tests aren't about load,
+/// and a measured one made a lone partition "too hot" on a slow runner, and never cold
+/// enough to merge (#2164's Windows red).
+///
+/// [`load::LOAD_FOR`]: super::super::load::LOAD_FOR
 async fn balancer_map(
     t: &Rig,
     token: Option<&str>,
@@ -3031,6 +3047,13 @@ async fn balancer_map(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !pass.iter().any(|(d, _)| d == dir) {
             pass.push((dir.clone(), Duration::from_millis(100)));
+        }
+        drop(pass);
+        let mut load = super::super::load::LOAD_FOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !load.iter().any(|(d, _)| d == dir) {
+            load.push((dir.clone(), Some(0.0)));
         }
     }
     let a = t.ports[0];
@@ -3134,7 +3157,15 @@ fn a_paused_or_idle_balancer_changes_no_map() {
     // nothing writes nothing to the map; its reason is in the writer's status. Paused, it
     // says so; on, an even cluster is within bounds, and ten passes and more leave the
     // map's version where it was.
+    //
+    // On the nodes' measured loads, not pinned ones (the coordinator on #2164's flake fix):
+    // the one balancer test that keeps the real measure under the pass. An idle rig does
+    // nothing whatever it measures: no partition has a tablet boundary to split at.
     let mut t = Rig::start();
+    super::super::load::LOAD_FOR
+        .lock()
+        .unwrap()
+        .extend(t.dirs.iter().map(|d| (d.clone(), None)));
     writer_leased(&mut t);
     let a = t.ports[0];
     t.rt.block_on(async {
