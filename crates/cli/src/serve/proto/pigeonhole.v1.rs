@@ -7795,6 +7795,10 @@ pub struct NodeStatus {
     pub move_retention_cap: u64,
     #[prost(uint32, tag = "17")]
     pub max_move_followers: u32,
+    /// D326: this node's `--cluster-lease-ms` (#2152): a promote run by the CLI bounds the time
+    /// between its two surveys of the old owner's grants by it. 0: unknown (an older node).
+    #[prost(uint64, tag = "18")]
+    pub lease_ms: u64,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]

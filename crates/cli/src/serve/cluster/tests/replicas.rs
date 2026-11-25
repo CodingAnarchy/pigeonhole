@@ -912,6 +912,17 @@ fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
     });
     let _ = stops.remove(2).send(());
     rt.block_on(stopped(ports[2]));
+    // A stopped process renews nothing. This rig's node c keeps its lease task while the
+    // process lives, so its outbound calls are cut as well: the promote waits out the
+    // others' grants to it, which a renewing owner would keep live (#2152).
+    let down: Vec<_> = [ports[0], ports[1]]
+        .iter()
+        .map(|p| (dirs[2].clone(), format!("127.0.0.1:{p}")))
+        .collect();
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(down.clone());
     rt.block_on(async {
         let r = within(super::super::promote::promote(
             &args_at(ports[0]),
@@ -934,6 +945,10 @@ fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
         let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
     });
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|e| !down.contains(e));
 }
 
 /// S4 (D328 PR 3): a move of p3 onto a, which holds p3's replica, takes a out of p3's
