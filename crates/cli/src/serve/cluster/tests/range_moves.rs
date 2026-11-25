@@ -279,6 +279,35 @@ fn an_opening_partition_raises_its_floor_past_a_moves_newest_row() {
     let _ = db.close();
 }
 
+/// audit120 on #2214: the open's read of the `newest/` rows creates nothing: a partition
+/// that never took a move opens without the progress family.
+#[test]
+fn an_opening_partition_with_no_move_creates_no_progress_family() {
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    let n = node(&dir, "a");
+    n.push_map(the_map(1, &ports), None).unwrap();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("p1.phdb"),
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap();
+    let gate = n.new_gate("p1");
+    n.arm_ranges(&gate, "p1", 1, &db, || ()).unwrap();
+    let family = match db
+        .table(super::super::identity::TABLE)
+        .and_then(|b| b.open())
+    {
+        Ok(t) => t.families().contains(&"moved"),
+        Err(e) => {
+            assert_eq!(e.code(), pigeonhole::ErrorCode::TableNotFound, "{e}");
+            false
+        }
+    };
+    assert!(!family, "the open created the progress family");
+    let _ = db.close();
+}
+
 /// simp724's B3, the crash case: the map at the hand-over's epoch persisted, the source's
 /// file still at the epoch before (a crash before the stamp). Its open finishes the
 /// hand-over: the row, then the stamp, and it opens at the map's epoch.

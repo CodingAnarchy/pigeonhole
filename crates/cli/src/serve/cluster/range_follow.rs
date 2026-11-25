@@ -1147,9 +1147,17 @@ pub(crate) fn newest_ts(db: &Pigeonhole, id: &str) -> Result<u64, ApiError> {
 }
 
 /// The newest of every `newest/<id>` row `db` holds, whatever their moves' state: 0 with
-/// none.
+/// none. Read only: a file that never took a move has no progress family, and its open
+/// doesn't create one (audit120 on #2214).
 pub(crate) fn newest_of_all(db: &Pigeonhole) -> Result<u64, ApiError> {
-    let t = progress_table(db)?;
+    let t = match db.table(identity::TABLE).and_then(|b| b.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    if !t.families().contains(&FAMILY) {
+        return Ok(0);
+    }
     let mut newest = 0;
     for row in t.scan_prefix(b"newest/").family(FAMILY).iter()? {
         let row = row?;
