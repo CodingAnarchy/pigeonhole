@@ -725,6 +725,7 @@ fn a_spanning_transactions_branch_on_its_homes_node_is_a_local_call() {
     // the branch past it, the transaction still usable.
     let mut limits = crate::serve::server_tests::limits();
     limits.txn_max_branches = 1;
+    let settle = settle_bound(&limits);
     let t = Several::start(limits);
     let [a, b, c] = t.ports;
     t.rt.block_on(async {
@@ -770,11 +771,24 @@ fn a_spanning_transactions_branch_on_its_homes_node_is_a_local_call() {
             .iter()
             .map(|p| (p.partition.as_str(), p.applied))
             .collect();
-        assert_eq!(parts, [("p3", true), ("p1", true)], "{reply:?}");
-        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+        // The reply waits for p1's decide only until the request deadline: on a slow runner
+        // p1 reads `applied: false`, still committed, and the decide task or the resolver
+        // applies it (#2147). The home's share is applied either way.
+        assert!(matches!(parts[..], [("p3", true), ("p1", _)]), "{reply:?}");
+        eventually_within(settle, "p1's share to apply", async || {
+            get_row(c, "alice").await.unwrap() == Some(b"1".to_vec())
+        })
+        .await;
         assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(get_row(c, "hank").await.unwrap(), None);
     });
+}
+
+/// How long a spanning commit's branch may take to settle after its commit answered: the
+/// decide round runs to the request deadline, then the resolver asks after its delay; plus
+/// a margin for a stalled runner (#2147).
+fn settle_bound(limits: &crate::serve::config::Limits) -> std::time::Duration {
+    limits.request_timeout + limits.txn_resolve_delay + std::time::Duration::from_secs(10)
 }
 
 /// A spanning transaction begun through `port` with its home at "zed" (p3, node a).
@@ -838,6 +852,8 @@ fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
     use crate::serve::cluster::spanning::seams;
     let mut limits = crate::serve::server_tests::limits();
     limits.request_timeout = std::time::Duration::from_millis(800);
+    // The hold's lifetime, plus a margin for a stalled runner (#2147).
+    let expiry = 2 * limits.request_timeout + std::time::Duration::from_secs(10);
     let t = Several::start(limits);
     let [_, b, c] = t.ports;
     t.rt.block_on(async {
@@ -872,7 +888,7 @@ fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
         pause.go.send(true).unwrap();
         let e = task.await.unwrap().unwrap_err();
         assert_eq!(code(&e), "Conflict", "{e}");
-        eventually("the hold to expire", async || {
+        eventually_within(expiry, "the hold to expire", async || {
             data(c)
                 .await
                 .mutate(crate::serve::proto::MutateRequest {
@@ -983,7 +999,9 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
     // audit120's M3b: rows a call already sent to a branch can't be applied twice by a
     // retry. What the home could refuse is checked before any row goes out; a failure after
     // that ends the transaction.
-    let t = Several::start(crate::serve::server_tests::limits());
+    let limits = crate::serve::server_tests::limits();
+    let settle = settle_bound(&limits);
+    let t = Several::start(limits);
     let [_, b, c] = t.ports;
     let commit = |id: String, rows| async move {
         txns(c)
@@ -1001,10 +1019,19 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
             .await
             .unwrap_err();
         assert_eq!(code(&e), "InvalidArgument", "{e}");
-        commit(id.clone(), vec![incr_row("alice", 1), put_row("zed", "1")])
-            .await
-            .unwrap();
+        // A forward that times out on a slow runner answers `OutcomeUnknown` ("the write may
+        // have been applied"): the transaction's outcome then says what was decided (#2147).
+        match commit(id.clone(), vec![incr_row("alice", 1), put_row("zed", "1")]).await {
+            Ok(_) => {}
+            Err(e) if code(&e) == "OutcomeUnknown" => committed_after(c, &id, settle, &e).await,
+            Err(e) => panic!("the corrected commit: {e}"),
+        }
+        eventually_within(settle, "alice's increment to apply", async || {
+            counter(c, "alice").await != 0
+        })
+        .await;
         assert_eq!(counter(c, "alice").await, 1, "counted once");
+        assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"1".to_vec()));
         // A bad row for the second branch (p2), after p1 took its rows: the transaction
         // ends, its retry answers that outcome, and p1's row is never committed.
         let id = begin_spanning(b).await;
@@ -1020,5 +1047,28 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
         assert_eq!(get_row(c, "hank").await.unwrap(), None);
         // p1's branch was aborted: bob takes a plain write at once.
         put(c, "bob", "2").await;
+        assert_eq!(counter(c, "alice").await, 1, "still counted once");
     });
+}
+
+/// Waits up to `limit` for `id`'s outcome, through `port`, to be decided, and requires it
+/// committed: `first` (a commit's ambiguous answer) is in the panic. An `Outcome` call that
+/// fails (it crosses the hop that just timed out) counts as not decided yet; the last
+/// answer is in the panic (perf287 on #2175).
+async fn committed_after(port: u16, id: &str, limit: std::time::Duration, first: &tonic::Status) {
+    use crate::serve::proto::TxnOutcomeState as St;
+    let until = tokio::time::Instant::now() + limit;
+    let mut last = String::from("no answer yet");
+    while tokio::time::Instant::now() < until {
+        match super::spanning::outcome(port, id).await {
+            Ok(r) if r.state() == St::InProgress => last = "IN_PROGRESS".into(),
+            Ok(r) => {
+                assert_eq!(r.state(), St::Committed, "after {first}: {r:?}");
+                return;
+            }
+            Err(e) => last = format!("Outcome failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the outcome after {first} was never decided within {limit:?}; last: {last}");
 }

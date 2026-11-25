@@ -1,5 +1,25 @@
 use super::*;
 
+/// The outcome of a spanning transaction ended before its commit point by `err` (#2161).
+/// `OutcomeUnknown` there means a branch's answer to a buffered write was lost; the
+/// transaction itself is ended and its branches aborted, so nothing of it commits. It
+/// becomes `Conflict` (retry the transaction), keeping what was lost in the message, so a
+/// client isn't sent to `Outcome` for what is already certain. Any other error stands.
+fn ended_before_commit(err: ApiError) -> ApiError {
+    if err.code != "OutcomeUnknown" {
+        return err;
+    }
+    ApiError::from_code(
+        pigeonhole::ErrorCode::Conflict,
+        &format!(
+            "the transaction was ended before its commit point, and nothing of it was \
+             committed: a write it sent to another partition got no answer ({}). Retry the \
+             transaction",
+            err.message
+        ),
+    )
+}
+
 /// The home's part of a spanning commit that wrote, as [`Service::spanning_write`] takes
 /// it: its transaction, the durability asked for, and the rows the `Commit` carried for
 /// the home (already applied to the transaction; kept for the range rule, #2155).
@@ -94,12 +114,18 @@ impl Service {
     /// audit120's M3b on #2062): its branches are aborted (in the background, on their own
     /// budget), and `err` becomes the session's recorded outcome, so a retry finds the
     /// transaction ended rather than applying those rows again. Returns `err`.
+    ///
+    /// Every caller is before the commit point, so the transaction's outcome is known
+    /// whatever `err` says: it didn't commit and can't. An `OutcomeUnknown` (a branch's
+    /// answer to a write was lost) is true of that one write, not of the transaction, so it
+    /// is recorded and returned as [`ended_before_commit`] makes it (#2161).
     pub(crate) fn end_spanning(
         mut g: super::super::sessions::TxnGuard,
         err: ApiError,
         driver: &super::super::cluster::spanning::Driver,
     ) -> ApiError {
         use super::super::cluster::spanning::SpanView;
+        let err = ended_before_commit(err);
         if let Some(span) = g.span() {
             let mut branches = span.branches(&driver.home);
             branches.extend(span.idle(&driver.home));
@@ -168,7 +194,11 @@ impl Service {
     /// 2b): commits every branch acknowledged, and abort markers. Returns how many went.
     pub(crate) async fn sweep_decisions(&self, now_ms: u64) -> Result<usize, ApiError> {
         use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
-        let table = self.decisions_table().await?;
+        // A home that never decided anything has no table: nothing to sweep, and nothing
+        // written to create it (the balancer judges an idle partition's device bytes).
+        let Some(table) = self.existing_decisions_table()? else {
+            return Ok(0);
+        };
         let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
         let gone: Vec<Vec<u8>> = {
             let table = table.clone();
@@ -198,6 +228,47 @@ impl Service {
         }
         drop(held);
         Ok(n)
+    }
+
+    /// This home's committed decision rows past `--txn-outcome-retention` at `now_ms` that
+    /// some branch never acked, at most `limit` of them, after xid `after` if given (the
+    /// sweep's cursor): each xid with the branches it still waits on (#2098).
+    pub(crate) async fn unacked_decisions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<(String, Vec<String>)>, ApiError> {
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, unacked};
+        let Some(table) = self.existing_decisions_table()? else {
+            return Ok(Vec::new());
+        };
+        let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        let after = after.map(|a| a.as_bytes().to_vec());
+        self.blocking(move || {
+            let mut out = Vec::new();
+            for row in table.scan_prefix(b"").iter()? {
+                if out.len() >= limit {
+                    break;
+                }
+                let row = row?;
+                if after.as_deref().is_some_and(|a| row.key() <= a) {
+                    continue;
+                }
+                let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
+                    continue;
+                };
+                let (Ok(xid), Some(waiting)) = (
+                    std::str::from_utf8(row.key()),
+                    unacked(cell.value(), now_ms, retention),
+                ) else {
+                    continue;
+                };
+                out.push((xid.to_owned(), waiting));
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// What transaction `id` is now, without taking it (D329's `Outcome` and resolver), as
@@ -541,6 +612,14 @@ impl Service {
                 "the commit's task ended without an outcome",
             ))
         })
+    }
+
+    /// This home's decision table, if it has one: the decision sweeps read it, and never
+    /// create it, so an idle partition's sweep writes nothing (#2164: a catalog change on
+    /// every partition of an idle cluster showed in its device load).
+    pub(crate) fn existing_decisions_table(&self) -> Result<Option<Table>, ApiError> {
+        use super::super::cluster::spanning::DECISIONS;
+        Ok(self.part()?.db.table(DECISIONS).and_then(|t| t.open()).ok())
     }
 
     /// The home's decision table (D329). Created through the gate if it's missing (a write

@@ -431,7 +431,7 @@ fn resolving() -> crate::serve::config::Limits {
 }
 
 /// `Transactions.Outcome` of `id` through `port`.
-async fn outcome(
+pub(super) async fn outcome(
     port: u16,
     id: &str,
 ) -> Result<super::super::proto::TxnOutcomeResponse, tonic::Status> {
@@ -817,6 +817,137 @@ fn a_spanning_transactions_outcome_is_its_tokens_alone_while_its_session_lasts()
     });
 }
 
+/// A call of transaction `id` that pauses at `Step::Forwarded` (its branch rows sent) and
+/// is cancelled there, as a client that goes away or whose deadline passes: the pause is
+/// never released, so the call can only end by being dropped where it waits. Then `again`
+/// is tried until the session answers for itself (the cancel has to reach the home's node
+/// first), and its answer is returned.
+async fn cancelled_after_forwarding<T, F, R, G, S>(
+    id: &str,
+    call: F,
+    again: G,
+) -> Result<R, tonic::Status>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+    G: Fn() -> S,
+    S: std::future::Future<Output = Result<R, tonic::Status>>,
+    R: std::fmt::Debug,
+{
+    use crate::serve::cluster::spanning::seams::{self, Step};
+    let pause = seams::pause(id, Step::Forwarded);
+    let first = tokio::spawn(call);
+    pause.reached.notified().await;
+    first.abort();
+    let _ = first.await;
+    let mut second = again().await;
+    let mut tries = 0;
+    while let Err(e) = &second {
+        if !matches!(code(e).as_str(), "SessionBusy" | "InProgress") || tries == 200 {
+            break;
+        }
+        tries += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        second = again().await;
+    }
+    assert!(
+        !matches!(&second, Err(e) if matches!(code(e).as_str(), "SessionBusy" | "InProgress")),
+        "the cancelled call never let go of the session: {second:?}"
+    );
+    drop(pause);
+    second
+}
+
+#[test]
+fn a_call_cancelled_after_its_branch_rows_went_out_ends_the_transaction() {
+    // #2157: a `Commit` carries a counter's increment for a branch (p1) and a row for its
+    // home (p2). The client goes away once the increment has reached the branch and before
+    // the commit's round starts, then sends the same `Commit` again, as a client with no
+    // answer does. Before the fix the session was put back open, the second `Commit` sent
+    // the increment again and committed, and the counter read 2. Now the cancelled call
+    // ends the transaction: the second `Commit` is told so (`Conflict`, retry the
+    // transaction) and nothing was applied. The same for a `TxnWrite` cut short.
+    let t = Three::start(["", "", ""]);
+    let [_, _, c] = t.ports;
+    t.rt.block_on(async {
+        use super::several::{add_counter, counter, incr_row};
+        add_counter(&t.ports, c).await;
+        let rows = || vec![incr_row("alice", 1), put_row("zed", "1")];
+
+        let id = begin_spanning(c, "zed").await.unwrap();
+        let first = {
+            let (id, rows) = (id.clone(), rows());
+            async move { commit_parts(c, &id, rows).await }
+        };
+        let second = cancelled_after_forwarding(&id, first, || commit_parts(c, &id, rows())).await;
+        let e = second.expect_err("the cancelled Commit ended the transaction");
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert!(e.message().contains("cancelled part-way"), "{e}");
+        assert_eq!(counter(c, "alice").await, 0);
+        assert_eq!(get_row(c, "zed").await.unwrap(), None);
+
+        // A `TxnWrite` cut short the same way: its retry finds the transaction ended, and
+        // so does a `Commit`.
+        let id = begin_spanning(c, "zed").await.unwrap();
+        let first = {
+            let (id, rows) = (id.clone(), rows());
+            async move { txn_write(c, &id, rows, None).await }
+        };
+        let second =
+            cancelled_after_forwarding(&id, first, || txn_write(c, &id, rows(), None)).await;
+        assert!(second.is_err(), "{second:?}");
+        let e = commit_parts(c, &id, Vec::new()).await.unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert_eq!(counter(c, "alice").await, 0);
+
+        // A whole transaction after that applies the increment once.
+        let id = begin_spanning(c, "zed").await.unwrap();
+        commit_parts(c, &id, rows()).await.unwrap();
+        assert_eq!(counter(c, "alice").await, 1);
+    });
+}
+
+#[test]
+fn a_transaction_ended_by_a_lost_branch_write_answer_says_it_didnt_commit() {
+    // #2161: a home's write to a branch is taken there, but its answer is lost, which is
+    // `OutcomeUnknown` for that one write. The home ends the transaction for it, before any
+    // commit point, so nothing of it can commit: the write's caller, and then `Commit`, are
+    // told so (`Conflict`, retry the transaction), not `OutcomeUnknown`, which sent a
+    // client to `Outcome` for what was already certain. In a `TxnWrite` and in the rows a
+    // `Commit` carries alike.
+    use crate::serve::cluster::spanning::seams;
+    let t = Three::start(["", "", ""]);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(c, &id, vec![put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        seams::lose_write_reply(&id);
+        let e = txn_write(c, &id, vec![put_row("alice", "1")], None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert!(e.message().contains("nothing of it was committed"), "{e}");
+        // The session's record says the same to its `Commit`.
+        let e = commit_parts(c, &id, Vec::new()).await.unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert_eq!(get_row(a, "alice").await.unwrap(), None);
+        assert_eq!(get_row(c, "zed").await.unwrap(), None);
+        assert!(!in_doubt(&t, &id));
+
+        // The same loss on a row the `Commit` itself carries.
+        let id = begin_spanning(c, "zed").await.unwrap();
+        seams::lose_write_reply(&id);
+        let e = commit_parts(c, &id, vec![put_row("alice", "2"), put_row("zed", "2")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert_eq!(get_row(a, "alice").await.unwrap(), None);
+        assert_eq!(get_row(c, "zed").await.unwrap(), None);
+    });
+}
+
 #[test]
 fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
     // #2078 (audit120's nit on #2076, Q3 on the plan): the home is lost after its commit
@@ -863,6 +994,221 @@ fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
+}
+
+#[test]
+fn a_commit_whose_ack_was_lost_is_asked_again_and_collected_past_retention() {
+    // #2098: as in the test above, p1's share is decided by hand, but its ack is lost (a
+    // restart of node a loses the queue it's owed from), so the home's row never takes it.
+    // Once the row is past retention, the home's sweep sends p1 the commit's decide again;
+    // p1 holds nothing in doubt, so it answers at once, its ack is recorded, and the same
+    // sweep collects the row. p1 applied the commit once.
+    use crate::serve::cluster::spanning::seams::{self, Step};
+    use crate::serve::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, DECISIONS};
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_resolve_delay = Duration::from_secs(3600);
+    let retention = limits.txn_outcome_retention;
+    let t = Three::start_limits(["", "", ""], limits);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        use super::several::{add_counter, counter, incr_row};
+        add_counter(&t.ports, c).await;
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(
+            c,
+            &id,
+            vec![incr_row("alice", 1), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let (pause, commit) = paused_commit(c, &id, Step::Decide).await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        assert!(in_doubt(&t, &id));
+        seams::lose_ack(&id);
+        decide(a, "p1", &id, true, true).await.unwrap();
+        assert!(!in_doubt(&t, &id));
+        assert_eq!(counter(c, "alice").await, 1);
+        // The row as the commit left it, aged past retention: nothing acked it.
+        let row = decision_row(&t.dbs[1], &id).unwrap();
+        let text = String::from_utf8(row).unwrap();
+        assert!(text.ends_with("\np1"), "{text:?}");
+        let (head, branches) = text.split_once('\n').unwrap();
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - retention.as_millis() as u64
+            - 1_000;
+        let aged: Vec<&str> = head
+            .split(' ')
+            .map(|w| if w.starts_with("at") { "AT" } else { w })
+            .collect();
+        let aged = format!("{}\n{branches}", aged.join(" ")).replace("AT", &format!("at{old}"));
+        t.dbs[1]
+            .table(DECISIONS)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(id.as_bytes())
+            .put(DECISION_FAMILY, DECISION_QUALIFIER, aged.as_bytes())
+            .commit()
+            .unwrap();
+        eventually_within(
+            Duration::from_secs(30),
+            "the home's sweep collects the row",
+            async || decision_row(&t.dbs[1], &id).is_none(),
+        )
+        .await;
+        assert_eq!(counter(c, "alice").await, 1, "applied once");
+    });
+}
+
+/// On a cluster with tokens (audit120's M1 on #2164): a spanning transaction homed on p2
+/// (node b) whose home dies before its decides leaves p1's share (node a) in doubt. Node a's
+/// resolver asks the home on another node, as the cluster itself, and decides it. With
+/// `lose`, p1 is instead decided by hand with its ack lost, and the home's sweep (#2098) asks
+/// p1 again on node a and collects the row. Either way the node's own calls are let through
+/// on a cluster whose nodes hold tokens.
+fn a_token_cluster_settles_a_share_across_nodes(lose: bool) {
+    use crate::serve::cluster::spanning::seams::{self, Step};
+    use crate::serve::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, DECISIONS};
+    use crate::serve::proto::{BeginRequest, DecideTxnRequest, TxnCommitRequest};
+    let tok = "t0ken-a";
+    let all = format!("write {tok}\ncluster {NODE_TOKEN}\n");
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_resolve_delay = if lose {
+        Duration::from_secs(3600)
+    } else {
+        Duration::from_millis(500)
+    };
+    let retention = limits.txn_outcome_retention;
+    let t = Three::start_limits([&all, &all, &all], limits);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        let r = BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        };
+        let id = txns(c)
+            .await
+            .begin(with(r, Some(tok)))
+            .await
+            .unwrap()
+            .into_inner()
+            .txn_id;
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            Some(tok),
+        )
+        .await
+        .unwrap();
+        let pause = seams::pause(&id, Step::Decide);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                txns(c)
+                    .await
+                    .commit(with(
+                        TxnCommitRequest {
+                            txn_id: id,
+                            rows: Vec::new(),
+                        },
+                        Some(tok),
+                    ))
+                    .await
+            })
+        };
+        pause.reached.notified().await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        assert!(in_doubt(&t, &id));
+        if !lose {
+            eventually_within(
+                Duration::from_secs(30),
+                "node a's resolver settles p1's share with the home on node b",
+                async || !in_doubt(&t, &id),
+            )
+            .await;
+            // The share leaves the in-doubt registry before its decision is written and
+            // applied (the engine's `on_external_decide`), so its row shows a moment later.
+            let users = t.dbs[0].table("users").unwrap().open().unwrap();
+            eventually_within(
+                Duration::from_secs(30),
+                "p1 applied the commit",
+                async || users.get(b"alice", "f", b"q").unwrap().is_some(),
+            )
+            .await;
+            return;
+        }
+        seams::lose_ack(&id);
+        client(a)
+            .await
+            .decide_txn(with(
+                DecideTxnRequest {
+                    partition: "p1".into(),
+                    xid: id.clone(),
+                    commit: true,
+                    force: true,
+                },
+                Some(NODE_TOKEN),
+            ))
+            .await
+            .unwrap();
+        assert!(!in_doubt(&t, &id));
+        let text = String::from_utf8(decision_row(&t.dbs[1], &id).unwrap()).unwrap();
+        assert!(text.ends_with("\np1"), "{text:?}");
+        let (head, branches) = text.split_once('\n').unwrap();
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - retention.as_millis() as u64
+            - 1_000;
+        let head: Vec<String> = head
+            .split(' ')
+            .map(|w| {
+                if w.starts_with("at") {
+                    format!("at{old}")
+                } else {
+                    w.to_owned()
+                }
+            })
+            .collect();
+        t.dbs[1]
+            .table(DECISIONS)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(id.as_bytes())
+            .put(
+                DECISION_FAMILY,
+                DECISION_QUALIFIER,
+                format!("{}\n{branches}", head.join(" ")).as_bytes(),
+            )
+            .commit()
+            .unwrap();
+        eventually_within(
+            Duration::from_secs(30),
+            "the home's sweep asks p1 on node a and collects the row",
+            async || decision_row(&t.dbs[1], &id).is_none(),
+        )
+        .await;
+    });
+}
+
+#[test]
+fn on_a_token_cluster_the_resolver_asks_a_home_on_another_node() {
+    a_token_cluster_settles_a_share_across_nodes(false);
+}
+
+#[test]
+fn on_a_token_cluster_the_sweep_asks_a_branch_on_another_node() {
+    a_token_cluster_settles_a_share_across_nodes(true);
 }
 
 /// D331 PR 5 (simp724's M1 on the design, and the range-scoped in-doubt rule): a spanning

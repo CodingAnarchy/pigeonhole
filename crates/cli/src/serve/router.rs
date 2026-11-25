@@ -87,6 +87,31 @@ impl Cluster {
             round: home_service.request_timeout(),
         })
     }
+
+    /// A coordinator for committed transaction `xid` at its home `home`, outside any client
+    /// call: the decision sweep's, which asks branches that never acked its commit again
+    /// (#2098), within one request timeout, as the cluster itself.
+    pub(crate) fn sweep_driver(
+        &self,
+        home_service: &Service,
+        home: &str,
+        xid: &str,
+    ) -> spanning::Driver {
+        let round = home_service.request_timeout();
+        spanning::Driver {
+            node: Arc::clone(&self.node),
+            parts: Arc::clone(&self.parts),
+            forwarder: Arc::clone(&self.forwarder),
+            spanning: Arc::clone(&self.spanning),
+            xid: xid.into(),
+            home: home.into(),
+            caller: Caller::anonymous(),
+            deadline: tokio::time::Instant::now() + round,
+            renew_after: home_service.txn_idle() / 2,
+            max_branches: home_service.txn_max_branches(),
+            round,
+        }
+    }
 }
 
 /// The most of what's left of a read's time one replica's attempt takes (simp724's S2 on

@@ -31,6 +31,49 @@ fn marker(dir: &Path, partition: &str) -> PathBuf {
     dir.join(INCOMING).join(format!("{partition}.installing"))
 }
 
+/// A promote's intent (#2156): written and synced before a stamp promotes its copy, and
+/// removed once the copy's identity is at the new epoch. The copy's promote and its identity
+/// write are two steps, so a stop between them leaves a primary at its bootstrap epoch;
+/// this tells that promote, run again, from a file the map has moved past. Beside the
+/// partition's files, which a drop moves aside with it.
+pub(crate) fn promote_intent(dir: &Path, partition: &str) -> PathBuf {
+    dir.join(format!("{partition}.phdb.promoting"))
+}
+
+/// What a promote's intent records: the cluster, the partition, the copy's bootstrap epoch
+/// and the epoch it's stamped at.
+fn intent_of(req: &StampRequest) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n",
+        req.cluster_id, req.partition, req.replica_epoch, req.to_epoch
+    )
+}
+
+/// Writes and syncs `req`'s intent before its promote.
+fn write_intent(dir: &Path, req: &StampRequest) -> Result<(), ApiError> {
+    use std::io::Write as _;
+    let path = promote_intent(dir, &req.partition);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(intent_of(req).as_bytes())?;
+        f.sync_all()
+    };
+    write().map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+    upload::sync_dir(dir);
+    Ok(())
+}
+
+/// Whether `req` is the promote whose intent is recorded: the same one, run again.
+fn intent_matches(dir: &Path, req: &StampRequest) -> bool {
+    std::fs::read_to_string(promote_intent(dir, &req.partition)).is_ok_and(|s| s == intent_of(req))
+}
+
+/// A test's fault seam (#2156): a promote's stamp on a node in each listed cluster
+/// directory stops after the copy's promote, before its identity, as a crash there would.
+#[cfg(test)]
+pub(crate) static STOP_AFTER_PROMOTE: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Partition `partition`'s main file in `dir`.
 fn main_file(dir: &Path, partition: &str) -> PathBuf {
     dir.join(format!("{partition}.phdb"))
@@ -663,11 +706,29 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
                 .replicated_seqno()
                 .map_err(|e| ApiError::internal(format!("read the copy's state: {e}")))?
                 .is_some();
-            // Already a primary, and not at `to_epoch` (done, above): an earlier promote
-            // stamped it, and the map has moved since (a set-map, relocate or promote), or
-            // it stopped between its promote and its identity. Stamping it again would give
-            // P this file's history over whatever P took since (simp724's M1 on #2007).
-            if !following {
+            // Already a primary, and not at `to_epoch` (done, above): this promote, run
+            // again after it stopped between its promote and its identity, if its intent says
+            // so (#2156), so only the identity is left to write. Otherwise an earlier promote
+            // stamped it and the map has moved since (a set-map, relocate or promote):
+            // stamping it again would give P this file's history over whatever P took since
+            // (simp724's M1 on #2007).
+            if following {
+                write_intent(dir, req)?;
+                db.promote()
+                    .map_err(|e| ApiError::internal(format!("promote {}: {e}", main.display())))?;
+                #[cfg(test)]
+                {
+                    let mut armed = STOP_AFTER_PROMOTE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(i) = armed.iter().position(|d| dir.starts_with(d)) {
+                        armed.swap_remove(i);
+                        return Err(ApiError::internal(
+                            "the test's fault between the copy's promote and its identity",
+                        ));
+                    }
+                }
+            } else if !intent_matches(dir, req) {
                 return Err(ApiError::failed_precondition(format!(
                     "{} is already a primary, at epoch {}: an earlier promote stopped after \
                      promoting it, and the map has moved on (this promote is from epoch {}). \
@@ -679,8 +740,6 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
                     req.from_epoch
                 )));
             }
-            db.promote()
-                .map_err(|e| ApiError::internal(format!("promote {}: {e}", main.display())))?;
         }
         let id = identity::Identity {
             cluster_id: req.cluster_id.clone(),
@@ -704,6 +763,15 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
     let closed = db.close();
     stamped?;
     closed.map_err(|e| ApiError::internal(format!("close {}: {e}", main.display())))?;
+    // The identity is at the new epoch and closed: a promote's intent has done its work.
+    if req.promote {
+        let intent = promote_intent(dir, p);
+        match std::fs::remove_file(&intent) {
+            Ok(()) => upload::sync_dir(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("phdb serve: remove {}: {e}", intent.display()),
+        }
+    }
     Ok(installed)
 }
 

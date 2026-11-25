@@ -47,6 +47,13 @@ const STEP_WAIT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(crate) static STOP_AFTER_STAMP: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
+/// A test's hold seam: every failover by a node in each listed cluster directory stops after
+/// its stamp, before its map, for as long as the directory is listed. A rerun that resumes
+/// a stamped promote stops there too, so the test decides when the promote may go on
+/// (#2184's CI: with [`STOP_AFTER_STAMP`], the next pass could finish it first).
+#[cfg(test)]
+pub(crate) static HOLD_AFTER_STAMP: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
 /// The writer's failover state.
 #[derive(Debug, Default)]
 pub(crate) struct Failovers {
@@ -60,6 +67,9 @@ pub(crate) struct Failovers {
     /// the failover margin, or when the grant it waits on ends (simp724's nit), or on a map
     /// change, not every lease round.
     surveyed: Mutex<HashMap<String, (u64, u64)>>,
+    /// When the blocked partitions with a pending promote are next due a look at their
+    /// owners, on the lease clock (#2152): once per failover margin, with failover off too.
+    waiting_due: Mutex<u64>,
 }
 
 /// A test's count: the failover surveys each node (by cluster directory) has run (perf287's
@@ -219,6 +229,72 @@ pub(crate) fn abandoned(map: &ClusterMap, ids: &[String]) -> ClusterMap {
     m
 }
 
+/// Whether partition `p`'s pending promote is to be abandoned for its owner (#2152). That
+/// promote's first map keeps P's lease from the owner ([`promote::pending_promote`]), so an
+/// owner that came back can't renew it, and [`check`]'s renewal test never sees it. Its
+/// place: `asked`, the owner asked this node for P's lease within the last lease (withheld
+/// here, `Grants::asked_withheld_since`), so it runs its rounds and can send; and it answers
+/// with P open at its epoch, fenced only for want of its lease (or serving). As with a
+/// renewal (#2070), this wins over finishing a stamped copy: the promote never got its final
+/// map, which marks it done in the same change, so its copy took no write and the owner holds
+/// everything (simp724's Q2 on the plan).
+pub(crate) fn owner_ready(
+    map: &ClusterMap,
+    p: &proto::Partition,
+    statuses: &HashMap<String, NodeStatus>,
+    asked: bool,
+) -> bool {
+    if !asked || promote::pending_promote(map, p).is_none() {
+        return false;
+    }
+    statuses.get(&p.node).is_some_and(|st| {
+        st.partitions.iter().any(|lp| {
+            lp.id == p.id
+                && lp.role() != PartitionRole::Replica
+                && lp.epoch == p.epoch
+                && match lp.state() {
+                    LocalPartitionState::Serving => true,
+                    LocalPartitionState::Fenced => {
+                        lp.fence_reason() != proto::FenceReason::Operator
+                    }
+                    _ => false,
+                }
+        })
+    })
+}
+
+/// `map` with the pending promotes of `ready` (each [`owner_ready`]) abandoned, its version
+/// raised, and each promote's copy back in its partition's replicas when its node answers
+/// with it below the promote's epoch, unstamped (#2152). A copy that doesn't answer may be
+/// stamped: an orphan for the operator to drop, as the guide says.
+pub(crate) fn abandoned_for_owner(
+    map: &ClusterMap,
+    ready: &[proto::Partition],
+    statuses: &HashMap<String, NodeStatus>,
+) -> ClusterMap {
+    let ids: Vec<String> = ready.iter().map(|p| p.id.clone()).collect();
+    let mut m = abandoned(map, &ids);
+    for p in ready {
+        let Some(e) = promote::pending_promote(map, p) else {
+            continue;
+        };
+        let unstamped = statuses.get(&e.to).is_some_and(|st| {
+            st.partitions
+                .iter()
+                .any(|lp| lp.id == p.id && lp.epoch < e.to_epoch)
+        });
+        if !unstamped {
+            continue;
+        }
+        for q in m.partitions.iter_mut().filter(|q| q.id == p.id) {
+            if q.node != e.to && !q.replicas.contains(&e.to) {
+                q.replicas.push(e.to.clone());
+            }
+        }
+    }
+    m
+}
+
 /// [`Check`] for `p` in `map` at `now`: `until` is the end of the owner's last grant of `p`
 /// here at its epoch, `office` when this node took office at the map's term, `lease` and
 /// `margin` (A) in ns.
@@ -337,12 +413,22 @@ pub(crate) fn qualify(
         })
         .max_by_key(|e| e.to_epoch)
     {
-        let stamped = statuses.get(&e.to).is_some_and(|st| {
+        // Its copy, closed (out of the replicas since the pending map), at the promote's
+        // epoch if stamped, or still at its bootstrap epoch inside P's history if the
+        // promote stopped before its stamp or between the copy's promote and its identity
+        // (#2156). Both are finished from here: the stamp writes only what's left.
+        // The range can also match an old owner's closed file of the same history on that
+        // node: the stamp's exact match on the promote's intent is what admits a file, so
+        // that one is refused, the promote stays pending, and abandon handles it (simp724).
+        let resumable = statuses.get(&e.to).is_some_and(|st| {
             st.partitions.iter().any(|lp| {
-                lp.id == p.id && lp.role() != PartitionRole::Replica && lp.epoch == e.to_epoch
+                lp.id == p.id
+                    && lp.role() != PartitionRole::Replica
+                    && (lp.epoch == e.to_epoch
+                        || (p.history_epoch <= lp.epoch && lp.epoch <= p.epoch))
             })
         });
-        if stamped {
+        if resumable {
             return Ok(e.to.clone());
         }
     }
@@ -474,22 +560,43 @@ struct Down {
 
 impl Node {
     /// Abandons the pending promotes of `back`, partitions whose owner came back
-    /// ([`Check::Abandon`]), once the survey finds each serving at its epoch (#2070).
-    async fn abandon_pending(self: &Arc<Self>, map: &ClusterMap, back: &[proto::Partition]) {
-        let statuses: HashMap<String, NodeStatus> = self
+    /// ([`Check::Abandon`]), once the survey finds each serving at its epoch (#2070); and of
+    /// `waiting`, blocked partitions with a pending promote, once their owner answers
+    /// waiting for the lease that promote withholds ([`owner_ready`], #2152).
+    async fn abandon_pending(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+        back: &[proto::Partition],
+        waiting: &[proto::Partition],
+    ) {
+        let mut statuses: HashMap<String, NodeStatus> = self
             .survey(map)
             .await
             .into_iter()
             .filter_map(|(id, st)| st.map(|st| (id, st)))
             .collect();
-        let ids: Vec<String> = back
+        // This node's own, for a promote's copy here.
+        let node = Arc::clone(self);
+        if let Ok(mine) = tokio::task::spawn_blocking(move || node.status()).await {
+            statuses.insert(self.id.clone(), mine);
+        }
+        let ps: Vec<proto::Partition> = back
             .iter()
             .filter(|p| serves(p, statuses.get(&p.node)))
-            .map(|p| p.id.clone())
+            .chain(waiting.iter().filter(|p| {
+                let now = self.grants.clock().now();
+                let since = now.saturating_sub(nanos(self.grants.lease()));
+                let asked = self
+                    .grants
+                    .asked_withheld_since(&p.id, &p.node, p.epoch, since);
+                owner_ready(map, p, &statuses, asked)
+            }))
+            .cloned()
             .collect();
-        if ids.is_empty() {
+        if ps.is_empty() {
             return;
         }
+        let ids: Vec<String> = ps.iter().map(|p| p.id.clone()).collect();
         // Still the writer, with its lease, at the same map, or a later round decides.
         let Ok(current) = self.get_map() else { return };
         if (current.writer_term, current.map_version) != (map.writer_term, map.map_version)
@@ -500,7 +607,11 @@ impl Node {
         let ops = NodeOps {
             node: Arc::downgrade(self),
         };
-        match ops.set_map(abandoned(map, &ids)).await {
+        match ops
+            .set_map(abandoned_for_owner(map, &ps, &statuses))
+            .await
+            .map(|s| s.version)
+        {
             Ok(v) => eprintln!(
                 "phdb serve: abandoned the pending promote of {} at map version {v}: the owner \
                  came back and serves it (#2070). A copy that promote stamped must be dropped",
@@ -528,6 +639,7 @@ impl Node {
         let mut blocked = BTreeMap::new();
         let mut down = Vec::new();
         let mut back = Vec::new();
+        let mut waiting = Vec::new();
         for p in map.partitions.iter().filter(|p| p.node != self.id) {
             let until = self.grants.last_grant_until(&p.id, &p.node, p.epoch);
             let renewed = match check(&map, p, until, office, now, lease, margin) {
@@ -544,6 +656,12 @@ impl Node {
                     continue;
                 }
                 Check::Blocked(why) => {
+                    // A pending promote's owner may be back and waiting for the lease that
+                    // promote withholds, with failover off too (#2152): abandoned below once
+                    // it answers so.
+                    if promote::pending_promote(&map, p).is_some() {
+                        waiting.push(p.clone());
+                    }
                     blocked.insert(p.id.clone(), why);
                     continue;
                 }
@@ -570,8 +688,20 @@ impl Node {
                 kept,
             });
         }
-        if !back.is_empty() {
-            self.abandon_pending(&map, &back).await;
+        if !waiting.is_empty() {
+            let mut due = self
+                .failovers
+                .waiting_due
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if now < *due {
+                waiting.clear();
+            } else {
+                *due = now.saturating_add(margin);
+            }
+        }
+        if !back.is_empty() || !waiting.is_empty() {
+            self.abandon_pending(&map, &back, &waiting).await;
         }
         let down = match survey_or_keep(down) {
             Ok(down) => down,
@@ -608,6 +738,39 @@ impl Node {
         if (current.writer_term, current.map_version) != (map.writer_term, map.map_version)
             || self.writer_may_change(&current).is_err()
         {
+            return;
+        }
+        // #2152: a pending promote whose owner came back, and waits for the lease that
+        // promote withholds, is abandoned so the owner serves again. The map changed, so a
+        // later round decides the rest.
+        let since = now.saturating_sub(lease);
+        let asked = |p: &proto::Partition| {
+            self.grants
+                .asked_withheld_since(&p.id, &p.node, p.epoch, since)
+        };
+        let (ready, down): (Vec<Down>, Vec<Down>) = down
+            .into_iter()
+            .partition(|d| owner_ready(&map, &d.p, &statuses, asked(&d.p)));
+        if !ready.is_empty() {
+            let ps: Vec<proto::Partition> = ready.iter().map(|d| d.p.clone()).collect();
+            let ids: Vec<&str> = ps.iter().map(|p| p.id.as_str()).collect();
+            let ops = NodeOps {
+                node: Arc::downgrade(self),
+            };
+            match ops.set_map(abandoned_for_owner(&map, &ps, &statuses)).await {
+                Ok(s) => eprintln!(
+                    "phdb serve: abandoned the pending promote of {} at map version {}: the \
+                     owner came back and waits for its lease (#2152)",
+                    ids.join(", "),
+                    s.version
+                ),
+                Err(f) => eprintln!(
+                    "phdb serve: abandoning the pending promote of {}: {}",
+                    ids.join(", "),
+                    f.message()
+                ),
+            }
+            self.failovers.set_blocked(blocked);
             return;
         }
         let now = self.grants.clock().now();
@@ -658,6 +821,9 @@ impl Node {
         };
         match promote::run(&ops, &map, &d.p.id, &to, &how).await {
             Ok(done) => {
+                for w in &done.warnings {
+                    eprintln!("phdb serve: failing partition {} over: {w}", d.p.id);
+                }
                 eprintln!(
                     "phdb serve: failed partition {} over from node {} to node {to} at epoch {} \
                      (applied seqno {}, the owner's durable seqno {} as the copy last heard it; \
@@ -812,7 +978,7 @@ impl Promoter for NodeOps {
             .map_err(|e| Failure::usage(&e.message))
     }
 
-    async fn set_map(&self, m: ClusterMap) -> Result<u64, Failure> {
+    async fn set_map(&self, m: ClusterMap) -> Result<promote::Set, Failure> {
         let expected = m.map_version.saturating_sub(1);
         self.node()?
             .set_map(SetMapRequest {
@@ -822,8 +988,38 @@ impl Promoter for NodeOps {
                 force: false,
             })
             .await
-            .map(|r| r.map_version)
+            // This node, the writer, holds it, and the pushes say who else does.
+            .map(|r| promote::Set {
+                version: r.map_version,
+                held: 1 + r.pushed.iter().filter(|p| p.ok).count(),
+            })
             .map_err(|e| Failure::usage(&e.message))
+    }
+
+    fn now(&self) -> u64 {
+        self.node
+            .upgrade()
+            .map_or_else(pigeonhole_io::sys::boot_clock_ns, |n| {
+                n.grants.clock().now()
+            })
+    }
+
+    async fn survey(
+        &self,
+        _wait: Duration,
+    ) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
+        // The writer's survey waits `--cluster-push-timeout-ms`, at most a sixth of the
+        // lease, for each node already.
+        let node = self.node()?;
+        let map = node.get_map().map_err(|e| Failure::usage(&e.message))?;
+        let mut statuses: HashMap<String, Option<NodeStatus>> =
+            node.survey(&map).await.into_iter().collect();
+        let own = Arc::clone(&node);
+        let mine = tokio::task::spawn_blocking(move || own.status())
+            .await
+            .map_err(|e| Failure::usage(&e.to_string()))?;
+        statuses.insert(node.id.clone(), Some(mine));
+        Ok(statuses)
     }
 
     async fn stamp(&self, id: &str, req: StampRequest) -> Result<(), Failure> {
@@ -872,6 +1068,13 @@ impl Promoter for NodeOps {
                 return Err(Failure::usage(
                     "the test's fault after the failover's stamp",
                 ));
+            }
+            drop(armed);
+            let held = HOLD_AFTER_STAMP
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if held.iter().any(|d| Some(d) == dir.as_ref()) {
+                return Err(Failure::usage("the test's hold after the failover's stamp"));
             }
         }
         Ok(())
@@ -975,6 +1178,93 @@ mod tests {
             .unwrap_or_default();
             assert!(!why.contains("range move"), "{why}");
         }
+    }
+
+    /// #2152: a pending promote withholds P's lease from its owner, so an owner that came
+    /// back waits fenced; the writer abandons the promote once the owner asked it for the
+    /// lease and answers waiting, and puts an unstamped copy back among P's replicas.
+    #[test]
+    fn a_pending_promote_is_abandoned_once_its_owner_waits_for_the_lease() {
+        let mut map = ClusterMap {
+            map_version: 7,
+            partitions: vec![proto::Partition {
+                id: "p1".into(),
+                node: "c".into(),
+                epoch: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut e = proto::FailoverEvent {
+            partition: "p1".into(),
+            from: "c".into(),
+            to: "b".into(),
+            to_epoch: 4,
+            ..Default::default()
+        };
+        e.set_kind(FailoverKind::Partition);
+        e.set_state(FailoverState::Pending);
+        map.failovers.push(e);
+        let row = |epoch, state: LocalPartitionState, reason: proto::FenceReason| {
+            let mut lp = proto::LocalPartition {
+                id: "p1".into(),
+                epoch,
+                ..Default::default()
+            };
+            lp.set_role(PartitionRole::Owner);
+            lp.set_state(state);
+            lp.set_fence_reason(reason);
+            NodeStatus {
+                partitions: vec![lp],
+                ..Default::default()
+            }
+        };
+        let waits = row(
+            3,
+            LocalPartitionState::Fenced,
+            proto::FenceReason::AwaitingPeerMap,
+        );
+        let unstamped = row(
+            3,
+            LocalPartitionState::Closed,
+            proto::FenceReason::Unspecified,
+        );
+        let statuses: HashMap<String, NodeStatus> =
+            [("c".into(), waits.clone()), ("b".into(), unstamped)].into();
+        let p = map.partitions[0].clone();
+        assert!(owner_ready(&map, &p, &statuses, true));
+        let m = abandoned_for_owner(&map, std::slice::from_ref(&p), &statuses);
+        assert_eq!(m.map_version, 8);
+        assert_eq!(m.failovers[0].state(), FailoverState::Abandoned);
+        assert_eq!(m.partitions[0].replicas, ["b"]);
+        // An owner that answers but hasn't asked for the lease (it can't send: a one-way
+        // cut) may not be able to renew: the promote goes on.
+        assert!(!owner_ready(&map, &p, &statuses, false));
+        // A stamped copy that answers is abandoned too, as on a renewal (#2070): it never
+        // served. It stays out of the replicas, an orphan for the operator.
+        let stamped = row(
+            4,
+            LocalPartitionState::Closed,
+            proto::FenceReason::Unspecified,
+        );
+        let s: HashMap<String, NodeStatus> =
+            [("c".into(), waits.clone()), ("b".into(), stamped)].into();
+        assert!(owner_ready(&map, &p, &s, true));
+        assert!(
+            abandoned_for_owner(&map, std::slice::from_ref(&p), &s).partitions[0]
+                .replicas
+                .is_empty()
+        );
+        // An owner the operator fenced isn't waiting for the lease.
+        let fenced = row(3, LocalPartitionState::Fenced, proto::FenceReason::Operator);
+        let s: HashMap<String, NodeStatus> = [("c".into(), fenced)].into();
+        assert!(!owner_ready(&map, &p, &s, true));
+        // A copy that doesn't answer may be stamped: abandoned, but not put back.
+        let s: HashMap<String, NodeStatus> = [("c".into(), waits)].into();
+        assert!(owner_ready(&map, &p, &s, true));
+        let m = abandoned_for_owner(&map, &[p], &s);
+        assert_eq!(m.failovers[0].state(), FailoverState::Abandoned);
+        assert!(m.partitions[0].replicas.is_empty());
     }
 
     /// The still-granting grant comes from another node only: the owner's own grant to

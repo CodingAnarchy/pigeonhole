@@ -24,6 +24,7 @@
 //! voted for a term refuses every map and writer lease below it (the term fence), so the old
 //! writer's late pushes can't reach a majority once the vote has.
 
+use std::collections::HashSet;
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -154,7 +155,14 @@ impl Node {
             && p.term > self.grants.term_floor(mine))
     }
 
-    /// Answers vote `req` against `mine` on a blocking thread (the fsync).
+    /// Answers vote `req` on a blocking thread (the fsync), against the map this node holds
+    /// then, or `mine` if it holds none.
+    ///
+    /// Under `installing` (#2159 item 1): an install that passed the term fence publishes its
+    /// map before this vote answers, so the candidate's fetch of this node's map sees it; one
+    /// that starts after the vote meets the fence. Lock order: `installing`, then the grants'
+    /// locks (an install takes `installing`, the state lock, then `voted`; nothing takes
+    /// `installing` under a grants lock).
     pub(crate) async fn vote_async(
         self: &Arc<Self>,
         mine: ClusterMap,
@@ -162,6 +170,11 @@ impl Node {
     ) -> Result<LeaseResponse, ApiError> {
         let node = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            let _one = node
+                .installing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mine = node.get_map().unwrap_or(mine);
             node.grants.vote(&mine, &req, |term| {
                 write_synced(&node.dir, WRITER_TERM_FILE, format!("{term}\n").as_bytes())
             })
@@ -410,7 +423,7 @@ impl Node {
     }
 
     /// Steps 1 to 3 at `term` (the module doc). An error says why it stopped.
-    async fn elect(self: &Arc<Self>, map: &ClusterMap, term: u64) -> Result<(), String> {
+    pub(super) async fn elect(self: &Arc<Self>, map: &ClusterMap, term: u64) -> Result<(), String> {
         let t0 = self.grants.clock().now();
         let req = LeaseRequest {
             cluster_id: map.cluster_id.clone(),
@@ -455,7 +468,7 @@ impl Node {
         self.candidate
             .store(term, std::sync::atomic::Ordering::Release);
         let end = super::lease::holder_end(t0, self.grants.lease());
-        let result = self.take_office(term, end, &granted).await;
+        let result = self.take_office(map, &req, term, end, granted).await;
         self.candidate
             .store(0, std::sync::atomic::Ordering::Release);
         result
@@ -478,13 +491,28 @@ impl Node {
             Ok(r) => why.push(format!("{}: {}", self.id, refusal(&r))),
             Err(e) => why.push(format!("{}: {}", self.id, e.message)),
         }
+        let (more, more_why) = self.ask_votes(map.nodes.iter(), req).await;
+        granted.extend(more);
+        why.extend(more_why);
+        (granted, why)
+    }
+
+    /// Asks each of `nodes` but this one for ballot `req` within the push timeout: the
+    /// nodes that granted it (each id and address), and why each other one didn't.
+    async fn ask_votes(
+        self: &Arc<Self>,
+        nodes: impl Iterator<Item = &super::proto::Node>,
+        req: &LeaseRequest,
+    ) -> (Vec<(String, Option<String>)>, Vec<String>) {
+        let mut granted = Vec::new();
+        let mut why = Vec::new();
         #[cfg(test)]
         if !req.pre_vote && super::seam(&super::DROP_VOTES, &self.dir) {
             why.push("its vote requests were dropped (a test's seam)".to_owned());
             return (granted, why);
         }
         let mut asks = tokio::task::JoinSet::new();
-        for n in map.nodes.iter().filter(|n| n.id != self.id) {
+        for n in nodes.filter(|n| n.id != self.id) {
             let (node, id, address, req) = (
                 Arc::clone(self),
                 n.id.clone(),
@@ -512,24 +540,66 @@ impl Node {
         (granted, why)
     }
 
-    /// Steps 2 and 3, as the writer voted at `term`, whose vote holds until `end` on the lease
-    /// clock: the majority `granted` voted for it (each id, and its address but for this node).
+    /// Steps 2 and 3, as the writer voted at `term` by vote `req`, whose vote holds until `end`
+    /// on the lease clock: `granted`, a majority of `map`'s nodes, voted for it (each id, and
+    /// its address but for this node).
     async fn take_office(
         self: &Arc<Self>,
+        map: &ClusterMap,
+        req: &LeaseRequest,
         term: u64,
         end: u64,
-        granted: &[(String, Option<String>)],
+        mut granted: Vec<(String, Option<String>)>,
     ) -> Result<(), String> {
-        // 2. The newest map the majority holds.
+        // 2. The newest map the voters hold. The votes must be a majority of its nodes too
+        // (#2159 item 3): if it changed the node set, a candidate counting a majority of it
+        // at this term might share no voter with this one's majority of `map`. So the newest
+        // map's nodes `map` doesn't list are asked for the same vote, each once, and the maps
+        // of those that grant it are read in turn, until no newer map turns up. Erring
+        // instead would never end: this node's vote fences the newest map's lower term, so it
+        // can't take that map and would ballot `map` again on its next tick.
         let mut newest = self.get_map().map_err(|e| e.message)?;
-        for (id, address) in granted {
-            let Some(address) = address else { continue };
-            match tokio::time::timeout(self.peers.push_timeout, self.fetch_map(address)).await {
-                Ok(Ok(m)) if map::newer(&m, &newest) => newest = m,
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(format!("node {id}'s map: {e}")),
-                Err(_) => return Err(format!("node {id}'s map: timed out")),
+        let mut asked: HashSet<String> = map.nodes.iter().map(|n| n.id.clone()).collect();
+        let mut read = 0;
+        let mut refused = Vec::new();
+        loop {
+            for (id, address) in &granted[read..] {
+                let Some(address) = address else { continue };
+                match tokio::time::timeout(self.peers.push_timeout, self.fetch_map(address)).await {
+                    Ok(Ok(m)) if map::newer(&m, &newest) => newest = m,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => return Err(format!("node {id}'s map: {e}")),
+                    Err(_) => return Err(format!("node {id}'s map: timed out")),
+                }
             }
+            read = granted.len();
+            let unasked: Vec<super::proto::Node> = newest
+                .nodes
+                .iter()
+                .filter(|n| !asked.contains(&n.id))
+                .cloned()
+                .collect();
+            if unasked.is_empty() {
+                break;
+            }
+            asked.extend(unasked.iter().map(|n| n.id.clone()));
+            let (more, why) = self.ask_votes(unasked.iter(), req).await;
+            granted.extend(more);
+            refused.extend(why);
+        }
+        let voters = granted
+            .iter()
+            .filter(|(id, _)| newest.nodes.iter().any(|n| n.id == *id))
+            .count();
+        if voters * 2 <= newest.nodes.len() {
+            return Err(format!(
+                "{voters} of the {} nodes of the newest map (version {}) voted for it, a \
+                 majority of map version {}'s alone ({})",
+                newest.nodes.len(),
+                newest.map_version,
+                map.map_version,
+                refused.join("; ")
+            ));
         }
         if !newest.nodes.iter().any(|n| n.id == self.id) {
             return Err(format!(
@@ -1341,6 +1411,9 @@ mod model {
                 writer_term: n.grants.term_floor(&n.map),
                 partitions,
                 grants: n.grants.granted(),
+                grace_remaining_ms: u64::try_from(n.grants.grace_remaining().as_millis())
+                    .unwrap_or(u64::MAX),
+                lease_ms: u64::try_from(LEASE.as_millis()).unwrap(),
                 ..NodeStatus::default()
             }
         }
@@ -1383,6 +1456,23 @@ mod model {
                 .collect();
             if !ids.is_empty() {
                 let _ = self.set_map(w, failover::abandoned(&map, &ids));
+                return;
+            }
+            // A pending promote whose owner came back and waits for the lease it withholds
+            // is abandoned too (#2152), as `maybe_fail_over` does.
+            let since = now.saturating_sub(nanos(LEASE));
+            let ready: Vec<Partition> = down
+                .iter()
+                .filter(|(p, _)| {
+                    let asked = n
+                        .grants
+                        .asked_withheld_since(&p.id, &p.node, p.epoch, since);
+                    failover::owner_ready(&map, p, &statuses, asked)
+                })
+                .map(|(p, _)| p.clone())
+                .collect();
+            if !ready.is_empty() {
+                let _ = self.set_map(w, failover::abandoned_for_owner(&map, &ready, &statuses));
                 return;
             }
             let Some((p, renewed, to)) = down.into_iter().find_map(|(p, renewed)| {
@@ -1716,8 +1806,32 @@ mod model {
             Ok(self.world.borrow().nodes[self.writer].map.clone())
         }
 
-        async fn set_map(&self, m: ClusterMap) -> Result<u64, Failure> {
-            self.world.borrow_mut().set_map(self.writer, m)
+        async fn set_map(&self, m: ClusterMap) -> Result<promote::Set, Failure> {
+            let version = self.world.borrow_mut().set_map(self.writer, m)?;
+            let world = self.world.borrow();
+            let at = |j: usize| {
+                let m = &world.nodes[j].map;
+                (m.writer_term, m.map_version)
+            };
+            let held = (0..NODES).filter(|&j| at(j) == at(self.writer)).count();
+            Ok(promote::Set { version, held })
+        }
+
+        fn now(&self) -> u64 {
+            self.world.borrow().nodes[self.writer].clock.now()
+        }
+
+        async fn survey(
+            &self,
+            _wait: Duration,
+        ) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
+            let world = self.world.borrow();
+            Ok((0..NODES)
+                .map(|j| {
+                    let st = world.reach(self.writer, j).then(|| world.status(j));
+                    (id(j), st)
+                })
+                .collect())
         }
 
         async fn stamp(&self, id: &str, req: StampRequest) -> Result<(), Failure> {

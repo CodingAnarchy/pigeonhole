@@ -391,6 +391,72 @@ fn a_cut_off_owners_follow_stream_ends_with_its_lease() {
     super::super::cut_node(&dirs[2], &c_at, &dirs, false);
 }
 
+/// #2162 item 4, feed1248's point 2 on #2184: a planned promote fences its owner again only
+/// when the operator fenced it. c, cut off from its peers, is fenced without its lease (as
+/// awaiting its peers' map, or for its lapsed lease): the promote goes on, and says its
+/// count is a lower bound for that reason.
+#[test]
+fn a_planned_promotion_from_an_owner_fenced_without_its_lease_counts_a_lower_bound() {
+    use crate::serve::proto::{FenceReason, LocalPartitionState, StatusRequest};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (_stops, ports) = three_leased(&rt, &dirs);
+    let c_at = format!("127.0.0.1:{}", ports[2]);
+    rt.block_on(async {
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's replica of p3 to follow c", async || {
+            copy_of(ports[0], "p3").await.is_some_and(|lp| {
+                lp.replica_state() == ReplicaState::Following && lp.replica_lag_ms < 1000
+            })
+        })
+        .await;
+        super::super::cut_node(&dirs[2], &c_at, &dirs, true);
+        eventually_why(
+            Duration::from_secs(10),
+            "c's p3 to be fenced without its lease, not by the operator",
+            async || {
+                let r = client(ports[2])
+                    .await
+                    .status(StatusRequest::default())
+                    .await
+                    .map_err(|s| format!("c's status: {s:?}"))?;
+                let lp = r
+                    .into_inner()
+                    .partitions
+                    .into_iter()
+                    .find(|lp| lp.id == "p3");
+                match lp {
+                    Some(lp)
+                        if lp.state() == LocalPartitionState::Fenced
+                            && lp.fence_reason() != FenceReason::Operator =>
+                    {
+                        Ok(())
+                    }
+                    other => Err(format!("c's p3: {other:?}")),
+                }
+            },
+        )
+        .await;
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits_counted"].as_str().is_some_and(
+                |s| s.starts_with("a lower bound: the owner's fence isn't the operator's")
+            ),
+            "{:?}",
+            r.document
+        );
+    });
+    super::super::cut_node(&dirs[2], &c_at, &dirs, false);
+}
+
 /// Design test 2: a move of p3 with its files (`phdb cluster move`) keeps its history, so
 /// a's follower resumes from its token on the new owner, b, with no second bootstrap, and
 /// applies the writes made there.
@@ -825,6 +891,14 @@ fn a_planned_promotion_makes_the_replica_the_owner() {
         .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
         assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        // A closed owner streams nothing, so the count is a lower bound (#2162 item 4).
+        assert!(
+            r.document["lost_commits_counted"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("a lower bound: the owner was closed")),
+            "{:?}",
+            r.document
+        );
         // The promote waited for a to serve p3 (#2035): a read on a at once, no retry.
         let (value, _, _) = read_through(ports[1], "k2", None, None).await.unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
@@ -849,6 +923,58 @@ fn a_planned_promotion_makes_the_replica_the_owner() {
         .await
         .unwrap();
         assert!(again.document.contains_key("done"), "{:?}", again.document);
+    });
+}
+
+/// #2162 item 4: with the owner fenced (not closed) it still streams, so the promote waits
+/// for the copy to hear it after the fence. A write just before the fence, which the copy
+/// may not have had when the promote began, is applied, and the loss is counted exactly.
+/// The write is `Buffered` (feed1248's S1 on #2184): the owner's feed reports it durable
+/// only at its background sync, which the fence waits for, so its durable frontier is
+/// final once the fence answers.
+#[test]
+fn a_planned_promotion_from_a_fenced_owner_counts_the_loss_exactly() {
+    use crate::serve::proto::{Durability, MutateRequest, PartitionRequest};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, dbs) = following(&rt);
+    rt.block_on(async {
+        let mut w = put_row("k2", "v");
+        w.row.as_mut().unwrap().table = "r".into();
+        data(ports[1])
+            .await
+            .mutate(MutateRequest {
+                writes: Some(w),
+                durability: Durability::Buffered as i32,
+            })
+            .await
+            .unwrap();
+        let req = PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req).await.unwrap();
+        // c's p3 (`dbs[2]`): nothing it answered is still held from its feed.
+        let (frontier, visible) = (dbs[2].replication_frontier(), dbs[2].visible_seqno());
+        assert!(frontier >= visible, "{frontier} < {visible}");
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits_counted"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("exact")),
+            "{:?}",
+            r.document
+        );
+        assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        let (value, _, _) = read_through(ports[1], "k2", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
     });
 }
 
@@ -912,6 +1038,17 @@ fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
     });
     let _ = stops.remove(2).send(());
     rt.block_on(stopped(ports[2]));
+    // A stopped process renews nothing. This rig's node c keeps its lease task while the
+    // process lives, so its outbound calls are cut as well: the promote waits out the
+    // others' grants to it, which a renewing owner would keep live (#2152).
+    let down: Vec<_> = [ports[0], ports[1]]
+        .iter()
+        .map(|p| (dirs[2].clone(), format!("127.0.0.1:{p}")))
+        .collect();
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(down.clone());
     rt.block_on(async {
         let r = within(super::super::promote::promote(
             &args_at(ports[0]),
@@ -934,6 +1071,10 @@ fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
         let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
     });
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|e| !down.contains(e));
 }
 
 /// S4 (D328 PR 3): a move of p3 onto a, which holds p3's replica, takes a out of p3's
@@ -1008,6 +1149,68 @@ fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
         let (node, epoch, history, _) = placed(ports[1], "p3").await;
         assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
         // The promote waited for a to serve p3 (#2035): read at once, no retry.
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// #2156: a promotion that stopped between the copy's promote and its identity (a crash
+/// there) leaves a primary at the copy's bootstrap epoch, with the promote's intent beside
+/// it. Without that intent the file is refused, as one the map moved past; with it, the
+/// rerun writes the identity and finishes.
+#[test]
+fn a_promotion_stopped_between_its_promote_and_its_identity_finishes_when_run_again() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::stamp::STOP_AFTER_PROMOTE
+            .lock()
+            .unwrap()
+            .push(dirs[0].clone());
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("stopped");
+        assert!(
+            e.message()
+                .contains("between the copy's promote and its identity"),
+            "{}",
+            e.message()
+        );
+        let (node, epoch, _, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1), "the map didn't move");
+        let intent = super::super::stamp::promote_intent(&dirs[0], "p3");
+        assert!(intent.exists(), "{}", intent.display());
+        // Without its intent, the primary at the bootstrap epoch is refused.
+        let aside = intent.with_extension("aside");
+        std::fs::rename(&intent, &aside).unwrap();
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("refused");
+        assert!(e.message().contains("already a primary"), "{}", e.message());
+        std::fs::rename(&aside, &intent).unwrap();
+        let r = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let (node, epoch, history, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        assert!(!intent.exists(), "the intent is removed once done");
         let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
     });

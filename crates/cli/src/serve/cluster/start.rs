@@ -342,8 +342,11 @@ pub(crate) fn run(
     // A node that restarts with a map takes a newer one from its peers, then pushes; and
     // D329's resolver starts once it serves, as do the range moves it follows as a target
     // (D331 PR 4b), each from its progress rows.
-    let resolver =
-        spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let resolver = spanning::start_resolver(
+        Arc::downgrade(&shared),
+        shared.limits.txn_resolve_delay,
+        spanning::sweep_every(shared.limits.txn_outcome_retention),
+    );
     let sync = start_sync(&node, version);
     let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {

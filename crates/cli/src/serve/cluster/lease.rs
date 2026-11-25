@@ -23,7 +23,7 @@
 //! grantor records that term durably before it answers, and from then refuses any lower
 //! term's writer, lease or map (the term fence, D330 amendment 1's M1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -128,6 +128,14 @@ pub(crate) struct Grants {
     /// Each partition's last grant here (D330 PR 2), by partition id: never dropped when it
     /// ends, only replaced by the next. Locked after `by_holder`, never before.
     last: Mutex<BTreeMap<String, LastGrant>>,
+    /// The pending promotes (partition, epoch) this node has logged a withheld grant for
+    /// (#2152), so it logs each once. A leaf lock, taken under `by_holder`.
+    withheld_logged: Mutex<BTreeSet<(String, u64)>>,
+    /// Each partition's last lease ask withheld here for a pending promote (#2152): the
+    /// holder, its epoch, and when, on this node's clock. The writer abandons such a promote
+    /// once its owner asks so and answers waiting, its proof that the owner runs its rounds
+    /// again. A leaf lock, taken under `by_holder`.
+    withheld_asks: Mutex<BTreeMap<String, (String, u64, u64)>>,
 }
 
 impl Grants {
@@ -143,6 +151,52 @@ impl Grants {
             voted: Mutex::new(0),
             writer_until: Mutex::new(started.saturating_add(nanos(grace(lease)))),
             last: Mutex::new(BTreeMap::new()),
+            withheld_logged: Mutex::new(BTreeSet::new()),
+            withheld_asks: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Whether `holder` asked this node for partition `id`'s lease at `epoch`, withheld for
+    /// a pending promote (#2152), at or after `since` on this node's clock.
+    pub(crate) fn asked_withheld_since(
+        &self,
+        id: &str,
+        holder: &str,
+        epoch: u64,
+        since: u64,
+    ) -> bool {
+        self.withheld_asks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .is_some_and(|(h, e, at)| h == holder && *e == epoch && *at >= since)
+    }
+
+    /// Records `owner`'s ask for P's lease at `epoch`, withheld at `now` for pending promote
+    /// `e`, and logs it once per pending promote.
+    fn withhold(
+        &self,
+        partition: &str,
+        owner: &str,
+        epoch: u64,
+        now: u64,
+        e: &super::proto::FailoverEvent,
+    ) {
+        self.withheld_asks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(partition.to_owned(), (owner.to_owned(), epoch, now));
+        let fresh = self
+            .withheld_logged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((partition.to_owned(), e.to_epoch));
+        if fresh {
+            eprintln!(
+                "phdb serve: withholding partition {partition}'s lease from its owner, node \
+                 {owner}: a promote of it to node {} at epoch {} is pending in the map (#2152)",
+                e.to, e.to_epoch
+            );
         }
     }
 
@@ -350,9 +404,20 @@ impl Grants {
                     });
                 writer || candidate
             } else {
+                // Not while the map holds a pending promote of P away from it (#2152): an
+                // owner that comes back mid-promote must take no write the promoted copy
+                // would lose. The promote finishes, or the writer abandons it once the owner
+                // answers waiting for this lease.
                 mine.partitions
                     .iter()
-                    .any(|p| p.id == *partition && p.node == req.node_id && p.epoch == *epoch)
+                    .find(|p| p.id == *partition && p.node == req.node_id && p.epoch == *epoch)
+                    .is_some_and(|p| match super::promote::pending_promote(mine, p) {
+                        Some(e) => {
+                            self.withhold(partition, &req.node_id, *epoch, now, e);
+                            false
+                        }
+                        None => true,
+                    })
             };
             if !given {
                 continue;
@@ -673,6 +738,48 @@ mod tests {
         let g = Grants::new(Arc::clone(&clock), lease);
         clock.advance(grace(lease));
         (g, clock)
+    }
+
+    #[test]
+    fn an_owner_gets_no_lease_while_the_map_holds_a_pending_promote_of_its_partition() {
+        // #2152: a failover's first map records the promote pending; an owner that comes
+        // back then must take no write the promoted copy would lose.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let mut v1 = map(1, &[("p1", "a", 3), ("p2", "a", 1)]);
+        let mut e = super::super::proto::FailoverEvent {
+            partition: "p1".into(),
+            from: "a".into(),
+            to: "b".into(),
+            to_epoch: 4,
+            ..Default::default()
+        };
+        e.set_kind(super::super::proto::FailoverKind::Partition);
+        e.set_state(super::super::proto::FailoverState::Pending);
+        v1.failovers.push(e.clone());
+        let r = grant(&g, &v1, &ask("a", 1, 1, &[("p1", 3), ("p2", 1)]));
+        assert_eq!(granted(&r), ["p2"], "{r:?}");
+        // The ask is kept, for the writer's proof that the owner is back.
+        assert!(g.asked_withheld_since("p1", "a", 3, 0));
+        assert!(!g.asked_withheld_since("p1", "a", 2, 0));
+        assert!(!g.asked_withheld_since("p2", "a", 1, 0));
+        // Abandoned (the owner came back), it's granted again.
+        let mut v2 = v1.clone();
+        v2.map_version = 2;
+        v2.failovers[0].set_state(super::super::proto::FailoverState::Abandoned);
+        let r = grant(&g, &v2, &ask("a", 2, 2, &[("p1", 3), ("p2", 1)]));
+        assert_eq!(granted(&r), ["p1", "p2"], "{r:?}");
+        // A pending promote at or below the epoch (a finished one's leftover) withholds
+        // nothing, nor does one from another node.
+        let mut v3 = v1.clone();
+        v3.map_version = 3;
+        v3.failovers[0].to_epoch = 3;
+        let r = grant(&g, &v3, &ask("a", 3, 3, &[("p1", 3)]));
+        assert_eq!(granted(&r), ["p1"], "{r:?}");
+        let mut v4 = v1.clone();
+        v4.map_version = 4;
+        v4.failovers[0].from = "c".into();
+        let r = grant(&g, &v4, &ask("a", 4, 4, &[("p1", 3)]));
+        assert_eq!(granted(&r), ["p1"], "{r:?}");
     }
 
     #[test]

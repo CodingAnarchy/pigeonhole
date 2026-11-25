@@ -1148,6 +1148,11 @@ impl Replica {
             }
             let failed = match halt {
                 Halt::Stopped => return,
+                // Defensive (#2162 item 3): a stop seen before a bootstrap or a pause ends here.
+                // Nothing between follow's selects and here consumes one today, so their own
+                // `changed()` would fire; this keeps a stop from being waited out if that
+                // changes.
+                _ if *stop.borrow() => return,
                 Halt::Expired(why) => {
                     self.fail(State::ReBootstrapping, why);
                     match self.bootstrap(on, &mut stop).await {
@@ -1160,6 +1165,10 @@ impl Replica {
             };
             if let Some(e) = failed {
                 self.fail(State::Retrying, e);
+            }
+            // The same before the pause (defensive, as above).
+            if *stop.borrow() {
+                return;
             }
             let woken = tokio::select! {
                 () = tokio::time::sleep(backoff) => false,
@@ -1293,7 +1302,13 @@ impl Replica {
             drop(s);
             return Halt::Expired(why);
         }
-        let channel = match self.connect().await {
+        // A dial to an owner that doesn't answer may take its whole connect timeout: a stop
+        // ends it (#2162 item 3). Nothing has happened yet to finish first.
+        let connected = tokio::select! {
+            c = self.connect() => c,
+            _ = stop.changed() => return Halt::Stopped,
+        };
+        let channel = match connected {
             Ok(c) => c,
             Err(e) => return Halt::Failed(e),
         };
@@ -1316,19 +1331,29 @@ impl Replica {
         self.set_state(State::Following);
         let mut run = Run::default();
         let mut peeked = None;
+        // When a read last had to wait: the queue was empty then, so a message read without
+        // waiting was made after the one read then. It's stamped with that time, not when
+        // the loop got to it after an apply or a stall (#2162 item 1: a stall of D made a
+        // copy look D fresher than it was).
+        let mut waited_at = Instant::now();
         loop {
-            let next = match peeked.take() {
-                Some(m) => m,
-                None => tokio::select! {
-                    m = stream.message() => m,
-                    _ = stop.changed() => {
-                        // Promote or shutdown: what arrived is applied first.
-                        return match self.apply_run(&db, &mut run).await {
-                            Ok(()) => Halt::Stopped,
-                            Err(halt) => halt,
-                        };
-                    }
-                },
+            let queued = peeked.take().or_else(|| ready(&mut stream));
+            let (next, at) = match queued {
+                Some(m) => (m, waited_at),
+                None => {
+                    let m = tokio::select! {
+                        m = stream.message() => m,
+                        _ = stop.changed() => {
+                            // Promote or shutdown: what arrived is applied first.
+                            return match self.apply_run(&db, &mut run).await {
+                                Ok(()) => Halt::Stopped,
+                                Err(halt) => halt,
+                            };
+                        }
+                    };
+                    waited_at = Instant::now();
+                    (m, waited_at)
+                }
             };
             let batch = match next {
                 Ok(Some(b)) => b,
@@ -1340,7 +1365,7 @@ impl Replica {
             {
                 let mut s = self.status();
                 s.primary_seqno = s.primary_seqno.max(batch.primary_seqno);
-                s.heard(batch.primary_seqno, Instant::now());
+                s.heard(batch.primary_seqno, at);
             }
             let quiet = batch.events.is_empty();
             for bytes in &batch.events {

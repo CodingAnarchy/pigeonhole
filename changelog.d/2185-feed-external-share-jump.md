@@ -1,0 +1,2 @@
+### Fixed
+- **A far-behind change-feed reader no longer expires over a spanning transaction's share** (#2180). On a `phdb serve` cluster partition with two or more shards, a reader more than its read-ahead budget behind could pass over the decision of a spanning transaction's share it was holding, drop the share as aborted, and then expire with "history has a gap" though nothing was lost. Such a share is now read again with its decision.
