@@ -2573,6 +2573,74 @@ fn a_source_cut_off_at_the_hand_over_stops_serving_before_the_target_serves() {
     let _ = (&t.db_a, &t.db_b);
 }
 
+/// #2154: a move whose source's node is down after the hand-over goes on with the nodes
+/// that answer. Before, the driver stopped on every run at the unreachable side. Now
+/// HANDED_OVER takes `never_both`'s majority path (the source's lease ended on the majority)
+/// and sets CLEANING, which then waits for the source's drop, said as such, rather than
+/// failing. A failover of the source is no longer held by the record past its commit point.
+#[test]
+fn a_move_whose_source_is_down_after_the_hand_over_goes_on_to_cleaning() {
+    let mut t = three();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    let args = super::backup::args(a);
+    let id = t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, &format!("n{i:02}"), "0").await.unwrap();
+        }
+        let spec = super::super::range_move::Spec {
+            table: "users".into(),
+            from: "p2".into(),
+            to: "p1".into(),
+            start: None,
+            end: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandedOver));
+        let stopped =
+            super::super::range_move::run(&args, &spec, Some(Duration::from_secs(120)), true).await;
+        assert!(stopped.is_err(), "the move ran past HANDED_OVER");
+        client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .moves[0]
+            .id
+            .clone()
+    });
+    // b, the source's node, goes down for good.
+    let _ = t._stops.swap_remove(1).send(());
+    t.rt.block_on(async {
+        eventually("b to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", b))
+                .await
+                .is_err()
+        })
+        .await;
+        let waited =
+            super::super::range_move::resume(&args, &id, Some(Duration::from_secs(30))).await;
+        let e = waited.expect_err("the move ended with its source's node down");
+        assert!(
+            e.message().contains("doesn't answer"),
+            "it waits for the source's drop, not on the unreachable node: {}",
+            e.message()
+        );
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(super::super::map::phase(&m.moves[0]), MovePhase::Cleaning);
+        assert_eq!(super::super::promote::range_move_holds(&m, "p2"), None);
+        assert_eq!(get_row(a, "n05").await.unwrap(), Some(b"0".to_vec()));
+    });
+    let _ = (&t.db_a, &t.db_b);
+}
+
 /// D331 PR 5 (audit120's point 1, simp724's case): a split's create whose COPYING change
 /// never lands leaves a marked, empty file no map places. The node moves it aside only once
 /// it holds a map past the version the change would have carried; a map at that version

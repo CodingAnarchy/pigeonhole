@@ -1595,3 +1595,108 @@ fn a_moves_rows_reach_the_copies_of_both_its_sides() {
         .await;
     });
 }
+
+/// #2154 (the coordinator's ruling): a target's failover past its move's commit point goes
+/// only to a replica copy that provably holds the copied range. A copy of the target reports,
+/// in `Status`, what its own progress rows show: the copy done, and the source's seqno the
+/// catch-up passed. The target writes those rows in the commits that carry the data, so
+/// `target_copy_holds` accepts a copy caught up through the move's `final_seqno`, and
+/// refuses one short of it.
+#[test]
+fn a_targets_copy_reports_its_moves_progress_from_its_own_rows() {
+    use crate::serve::proto::{MoveKind, MovePhase, RangeMove, SplitKey, split_key};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    let key = |s: &str| SplitKey {
+        key: Some(split_key::Key::Text(s.into())),
+    };
+    rt.block_on(async {
+        let (a, c) = (ports[0], ports[2]);
+        // c holds a copy of p2 (b's), the move's target.
+        set_replicas(a, "p2", &["c"]).await;
+        eventually_within(
+            Duration::from_secs(30),
+            "c's replica of p2 to follow b",
+            async || {
+                copy_of(c, "p2")
+                    .await
+                    .is_some_and(|lp| lp.replica_state() == ReplicaState::Following)
+            },
+        )
+        .await;
+        put_after_move(a, "r", "zz").await;
+        // `r` from "m" on, from p3 (c's) into p2: copied, then caught up.
+        step(a, &|m, _| {
+            m.moves.push(RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "r".into(),
+                start: Some(key("m")),
+                end: None,
+                from: "p3".into(),
+                to: "p2".into(),
+                phase: MovePhase::Copying as i32,
+                ..Default::default()
+            });
+        })
+        .await;
+        let source = put_after_move(a, "r", "zy").await;
+        // The owner's follower first: b copies and catches up past the write.
+        let owner = async || {
+            client(ports[1])
+                .await
+                .status(StatusRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .into_iter()
+                .find(|lp| {
+                    lp.id == "p2" && lp.role() != crate::serve::proto::PartitionRole::Replica
+                })
+                .and_then(|lp| lp.moves.into_iter().find(|s| s.id == "mv1"))
+        };
+        eventually_within(
+            Duration::from_secs(60),
+            "b's follower to copy mv1 and catch up past the write",
+            async || {
+                owner()
+                    .await
+                    .is_some_and(|s| s.copy_done && s.source_applied_seqno >= source)
+            },
+        )
+        .await;
+        let shown = async || {
+            copy_of(c, "p2")
+                .await
+                .and_then(|lp| lp.moves.into_iter().find(|s| s.id == "mv1"))
+        };
+        eventually_within(
+            Duration::from_secs(60),
+            "c's copy of p2 to show mv1's copy done and caught up past the write",
+            async || {
+                shown()
+                    .await
+                    .is_some_and(|s| s.copy_done && s.source_applied_seqno >= source)
+            },
+        )
+        .await;
+        let row = copy_of(c, "p2").await.unwrap();
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.moves[0].phase = MovePhase::HandedOver as i32;
+        m.moves[0].final_seqno = source;
+        assert_eq!(
+            super::super::promote::target_copy_holds(&m, "p2", &row),
+            Ok(())
+        );
+        // A final seqno the copy hasn't passed: no.
+        m.moves[0].final_seqno = shown().await.unwrap().source_applied_seqno + 1_000;
+        assert!(super::super::promote::target_copy_holds(&m, "p2", &row).is_err());
+        step(a, &|m, _| m.moves.clear()).await;
+    });
+}

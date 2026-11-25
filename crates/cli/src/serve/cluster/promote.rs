@@ -382,23 +382,58 @@ fn wall_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Why `partition` can't fail over or be promoted in `m`, if a range move (D331) naming it,
-/// as its source or its target, is at HANDING_OVER or past it: the move only goes on from
-/// there, on the epochs it recorded (the coordinator's ruling).
+/// Why `partition` can't fail over or be promoted in `m` at all now, if a range move (D331)
+/// naming it, as its source or its target, is at HANDING_OVER: its fence and hand-over
+/// run on the epochs it recorded, and #2160 bounds the phase. Past the commit point it no
+/// longer holds the source (the coordinator's ruling on #2154): a promoted copy of S takes
+/// the record with it, serves none of the handed-over range by the map, and drops its copy
+/// at CLEANING. The target, past it, may move only to a copy that holds the copied range
+/// ([`target_copy_holds`]).
 pub(crate) fn range_move_holds(m: &proto::ClusterMap, partition: &str) -> Option<String> {
     let r = m.moves.iter().find(|r| {
         !super::map::node_move(r)
             && (r.from == partition || r.to == partition)
-            && super::map::handing_over_or_past(super::map::phase(r))
+            && super::map::phase(r) == proto::MovePhase::HandingOver
     })?;
     Some(format!(
-        "range move {} of table {:?} ({} to {}) is at {:?}, past where it can abort: let it          finish (phdb cluster move-range, or its split, run again), then promote",
-        r.id,
-        r.table,
-        r.from,
-        r.to,
-        super::map::phase(r)
+        "range move {} of table {:?} ({} to {}) is at its hand-over (HANDING_OVER): let it \
+         finish or abort (phdb cluster move-range, or --abort {}), then promote",
+        r.id, r.table, r.from, r.to, r.id
     ))
+}
+
+/// Whether replica copy `row` of `partition` may be promoted, or taken by a failover, under
+/// `m`'s range moves into it past their commit point (#2154, the coordinator's ruling):
+/// the range is the target's from HANDED_OVER, and the copy must provably hold all of it.
+/// It does when its file shows the move's copy done and its catch-up past the source's
+/// `final_seqno` (`Status` reads both from the copy's own progress rows, which the
+/// target's commits carry with the copied data, so a replica that applied them holds the
+/// data too). Otherwise the target stays where it is until the move ends.
+pub(crate) fn target_copy_holds(
+    m: &proto::ClusterMap,
+    partition: &str,
+    row: &proto::LocalPartition,
+) -> Result<(), String> {
+    for r in m.moves.iter().filter(|r| {
+        !super::map::node_move(r)
+            && r.to == partition
+            && super::map::committed(super::map::phase(r))
+    }) {
+        let shown = row.moves.iter().find(|s| s.id == r.id);
+        if !shown.is_some_and(|s| s.copy_done && s.source_applied_seqno >= r.final_seqno) {
+            return Err(format!(
+                "range move {} gave {partition} a range of table {:?} (past its hand-over), \
+                 and this copy can't be shown to hold all of it (copy done: {}, caught up \
+                 through {} of {}): {partition} stays on its owner until the move ends",
+                r.id,
+                r.table,
+                shown.is_some_and(|s| s.copy_done),
+                shown.map_or(0, |s| s.source_applied_seqno),
+                r.final_seqno
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Promotes node `to`'s copy of `partition` in `m` (D328 PR 3, with D330 PR 2's pending
@@ -446,6 +481,11 @@ pub(crate) async fn run(
     };
     let replica = row.role() == proto::PartitionRole::Replica;
     let stamped = !replica && row.epoch == target;
+    // #2154: a copy taking over a range move's target must hold the copied range. A stamped
+    // copy passed this before its stamp.
+    if replica && let Err(why) = target_copy_holds(m, partition, &row) {
+        return Err(Failure::usage(&why));
+    }
     // The copy's identity epoch, the owner's at its bootstrap (`e_b`, D328's amendment): its
     // history began at or before it, and the map's epoch is at or past it.
     let e_b = row.epoch;
@@ -759,8 +799,12 @@ mod tests {
     /// ([`run`] checks it first and again before its map). Before it (and ABORTING) the move
     /// aborts on an epoch change instead; a NODE move and another partition's don't count.
     #[test]
-    fn a_range_move_from_its_hand_over_holds_both_its_partitions() {
-        use proto::{MoveKind, MovePhase as P, RangeMove};
+    fn a_range_move_holds_both_its_partitions_only_at_its_hand_over() {
+        // #2154 (the coordinator's ruling): HANDING_OVER holds both. Past the commit point the
+        // source may go, and the target only to a copy holding the range
+        // (`target_copy_holds`). Before it, the move aborts on an epoch change instead. A
+        // NODE move and another partition's don't count.
+        use proto::{MoveKind, MovePhase as P, MoveStatus, RangeMove};
         let with = |phase: P, kind: MoveKind| {
             let mut m = with_p3(5);
             let mut r = RangeMove {
@@ -769,25 +813,64 @@ mod tests {
                 table: "t".into(),
                 from: "p3".into(),
                 to: "p4".into(),
+                final_seqno: 40,
                 ..Default::default()
             };
             r.set_phase(phase);
             m.moves.push(r);
             m
         };
-        for phase in [P::HandingOver, P::HandedOver, P::Cleaning] {
-            let m = with(phase, MoveKind::Range);
-            for p in ["p3", "p4"] {
-                let why = range_move_holds(&m, p).unwrap_or_else(|| panic!("{phase:?} {p}"));
-                assert!(why.contains("range move mv1"), "{why}");
-            }
-            assert_eq!(range_move_holds(&m, "p9"), None);
-            assert_eq!(range_move_holds(&with(phase, MoveKind::Node), "p3"), None);
+        let m = with(P::HandingOver, MoveKind::Range);
+        for p in ["p3", "p4"] {
+            let why = range_move_holds(&m, p).unwrap_or_else(|| panic!("{p}"));
+            assert!(why.contains("range move mv1"), "{why}");
         }
-        for phase in [P::Copying, P::CatchingUp, P::Aborting] {
+        assert_eq!(range_move_holds(&m, "p9"), None);
+        assert_eq!(
+            range_move_holds(&with(P::HandingOver, MoveKind::Node), "p3"),
+            None
+        );
+        for phase in [
+            P::Copying,
+            P::CatchingUp,
+            P::Aborting,
+            P::HandedOver,
+            P::Cleaning,
+        ] {
             let m = with(phase, MoveKind::Range);
             assert_eq!(range_move_holds(&m, "p3"), None, "{phase:?}");
             assert_eq!(range_move_holds(&m, "p4"), None, "{phase:?}");
+        }
+        // The target past the commit point: only a copy whose own rows show the copy done
+        // and caught up through `final_seqno`.
+        let row = |done: bool, applied: u64| proto::LocalPartition {
+            id: "p4".into(),
+            moves: vec![MoveStatus {
+                id: "mv1".into(),
+                copy_done: done,
+                source_applied_seqno: applied,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for phase in [P::HandedOver, P::Cleaning] {
+            let m = with(phase, MoveKind::Range);
+            assert!(
+                target_copy_holds(&m, "p4", &row(true, 40)).is_ok(),
+                "{phase:?}"
+            );
+            assert!(target_copy_holds(&m, "p4", &row(true, 39)).is_err());
+            assert!(target_copy_holds(&m, "p4", &row(false, 40)).is_err());
+            assert!(target_copy_holds(&m, "p4", &proto::LocalPartition::default()).is_err());
+            // The source's copies, and another partition's, need nothing.
+            assert!(target_copy_holds(&m, "p3", &proto::LocalPartition::default()).is_ok());
+        }
+        for phase in [P::Copying, P::CatchingUp, P::HandingOver, P::Aborting] {
+            let m = with(phase, MoveKind::Range);
+            assert!(
+                target_copy_holds(&m, "p4", &proto::LocalPartition::default()).is_ok(),
+                "{phase:?}: before the commit point the target's copy isn't the range's"
+            );
         }
     }
 

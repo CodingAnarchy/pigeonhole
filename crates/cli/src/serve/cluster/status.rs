@@ -96,6 +96,19 @@ impl Node {
                     .ok()
                     .and_then(|part| identity::read(&part.db).ok().flatten())
                     .map_or(0, |id| id.epoch);
+                // #2154: a range move into the partition, as this copy's own progress rows
+                // show it, so failover and promote can tell whether the copy holds the range.
+                if let (Some(m), Ok(part)) = (&map, copy.service.part()) {
+                    lp.moves = crate::serve::ranges::statuses(m, &named)
+                        .into_iter()
+                        .filter(|s| !s.source)
+                        .map(|mut s| {
+                            (s.copy_done, s.source_applied_seqno) =
+                                super::range_follow::shown(&part.db, &s.id);
+                            s
+                        })
+                        .collect();
+                }
                 lp.ok = c.state != proto::ReplicaState::Behind
                     && c.state != proto::ReplicaState::OwnerFeedOff;
                 lp.error = if lp.ok { String::new() } else { c.last_error };
@@ -259,8 +272,11 @@ impl Node {
                     }
                 }
             }
-            // D331: the moves naming it (the follower's lag comes with PR 4's follower).
-            if let Some(m) = &map {
+            // D331: the moves naming it (the follower's lag comes with PR 4's follower). A
+            // replica copy's row has them already, from its own progress rows (#2154, #2173).
+            if let Some(m) = &map
+                && lp.role != proto::PartitionRole::Replica as i32
+            {
                 lp.moves = crate::serve::ranges::statuses(m, &id);
                 // PR 4b: a source whose move's retention hold lapsed; a target's follower.
                 if let Some(copies) = self.range_copies() {

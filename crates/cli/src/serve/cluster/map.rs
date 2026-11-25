@@ -287,13 +287,6 @@ pub(crate) fn before_commit(p: MovePhase) -> bool {
     )
 }
 
-/// From the hand-over on: HANDING_OVER and every phase after it in the order. Never
-/// ABORTING. Neither partition of a range move here fails over or is promoted (the
-/// coordinator's ruling): before it, the move aborts on an epoch change instead.
-pub(crate) fn handing_over_or_past(p: MovePhase) -> bool {
-    p == MovePhase::HandingOver || committed(p)
-}
-
 /// The target follows the range from the source, and the source serves its copy and feed:
 /// COPYING through HANDED_OVER. Never ABORTING.
 pub(crate) fn follows(p: MovePhase) -> bool {
