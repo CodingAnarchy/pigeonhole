@@ -1338,6 +1338,9 @@ mod model {
                 writer_term: n.grants.term_floor(&n.map),
                 partitions,
                 grants: n.grants.granted(),
+                grace_remaining_ms: u64::try_from(n.grants.grace_remaining().as_millis())
+                    .unwrap_or(u64::MAX),
+                lease_ms: u64::try_from(LEASE.as_millis()).unwrap(),
                 ..NodeStatus::default()
             }
         }
@@ -1380,6 +1383,23 @@ mod model {
                 .collect();
             if !ids.is_empty() {
                 let _ = self.set_map(w, failover::abandoned(&map, &ids));
+                return;
+            }
+            // A pending promote whose owner came back and waits for the lease it withholds
+            // is abandoned too (#2152), as `maybe_fail_over` does.
+            let since = now.saturating_sub(nanos(LEASE));
+            let ready: Vec<Partition> = down
+                .iter()
+                .filter(|(p, _)| {
+                    let asked = n
+                        .grants
+                        .asked_withheld_since(&p.id, &p.node, p.epoch, since);
+                    failover::owner_ready(&map, p, &statuses, asked)
+                })
+                .map(|(p, _)| p.clone())
+                .collect();
+            if !ready.is_empty() {
+                let _ = self.set_map(w, failover::abandoned_for_owner(&map, &ready, &statuses));
                 return;
             }
             let Some((p, renewed, to)) = down.into_iter().find_map(|(p, renewed)| {
@@ -1713,8 +1733,32 @@ mod model {
             Ok(self.world.borrow().nodes[self.writer].map.clone())
         }
 
-        async fn set_map(&self, m: ClusterMap) -> Result<u64, Failure> {
-            self.world.borrow_mut().set_map(self.writer, m)
+        async fn set_map(&self, m: ClusterMap) -> Result<promote::Set, Failure> {
+            let version = self.world.borrow_mut().set_map(self.writer, m)?;
+            let world = self.world.borrow();
+            let at = |j: usize| {
+                let m = &world.nodes[j].map;
+                (m.writer_term, m.map_version)
+            };
+            let held = (0..NODES).filter(|&j| at(j) == at(self.writer)).count();
+            Ok(promote::Set { version, held })
+        }
+
+        fn now(&self) -> u64 {
+            self.world.borrow().nodes[self.writer].clock.now()
+        }
+
+        async fn survey(
+            &self,
+            _wait: Duration,
+        ) -> Result<HashMap<String, Option<NodeStatus>>, Failure> {
+            let world = self.world.borrow();
+            Ok((0..NODES)
+                .map(|j| {
+                    let st = world.reach(self.writer, j).then(|| world.status(j));
+                    (id(j), st)
+                })
+                .collect())
         }
 
         async fn stamp(&self, id: &str, req: StampRequest) -> Result<(), Failure> {

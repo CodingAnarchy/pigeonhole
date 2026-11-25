@@ -334,6 +334,7 @@ impl Node {
             partitions,
             divergent,
             grace_remaining_ms: millis(self.grants.grace_remaining()),
+            lease_ms: millis(self.grants.lease()),
             map_features: MAP_FEATURES
                 .iter()
                 .filter(|&&f| {
