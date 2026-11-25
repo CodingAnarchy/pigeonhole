@@ -1146,6 +1146,37 @@ pub(crate) fn newest_ts(db: &Pigeonhole, id: &str) -> Result<u64, ApiError> {
     Ok(stored_newest(&progress_table(db)?, id)?)
 }
 
+/// The newest of every `newest/<id>` row `db` holds, whatever their moves' state: 0 with
+/// none.
+pub(crate) fn newest_of_all(db: &Pigeonhole) -> Result<u64, ApiError> {
+    let t = progress_table(db)?;
+    let mut newest = 0;
+    for row in t.scan_prefix(b"newest/").family(FAMILY).iter()? {
+        let row = row?;
+        if let Some(ts) = row
+            .get(FAMILY, b"ts")
+            .and_then(|c| std::str::from_utf8(c.value()).ok()?.parse::<u64>().ok())
+        {
+            newest = newest.max(ts);
+        }
+    }
+    Ok(newest)
+}
+
+/// Raises `db`'s timestamp floor past `newest`, durably (#2153), when there is one: before
+/// a range a move copied here is served, so a write stamped here sorts after every cell
+/// the move wrote, whatever the two nodes' clocks. To `newest + 1`: a group's stamp may
+/// equal the floor (D271), and a tie with a copied cell would be ordered by seqno alone.
+/// A raise to a floor already past is a no-op, so a crash after it and before what it
+/// guards raises it again harmlessly.
+pub(crate) fn raise_floor(db: &Pigeonhole, newest: u64) -> Result<(), String> {
+    if newest > 0 {
+        db.raise_ts_floor(newest.saturating_add(1))
+            .map_err(|e| format!("raise the timestamp floor: {e}"))?;
+    }
+    Ok(())
+}
+
 /// The catch-up's token, once it has stored one.
 fn read_follow(db: &Pigeonhole, id: &str) -> Result<Option<Vec<u8>>, ApiError> {
     let t = progress_table(db)?;
