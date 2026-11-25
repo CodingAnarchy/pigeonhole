@@ -7902,8 +7902,10 @@ pub struct LocalPartition {
     pub load_device: f64,
     #[prost(double, tag = "31")]
     pub load: f64,
-    /// D332: the partition file's size here, from the file system (the database is one file,
-    /// WAL included), for the balancer. Open partitions only; 0 when closed.
+    /// D332: the bytes the partition's file holds here, for the balancer and a move's plan:
+    /// the file's length less the free space inside it (#2150, 1.3.1; before, its length,
+    /// which a split's cleanup or a large delete never shrank). Open partitions only; 0 when
+    /// closed.
     #[prost(uint64, tag = "32")]
     pub file_bytes: u64,
     /// D331 PR 6: on a partition the map places no range on (a merge emptied it), what still
