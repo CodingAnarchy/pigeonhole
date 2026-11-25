@@ -1150,6 +1150,34 @@ pub(crate) async fn serve_home(
         }
     };
     let buffered = g.wrote();
+    // #2157: once a `TxnWrite` or a `Commit` has sent rows to a branch, a client that goes
+    // away (its call dropped where it waits) must not leave the session open: its retry
+    // would send those rows again, and an increment would count twice. From the first row
+    // sent (`sent`), a dropped call ends the transaction, as a failed one does
+    // ([`Service::end_spanning`]): the branches are aborted and the session says so.
+    let sent = matches!(op, ServiceOp::TxnWrite(_) | ServiceOp::Commit(_)).then(|| {
+        let d = driver.clone();
+        g.end_if_dropped(Box::new(move |span| {
+            if let (Some(span), Ok(rt)) = (span, tokio::runtime::Handle::try_current()) {
+                let mut branches = span.branches(&d.home);
+                branches.extend(span.idle(&d.home));
+                let d = d.for_round();
+                rt.spawn(async move { d.abort(&branches).await });
+            }
+            ApiError::from_code(
+                pigeonhole::ErrorCode::Conflict,
+                "the transaction was ended before its commit point, and nothing of it was \
+                 committed: the call that sent its rows to other partitions was cancelled \
+                 part-way (its client went away or its deadline passed). Retry the \
+                 transaction",
+            )
+        }))
+    });
+    let arm = |on: bool| {
+        if let Some(sent) = &sent {
+            sent.store(on, std::sync::atomic::Ordering::Release);
+        }
+    };
     let Some(span) = g.span() else {
         return Err(ApiError::internal("a spanning id on a plain session"));
     };
@@ -1187,6 +1215,7 @@ pub(crate) async fn serve_home(
                 home.home_ranges(&mine, None)?;
             }
             driver.room(span, others.keys())?;
+            arm(!others.is_empty());
             for (p, rows) in others {
                 let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
                     txn_id: r.txn_id.clone(),
@@ -1201,6 +1230,15 @@ pub(crate) async fn serve_home(
                 span.parts.entry(driver.home.to_string()).or_default().wrote = true;
                 Service::buffer_rows(&mut g, &rows);
             }
+            #[cfg(test)]
+            if sent
+                .as_ref()
+                .is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire))
+            {
+                seams::at(&driver.xid, seams::Step::Forwarded).await;
+            }
+            // Every row is in, and nothing is left to wait for: the call answers.
+            arm(false);
             drop((g, budget));
             Ok(ServiceReply::Empty(proto::Empty {}))
         }
@@ -1223,6 +1261,9 @@ pub(crate) async fn serve_home(
             }
             driver.room(span, others.keys())?;
             let forwarded = !others.is_empty();
+            // Stays set until the commit takes the session (`TxnGuard::commit`), through
+            // `commit_spanning`'s own waits before that.
+            arm(forwarded);
             for (p, rows) in others {
                 let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
                     txn_id: r.txn_id.clone(),
@@ -1235,6 +1276,10 @@ pub(crate) async fn serve_home(
             }
             if !mine.is_empty() {
                 span.parts.entry(driver.home.to_string()).or_default().wrote = true;
+            }
+            #[cfg(test)]
+            if forwarded {
+                seams::at(&driver.xid, seams::Step::Forwarded).await;
             }
             let r = proto::TxnCommitRequest {
                 txn_id: r.txn_id,
@@ -1277,6 +1322,9 @@ pub(crate) mod seams {
         CommitPoint,
         /// Before the decides: the commit point committed, no branch decided.
         Decide,
+        /// In the home's `Commit` or `TxnWrite` call, once the rows it carried for branches
+        /// were sent and before the call goes on (#2157): a client that goes away here.
+        Forwarded,
     }
 
     type Waiting = (Arc<Notify>, oneshot::Receiver<bool>);
