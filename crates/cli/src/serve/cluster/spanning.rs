@@ -90,28 +90,46 @@ pub(crate) fn with_acks(value: &[u8], acked: &[String]) -> Option<Vec<u8>> {
 /// Whether decision row `value` may go at `now_ms` with `retention_ms` (D329 2b): an abort
 /// marker, or a commit every branch acknowledged, whose time is that far past.
 pub(crate) fn collectable(value: &[u8], now_ms: u64, retention_ms: u64) -> bool {
-    let Ok(text) = std::str::from_utf8(value) else {
+    let Some((head, mut lines)) = past_retention(value, now_ms, retention_ms) else {
         return false;
     };
-    let mut lines = text.lines();
-    let Some(head) = lines.next() else {
-        return false;
-    };
-    let Some(at) = head
-        .split(' ')
-        .find_map(|t| t.strip_prefix("at"))
-        .and_then(|t| t.parse::<u64>().ok())
-    else {
-        return false;
-    };
-    if at.saturating_add(retention_ms) > now_ms {
-        return false;
-    }
     match head.split(' ').next() {
         Some("aborted") => true,
         Some("committed") => lines.all(|l| l.starts_with('+')),
         _ => false,
     }
+}
+
+/// The branches a committed decision row `value` still names without their ack, once its
+/// time is `retention_ms` past at `now_ms` (#2098): the home's sweep asks each of them
+/// again. `None` for an abort marker, a row within retention, or one every branch acked.
+pub(crate) fn unacked(value: &[u8], now_ms: u64, retention_ms: u64) -> Option<Vec<String>> {
+    let (head, lines) = past_retention(value, now_ms, retention_ms)?;
+    if head.split(' ').next() != Some("committed") {
+        return None;
+    }
+    let waiting: Vec<String> = lines
+        .filter(|l| !l.starts_with('+'))
+        .map(str::to_owned)
+        .collect();
+    (!waiting.is_empty()).then_some(waiting)
+}
+
+/// Decision row `value`'s head and branch lines, if its time (`at<ms>`) is `retention_ms`
+/// past at `now_ms`.
+fn past_retention(
+    value: &[u8],
+    now_ms: u64,
+    retention_ms: u64,
+) -> Option<(&str, std::str::Lines<'_>)> {
+    let text = std::str::from_utf8(value).ok()?;
+    let mut lines = text.lines();
+    let head = lines.next()?;
+    let at = head
+        .split(' ')
+        .find_map(|t| t.strip_prefix("at"))
+        .and_then(|t| t.parse::<u64>().ok())?;
+    (at.saturating_add(retention_ms) <= now_ms).then_some((head, lines))
 }
 
 /// A `COMMITTED` decision row's value: `committed h<epoch> at<ms>`, then one line per branch,
@@ -435,6 +453,10 @@ impl Spanning {
     /// Owes `xid`'s home the ack of branch `partition`'s applied commit, due now (#2078).
     /// Past [`MAX_ACKS`] owed, it's dropped and said so: the home's record then stays.
     pub(crate) fn queue_ack(&self, xid: &str, partition: &str) {
+        #[cfg(test)]
+        if seams::ack_lost(xid) {
+            return;
+        }
         let mut acks = self.acks();
         if acks.len() >= MAX_ACKS && !acks.contains_key(&(xid.to_owned(), partition.to_owned())) {
             eprintln!(
@@ -557,6 +579,17 @@ pub(crate) fn is_branch(msg: &proto::ForwardRequest) -> bool {
         Some(Op::TxnGet(_) | Op::TxnGetRow(_) | Op::TxnWrite(_)) => !msg.partition.is_empty(),
         _ => false,
     }
+}
+
+/// Whether branch call `msg` is one of the nodes' own arms (prepare, decide, resolve), which
+/// act for the transaction, not for its client: no forwarded caller is checked or used for
+/// them, as `Cluster.Forward` already takes only a cluster-scope bearer (#2165). The resolver
+/// and the decision sweep send them as the cluster itself, with no client token.
+pub(crate) fn is_node_arm(msg: &proto::ForwardRequest) -> bool {
+    matches!(
+        msg.op,
+        Some(Op::BranchPrepare(_) | Op::BranchDecide(_) | Op::ResolveTxn(_))
+    )
 }
 
 /// The table and row of each row a transaction call on a branch names.
@@ -981,6 +1014,51 @@ impl Driver {
             .collect()
     }
 
+    /// The branches of `parts` that hold no share of this committed transaction in doubt
+    /// any more (#2098): each is sent the commit's decide again, which applies a share still
+    /// in doubt and answers at once for one that isn't, so any answer means it holds none
+    /// now. A partition the map no longer lists counts too: a merge removes one only once it
+    /// holds no share in doubt (D331 PR 6). One that doesn't answer doesn't count; the first
+    /// such refusal comes back beside the acked, for the sweep's log line.
+    pub(crate) async fn confirm(
+        &self,
+        parts: &[String],
+    ) -> (Vec<String>, Option<(String, ApiError)>) {
+        let (gone, listed): (Vec<String>, Vec<String>) = {
+            let routes = self.node.routes();
+            parts
+                .iter()
+                .cloned()
+                .partition(|p| routes.as_ref().is_some_and(|r| r.owner(p).is_none()))
+        };
+        let calls: Vec<_> = listed
+            .iter()
+            .map(|p| {
+                let (d, p) = (self.clone(), p.clone());
+                tokio::spawn(async move {
+                    let op = Op::BranchDecide(proto::BranchDecide {
+                        xid: d.xid.to_string(),
+                        commit: true,
+                        hold: 0,
+                        term: 0,
+                    });
+                    d.send(&p, op, true).await
+                })
+            })
+            .collect();
+        let mut done = gone;
+        let mut refused = None;
+        for (p, r) in joined(&listed, calls).await {
+            match r {
+                Ok(_) => done.push(p),
+                Err(e) => {
+                    refused.get_or_insert((p, e));
+                }
+            }
+        }
+        (done, refused)
+    }
+
     /// Releases the read-only holds in `held`, at once: whether every one lasted.
     pub(crate) async fn release(&self, held: &[Prepared]) -> bool {
         let names: Vec<String> = held.iter().map(|h| h.partition.clone()).collect();
@@ -1386,6 +1464,27 @@ pub(crate) mod seams {
         reached.notify_one();
         go.await.unwrap_or(false)
     }
+
+    static LOST_ACKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// A fault (#2098): the next ack owed for `xid` is lost, as a restart of the branch's
+    /// node loses its in-memory queue.
+    pub(crate) fn lose_ack(xid: &str) {
+        LOST_ACKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(xid.to_owned());
+    }
+
+    /// Whether `xid`'s ack is to be lost ([`lose_ack`]), once.
+    pub(crate) fn ack_lost(xid: &str) -> bool {
+        let mut lost = LOST_ACKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(i) = lost.iter().position(|x| x == xid) else {
+            return false;
+        };
+        lost.swap_remove(i);
+        true
+    }
 }
 
 /// The most acks a node keeps owing to transactions' homes (#2078): about a hundred bytes
@@ -1471,15 +1570,112 @@ where
     }
 }
 
+/// The most committed decision rows one sweep of a home asks its branches about again
+/// (#2098): the rest wait for the next sweep.
+const CONFIRM_PER_SWEEP: usize = 32;
+
+/// Home partition `home`'s committed decision rows past retention that some branch never
+/// acked (#2098): the ack was lost, to a restart of the branch's node while it was owed or
+/// to the home's own write failing after its decide round. Each such branch is sent the
+/// commit's decide again ([`Driver::confirm`]), and those that answer are recorded as
+/// acked, so the sweep that follows collects the row. A branch that doesn't answer keeps
+/// it, as it may still hold the share in doubt. Only on a partition this node holds leased.
+async fn confirm_unacked(
+    cluster: &super::super::router::Cluster,
+    home: &str,
+    service: &Arc<Service>,
+    timeout: Duration,
+    cursor: &mut HashMap<String, String>,
+) {
+    if !service.gate().is_some_and(|g| g.leased()) {
+        return;
+    }
+    let after = cursor.get(home).cloned();
+    let rows = match service
+        .unacked_decisions(now_ms(), CONFIRM_PER_SWEEP, after.as_deref())
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if e.code != "Fenced" {
+                eprintln!(
+                    "phdb serve: reading {home}'s unacked decision records: {}",
+                    e.message
+                );
+            }
+            return;
+        }
+    };
+    // The next sweep goes on after the last row asked, and starts over once none is left,
+    // so rows whose branch doesn't answer don't keep the others from being asked (audit120's
+    // S2 on #2164).
+    match rows.last() {
+        Some((xid, _)) => cursor.insert(home.to_owned(), xid.clone()),
+        None => cursor.remove(home),
+    };
+    // Every row at once, all within one request timeout, so a branch node that's down costs
+    // the resolver's pass one timeout, not one per row (audit120's S1 on #2164).
+    let mut set = tokio::task::JoinSet::new();
+    for (xid, waiting) in rows {
+        let d = cluster.sweep_driver(service, home, &xid);
+        set.spawn(async move {
+            let (acked, refused) = d.confirm(&waiting).await;
+            (xid, waiting.len(), acked, refused)
+        });
+    }
+    let mut answers = Vec::new();
+    let _ = tokio::time::timeout(timeout, async {
+        while let Some(done) = set.join_next().await {
+            if let Ok(done) = done {
+                answers.push(done);
+            }
+        }
+    })
+    .await;
+    set.abort_all();
+    let (mut asked, mut unanswered, mut first) = (0, 0, None);
+    for (xid, n, acked, refused) in answers {
+        asked += n;
+        unanswered += n - acked.len();
+        if let Some((p, e)) = refused {
+            first.get_or_insert(format!("partition {p} for {xid}: {}", e.message));
+        }
+        if let Err(e) = service.ack_decision(&xid, &acked).await
+            && e.code != "Fenced"
+        {
+            eprintln!(
+                "phdb serve: recording {home}'s branch acks for {xid}: {}",
+                e.message
+            );
+        }
+    }
+    // One line a sweep for a home whose rows stay (audit120's nit on #2164).
+    if let Some(first) = first {
+        eprintln!(
+            "phdb serve: {home}'s decision sweep: {unanswered} of {asked} branches that never \
+             acked a commit didn't answer its decide again, so those records stay (first: \
+             {first})"
+        );
+    }
+}
+
+/// How often the resolver sweeps the decision records under `--txn-outcome-retention`
+/// `retention`: every `retention / 24`, between one and ten minutes.
+pub(crate) fn sweep_every(retention: Duration) -> Duration {
+    (retention / 24).clamp(Duration::from_secs(60), Duration::from_secs(600))
+}
+
 /// D329's resolver, started once the node serves: each partition's shares held in doubt
 /// longer than `delay` (default: the request timeout, so it never fires on a healthy
 /// commit) ask their home what was decided (`ResolveTxn`), and are decided by the answer.
 /// A home that's unreachable, still committing, or whose history changed leaves the share
 /// in doubt, with the reason kept for `Status`, and it's asked again after a backoff that
-/// doubles to a minute. The loop holds the server only while it runs a pass.
+/// doubles to a minute. Every `sweep_every` ([`sweep_every`]; shorter in tests) a pass
+/// first sweeps the decision records. The loop holds the server only while it runs a pass.
 pub(crate) fn start_resolver(
     shared: std::sync::Weak<super::super::Shared>,
     delay: Duration,
+    sweep_every: Duration,
 ) -> Box<dyn FnOnce() + Send> {
     Box::new(move || {
         tokio::spawn(async move {
@@ -1488,13 +1684,9 @@ pub(crate) fn start_resolver(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // (partition, xid) → (when to ask again, the backoff's step).
             let mut next: HashMap<(String, Vec<u8>), (Instant, Duration)> = HashMap::new();
-            let sweep_every = shared
-                .upgrade()
-                .map_or(Duration::from_secs(600), |s| {
-                    s.limits.txn_outcome_retention / 24
-                })
-                .clamp(Duration::from_secs(60), Duration::from_secs(600));
             let mut last_sweep = Instant::now();
+            // Each home's decision sweep cursor (#2098): the last unacked row it asked about.
+            let mut cursors: HashMap<String, String> = HashMap::new();
             loop {
                 tick.tick().await;
                 let Some(shared) = shared.upgrade() else {
@@ -1507,10 +1699,12 @@ pub(crate) fn start_resolver(
                 let parts = cluster.parts.load_full();
                 // The decision records past retention on the partitions this node owns (GC),
                 // every `retention / 24`, between one and ten minutes: first, so it never
-                // waits on a pass's asks (#2078).
+                // waits on a pass's asks (#2078). A commit some branch never acked is asked
+                // of those branches again first, so a lost ack doesn't keep it (#2098).
                 if last_sweep.elapsed() >= sweep_every {
                     last_sweep = Instant::now();
-                    for service in parts.values() {
+                    for (partition, service) in parts.iter() {
+                        confirm_unacked(cluster, partition, service, timeout, &mut cursors).await;
                         if let Err(e) = service.sweep_decisions(now_ms()).await
                             && e.code != "Fenced"
                         {
@@ -1682,7 +1876,8 @@ pub(crate) fn start_resolver(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiError, Ask, MAX_ACKS, Spanning, ask_homes, collectable, keep_ack, proto, with_acks,
+        ApiError, Ask, MAX_ACKS, Spanning, ask_homes, collectable, keep_ack, proto, unacked,
+        with_acks,
     };
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -1853,6 +2048,35 @@ mod tests {
         assert!(collectable(b"committed h3 at5000", 6_000, retention));
         for bad in [&b""[..], b"committed h3", b"atx", b"\xff", b"maybe h1 at1"] {
             assert!(!collectable(bad, u64::MAX, 0), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_commit_past_retention_names_the_branches_still_owing_their_ack() {
+        // #2098: the sweep asks again only the branches of a commit past retention that
+        // never acked. Nothing for a row within retention, an abort, a fully acked commit
+        // or one it can't read.
+        let retention = 1_000;
+        let committed = b"committed h3 at5000\np1\n+p4\np7".to_vec();
+        assert_eq!(
+            unacked(&committed, 5_999, retention),
+            None,
+            "within retention"
+        );
+        assert_eq!(
+            unacked(&committed, 6_000, retention),
+            Some(vec!["p1".to_owned(), "p7".to_owned()])
+        );
+        let all = with_acks(&committed, &["p1".to_owned(), "p7".to_owned()]).unwrap();
+        assert_eq!(
+            unacked(&all, u64::MAX, retention),
+            None,
+            "every branch acked"
+        );
+        assert_eq!(unacked(b"committed h3 at5000", u64::MAX, retention), None);
+        assert_eq!(unacked(b"aborted h3 at5000", u64::MAX, retention), None);
+        for bad in [&b""[..], b"committed h3\np1", b"\xff", b"maybe h1 at1\np1"] {
+            assert_eq!(unacked(bad, u64::MAX, 0), None, "{bad:?}");
         }
     }
 }

@@ -1361,8 +1361,12 @@ fn data_node_served(
     } else {
         None
     };
-    let resolver =
-        super::spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    // The decision records' sweep every half second, as other passes run sooner in tests.
+    let resolver = super::spanning::start_resolver(
+        Arc::downgrade(&shared),
+        shared.limits.txn_resolve_delay,
+        Duration::from_millis(500),
+    );
     let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
         if let Some(sync) = sync {
