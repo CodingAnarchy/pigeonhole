@@ -2838,11 +2838,20 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
     });
     cut(&t, 1, true);
     t.rt.block_on(async {
-        eventually_within(FAILOVER_WINDOW, "p3 to fail over to a", async || {
+        // Twice on CI (#2166, #2170) a never failed over within the window: the reason a
+        // gives, and its p3 rows, say which step stalled next time.
+        eventually_why(FAILOVER_WINDOW, "p3 to fail over to a", async || {
             let m = map_of(a).await;
-            m.partitions
-                .iter()
-                .any(|p| p.id == "p3" && p.node == "a" && p.epoch > pending)
+            let p3 = m.partitions.iter().find(|p| p.id == "p3");
+            if p3.is_some_and(|p| p.node == "a" && p.epoch > pending) {
+                return Ok(());
+            }
+            let st = status_of(a).await;
+            let rows: Vec<_> = st.partitions.iter().filter(|lp| lp.id == "p3").collect();
+            Err(format!(
+                "map version {} has p3 {p3:?}; a's failover_blocked {:?}; a's p3 rows {rows:?}",
+                m.map_version, st.failover_blocked
+            ))
         })
         .await;
         let m = map_of(a).await;
