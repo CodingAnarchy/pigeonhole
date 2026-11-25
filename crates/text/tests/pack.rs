@@ -575,3 +575,50 @@ fn list_names_the_text_indexes_and_no_other_table() {
 fn ids_of(hits: &[Hit]) -> Vec<Vec<u8>> {
     hits.iter().map(|h| h.id.clone()).collect()
 }
+
+/// #2182: a chunk whose transaction is too large for one commit (here a batch past half a
+/// small memtable arena: a word repeated through long documents, so each posting carries a
+/// long position list) is cut smaller and retried, as a conflicted one is. Before, the pack
+/// failed at that chunk every time, and never reached the terms after it.
+#[test]
+fn a_chunk_too_large_for_one_commit_is_cut_smaller_and_the_pack_goes_on() {
+    let vfs = SimVfs::new(2182);
+    let db = Pigeonhole::open(
+        "/db/text.phdb",
+        Options::default()
+            .vfs(vfs as Arc<_>)
+            .shards(1)
+            .memtable_budget(2 << 20),
+    )
+    .expect("open");
+    let (_, plain) = pair(&db, "plain", IndexOptions::new());
+    let (_, packed) = pair(&db, "packed", IndexOptions::new());
+    // 600 documents of "alpha" 3000 times, then "omega": a first chunk of alpha's 512
+    // postings carries about 1.5 MB of positions, past half the 2 MiB arena
+    // (`BatchTooLarge`); omega, after it, has one position a document.
+    let body = format!("{}omega", "alpha ".repeat(3000));
+    for i in 0..600 {
+        let doc = format!("d{i:04}").into_bytes();
+        plain.put(&doc, &body).unwrap();
+        packed.put(&doc, &body).unwrap();
+    }
+    let stats = packed.pack().expect("the pack gets past the large chunk");
+    assert!(
+        !stats.stopped && stats.terms == 2 && stats.postings == 1200,
+        "{stats:?}"
+    );
+    assert!(!packed.pack_pending().unwrap());
+    let v = packed.verify().unwrap();
+    assert!(v.is_consistent() && v.packed == 1200, "{v:?}");
+    for q in [
+        Query::new().term("alpha"),
+        Query::new().term("omega"),
+        Query::new().phrase(["alpha", "omega"]),
+    ] {
+        assert_eq!(
+            packed.search(q.clone(), 10).run().unwrap(),
+            plain.search(q, 10).run().unwrap()
+        );
+    }
+    db.close().unwrap();
+}

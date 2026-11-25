@@ -923,7 +923,11 @@ impl Index {
     /// It carries on from where a stopped pack left off ([`pack_with`](Self::pack_with)),
     /// and otherwise starts at the first term. `PackRefused` while a rebuild is pending
     /// ([`rebuild_pending`](Self::rebuild_pending)): finish the rebuild first. `Busy` while
-    /// a repair runs.
+    /// a repair runs. A chunk whose commit conflicts with writers, or is too large for the
+    /// database (`BatchTooLarge`, `RecordTooLarge`), is retried smaller; an error coded
+    /// `Conflict` means writers kept changing a chunk's postings through its retries, even
+    /// at its smallest. The index is consistent then, and the cursor kept: pack again to
+    /// carry on.
     pub fn pack(&self) -> Result<PackStats> {
         self.pack_with(PackOptions::new(), |_| ControlFlow::Continue(()))
     }
@@ -1011,7 +1015,8 @@ impl Index {
         let rows = self.rows(true)?;
         let positions = self.inner.opts.get_positions();
         // The most cells the chunk takes: cut when its transaction runs out of retries, so
-        // a pack beside steady writers of the same documents still gets through.
+        // a pack beside steady writers of the same documents still gets through, or is too
+        // large to commit.
         let mut limit = PACK_CHUNK;
         let mut idle = 0;
         loop {
@@ -1109,10 +1114,23 @@ impl Index {
                 tx.put(t, GLOBAL, META, PACK_AFTER, &next);
                 Ok::<_, Tx>(true)
             });
+            // Cut on a conflict (to 8 at least), and on a commit too large for the database (to
+            // one cell: a common word in long documents carries long position lists, #2182).
+            // One cell's chunk is about the size of the write that made it.
             let done = match done.map_err(Error::from) {
                 Ok((done, _)) => done,
                 Err(e) if e.code() == pigeonhole::ErrorCode::Conflict && limit > 8 => {
                     limit = (limit / 8).max(8);
+                    continue;
+                }
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        pigeonhole::ErrorCode::BatchTooLarge
+                            | pigeonhole::ErrorCode::RecordTooLarge
+                    ) && limit > 1 =>
+                {
+                    limit = (limit / 8).max(1);
                     continue;
                 }
                 Err(e) => return Err(e),
