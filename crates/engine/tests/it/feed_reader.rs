@@ -850,6 +850,111 @@ fn oldest_after_reopens_starts_at_the_oldest_session_kept() {
     db.close().unwrap();
 }
 
+/// #2190: an `Oldest` start never begins in an earlier session that opened with an
+/// external share in doubt. Here the share is prepared while the feed is off (so its
+/// session isn't in the history), decided in the next session, and a single follows it
+/// there; a third session subscribes from the oldest. Starting in the second session would
+/// pass the share over, and its Decision, read in a session before the current one, would
+/// look like a round recovery dropped: the commit passed over silently, the single after
+/// it delivered. The start is later instead, and nothing is skipped.
+#[test]
+fn oldest_never_starts_in_a_session_that_opened_with_a_share_in_doubt() {
+    let vfs = SimVfs::new(3210);
+    let db = open(&vfs, None);
+    let (a, b) = tables(&db);
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let early = single(&db, &a, b"early", Durability::GroupSync);
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    let late = single(&db, &a, b"late", Durability::GroupSync);
+    assert!(early < decided && decided < late);
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let got = drain_seqnos(&mut r);
+    assert!(
+        !got.contains(&late) || got.contains(&decided),
+        "the commit was passed over: {got:?} (decided {decided})"
+    );
+    assert!(
+        got.iter().all(|&s| s > late),
+        "a later start, past the second session: {got:?}"
+    );
+    let now = single(&db, &b, b"now", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, now);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// #2196: a feed that expired on a gap (here a round whose share was logged with the feed
+/// off, outside its history) keeps its position before the round: a token taken from it
+/// after the expiry resumes into the same gap and expires again, as one taken before does,
+/// in the same session and after a reopen. Never the next commit as if nothing was missing.
+#[test]
+fn a_token_taken_after_a_gap_expiry_never_resumes_past_the_gap() {
+    let vfs = SimVfs::new(3211);
+    let db = open(&vfs, None);
+    let (a, b) = tables(&db);
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    db.close().unwrap();
+    let mut db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let before = r.token();
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    assert!(matches!(r.wait(WAIT).unwrap(), Next::Expired(_)));
+    let after = r.token();
+    drop(r);
+    single(&db, &a, b"later", Durability::GroupSync);
+    for reopen in [false, true] {
+        if reopen {
+            db.close().unwrap();
+            db = open(&vfs, Some(feed(1 << 20)));
+        }
+        for (name, token) in [("before", &before), ("after", &after)] {
+            let mut t = db
+                .feed(spec(&[&a, &b], FeedStart::Token(token.clone())))
+                .unwrap();
+            match t.wait(WAIT).unwrap() {
+                Next::Expired(e) => assert!(
+                    format!("{e:?}").contains(&format!("before seqno {decided}")),
+                    "token taken {name} the expiry, reopen {reopen}: {e:?}"
+                ),
+                other => panic!("token taken {name} the expiry, reopen {reopen}: {other:?}"),
+            }
+        }
+    }
+    db.close().unwrap();
+}
+
 /// The sidecar's entries, as a writer left them.
 fn sidecar_entries(vfs: &Arc<SimVfs>) -> Vec<pigeonhole_format::feed::FeedEntry> {
     use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader, decode_entries};
