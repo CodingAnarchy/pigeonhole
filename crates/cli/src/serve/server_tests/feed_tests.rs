@@ -191,10 +191,9 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
 
 /// A client that takes nothing: its buffer fills, then the stream ends with
 /// `DeadlineExceeded` after `--stream-idle-ms`. The events it buffered come first, in order.
-/// A client that takes nothing until its buffer fills and the idle limit drops it: the
-/// commits it then holds, every commit written, and how many events it held in all. Besides
-/// commits, a quiet moment between two writes may buffer a progress event, which takes a
-/// place too (#2211).
+/// Returns the commits it held, every commit written, and how many events it held in all:
+/// besides commits, a quiet moment between two writes may buffer a progress event, which
+/// takes a place too (#2211).
 fn stalled_feed(
     client_events: usize,
     client_bytes: usize,
