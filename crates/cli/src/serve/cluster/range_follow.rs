@@ -427,6 +427,23 @@ impl Follower {
 
     async fn step(&mut self) -> Result<Step, Failed> {
         let cx = self.ctx()?;
+        // #2141: an aborted record's drop under this move's own id runs to its end first, as
+        // it deletes the progress rows `read_head` would read, and the range with them.
+        if super::range_drop::pending_own(&cx.db, &self.id)
+            .map_err(|e| Failed::Retry(ApiError::internal(e)))?
+        {
+            let why = format!(
+                "waiting for an earlier drop of move {:?}'s own copy here (an aborted record \
+                 of the same id)",
+                self.id
+            );
+            *self
+                .progress
+                .waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = why.clone();
+            return Err(Failed::Retry(ApiError::partition_unavailable(why)));
+        }
         let head = read_head(&cx.db, &self.id)?;
         self.progress
             .copied_bytes
