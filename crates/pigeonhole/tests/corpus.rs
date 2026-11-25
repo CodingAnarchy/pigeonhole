@@ -570,6 +570,21 @@ fn entries() -> Vec<Entry> {
         feed_resumes_by_1_1: false,
         read_only_by: 0,
     });
+    // Internal cross-shard commits on both WAL streams (#2145). Last, so the entries before
+    // it keep their seeds.
+    entries.push(Entry {
+        name: "xshard_crash",
+        shards: 2,
+        options: same,
+        write: write_xshard_crash,
+        crash: true,
+        refused_by_1_0_0: 0,
+        extra: None,
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: 0,
+    });
     entries
 }
 
@@ -685,14 +700,6 @@ fn write_spanning_txn(db: &Pigeonhole) {
 #[cfg(feature = "__unstable-txn-prepare")]
 fn assert_two_stream_shares(vfs: &Arc<SimVfs>, path: &str) {
     use pigeonhole_format::wal::WalRecord;
-    let vfs_ref: pigeonhole_io::VfsRef = Arc::clone(vfs) as pigeonhole_io::VfsRef;
-    let path = Path::new(path);
-    let f = vfs.open(path, OpenOptions::read()).unwrap();
-    let mut page = vec![0u8; 4096];
-    f.read_at(&mut page, 0).unwrap();
-    let db_id = pigeonhole_format::superblock::Superblock::decode(&page)
-        .unwrap()
-        .db_id;
     let both = vec![0u32, 1];
     // Per xid: the streams holding its External Prepares, and the participants each names;
     // the decision's (Decision or External Abort) participants.
@@ -700,38 +707,26 @@ fn assert_two_stream_shares(vfs: &Arc<SimVfs>, path: &str) {
     let mut decided: BTreeMap<Vec<u8>, (&str, Vec<u32>)> = BTreeMap::new();
     let mut xid_of: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut decisions = Vec::new();
-    for stream in pigeonhole_wal::discover_streams(&vfs_ref, path).unwrap() {
-        let mut rec = pigeonhole_wal::Recovery::open_read_only(
-            &vfs_ref,
-            path,
-            stream,
-            db_id,
-            Default::default(),
-        )
-        .unwrap();
-        while let Some((_, record)) = rec.next_record().unwrap() {
-            match record {
-                WalRecord::ExternalPrepare { seqno, share, .. } => {
-                    let names = share.participants().iter().map(|s| s.0).collect();
-                    xid_of.insert(seqno, share.xid().to_vec());
-                    prepared
-                        .entry(share.xid().to_vec())
-                        .or_default()
-                        .push((stream.0, names));
-                }
-                WalRecord::ExternalAbort { share, .. } => {
-                    let names = share.participants().iter().map(|s| s.0).collect();
-                    decided.insert(share.xid().to_vec(), ("abort", names));
-                }
-                WalRecord::Decision {
-                    seqno,
-                    participants,
-                    ..
-                } => decisions.push((seqno, participants.iter().map(|s| s.0).collect())),
-                _ => {}
-            }
+    for_each_wal_record(vfs, path, |stream, record| match record {
+        WalRecord::ExternalPrepare { seqno, share, .. } => {
+            let names = share.participants().iter().map(|s| s.0).collect();
+            xid_of.insert(seqno, share.xid().to_vec());
+            prepared
+                .entry(share.xid().to_vec())
+                .or_default()
+                .push((stream, names));
         }
-    }
+        WalRecord::ExternalAbort { share, .. } => {
+            let names = share.participants().iter().map(|s| s.0).collect();
+            decided.insert(share.xid().to_vec(), ("abort", names));
+        }
+        WalRecord::Decision {
+            seqno,
+            participants,
+            ..
+        } => decisions.push((seqno, participants.iter().map(|s| s.0).collect())),
+        _ => {}
+    });
     for (seqno, names) in decisions {
         let xid = xid_of
             .get(&seqno)
@@ -1158,8 +1153,9 @@ fn write_merge(db: &Pigeonhole) {
     }
 }
 
-/// Two shards; flushed data, then synced commits (cross-shard batches among them) that a
-/// process crash leaves only in the WAL.
+/// Two shards; flushed data, then synced commits of several rows each that a process crash
+/// leaves only in the WAL. Its rows are all in one table, whose tablet is on one shard, so
+/// every commit is on one stream; `xshard_crash` holds the cross-shard ones (#2145).
 fn write_wal_crash(db: &Pigeonhole) {
     let t = db
         .table("events")
@@ -1182,6 +1178,184 @@ fn write_wal_crash(db: &Pigeonhole) {
         }
         batch.commit_with(Durability::Sync).unwrap();
     }
+}
+
+/// Calls `f` with every record of the entry at `path`'s WAL, stream by stream, with its
+/// stream's number, read from the files as the simulator holds them.
+fn for_each_wal_record(
+    vfs: &Arc<SimVfs>,
+    path: &str,
+    mut f: impl FnMut(u32, pigeonhole_format::wal::WalRecord<'_>),
+) {
+    let vfs_ref: pigeonhole_io::VfsRef = Arc::clone(vfs) as pigeonhole_io::VfsRef;
+    let path = Path::new(path);
+    let file = vfs.open(path, OpenOptions::read()).unwrap();
+    let mut page = vec![0u8; 4096];
+    file.read_at(&mut page, 0).unwrap();
+    let db_id = pigeonhole_format::superblock::Superblock::decode(&page)
+        .unwrap()
+        .db_id;
+    for stream in pigeonhole_wal::discover_streams(&vfs_ref, path).unwrap() {
+        let mut rec = pigeonhole_wal::Recovery::open_read_only(
+            &vfs_ref,
+            path,
+            stream,
+            db_id,
+            Default::default(),
+        )
+        .unwrap();
+        while let Some((_, record)) = rec.next_record().unwrap() {
+            f(stream.0, record);
+        }
+    }
+}
+
+/// Two shards, two tables whose tablets are on different shards, a flushed base, then
+/// synced internal cross-shard commits a process crash leaves only in the WAL (#2145):
+/// write batches and transactions (one reading a row of each table first), each with rows
+/// in both tables, so each is a Prepare (type 2) on each WAL stream and a Decision
+/// (type 4) naming both, which the reopen replays. `wal_crash`'s batches are all in one
+/// table, so on one stream; [`assert_two_stream_prepares`] checks this entry's files.
+fn write_xshard_crash(db: &Pigeonhole) {
+    // Created first: a new table's tablet goes to shard `tablet % shards`, so `ledger` and
+    // `events` (the next) are on different shards.
+    let ledger = db
+        .table("ledger")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let events = db
+        .table("events")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    assert_ne!(
+        events.shard_of(b"ev000"),
+        ledger.shard_of(b"l000"),
+        "xshard_crash needs `events` and `ledger` on different shards"
+    );
+    for i in 0..10u64 {
+        events
+            .mutate(format!("ev{i:03}").as_bytes())
+            .put_at("e", b"q", T0 + i, b"flushed")
+            .commit()
+            .unwrap();
+        ledger
+            .mutate(format!("l{i:03}").as_bytes())
+            .put_at("e", b"q", T0 + i, b"flushed")
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    for i in 10..30u64 {
+        let mut batch = db.write_batch();
+        batch.put_at(
+            &events,
+            format!("ev{:03}", i % 15).as_bytes(),
+            "e",
+            b"q",
+            T0 + i,
+            b"batch",
+        );
+        batch.put_at(
+            &ledger,
+            format!("l{:03}", i % 12).as_bytes(),
+            "e",
+            b"q",
+            T0 + i,
+            b"batch",
+        );
+        batch.commit_with(Durability::Sync).unwrap();
+    }
+    for i in 30..40u64 {
+        let mut txn = db.transaction().unwrap();
+        assert!(txn.get(&events, b"ev000", "e", b"q").unwrap().is_some());
+        assert!(txn.get(&ledger, b"l000", "e", b"q").unwrap().is_some());
+        txn.put_at(
+            &events,
+            format!("ev{:03}", i % 15).as_bytes(),
+            "e",
+            b"q",
+            T0 + i,
+            b"txn",
+        );
+        txn.put_at(
+            &ledger,
+            format!("l{:03}", i % 12).as_bytes(),
+            "e",
+            b"q",
+            T0 + i,
+            b"txn",
+        );
+        txn.commit_with(Durability::Sync).unwrap();
+    }
+}
+
+/// `xshard_crash`'s files hold genuinely two-stream internal commits (#2145): every
+/// Decision names both streams, and its commit has a Prepare on each, with that Decision's
+/// stream as coordinator; all 30 of the entry's cross-shard commits are there. Read from the
+/// WAL itself, so a placement change can't silently leave the entry single-stream.
+fn assert_two_stream_prepares(vfs: &Arc<SimVfs>, path: &str) {
+    use pigeonhole_format::wal::WalRecord;
+    // Per commit id: the streams of its Prepares, and their coordinator.
+    let mut prepares: BTreeMap<u64, Vec<(u32, u32)>> = BTreeMap::new();
+    // Per commit id: the Decision's stream and its participants.
+    let mut decisions: BTreeMap<u64, (u32, Vec<u32>)> = BTreeMap::new();
+    for_each_wal_record(vfs, path, |stream, record| match record {
+        WalRecord::Prepare {
+            seqno, coordinator, ..
+        } => prepares
+            .entry(seqno)
+            .or_default()
+            .push((stream, coordinator.0)),
+        WalRecord::Decision {
+            seqno,
+            participants,
+            ..
+        } => {
+            let names = participants.iter().map(|s| s.0).collect();
+            assert!(
+                decisions.insert(seqno, (stream, names)).is_none(),
+                "one Decision per commit"
+            );
+        }
+        _ => {}
+    });
+    assert_eq!(
+        decisions.len(),
+        30,
+        "a Decision for each of the 20 batches and 10 transactions: {decisions:?}"
+    );
+    for (id, (on, names)) in decisions {
+        assert_eq!(
+            names,
+            [0, 1],
+            "commit {id}: its Decision names both streams"
+        );
+        let mut shares = prepares.remove(&id).unwrap_or_default();
+        shares.sort();
+        assert_eq!(
+            shares,
+            [(0, on), (1, on)],
+            "commit {id}: a Prepare on each stream, coordinated by the Decision's"
+        );
+    }
+}
+
+/// `xshard_crash` as the generator writes it holds two-stream commits: CI checks the
+/// placement the entry relies on, not only the generator (#2145).
+#[test]
+fn xshard_crash_prepares_are_on_both_streams() {
+    let (seed, e) = entries()
+        .into_iter()
+        .enumerate()
+        .find(|(_, e)| e.name == "xshard_crash")
+        .unwrap();
+    let path = format!("/db/{DB}");
+    let vfs = write_entry(&e, 9_000 + seed as u64, &path, Duration::ZERO);
+    assert_two_stream_prepares(&vfs, &path);
 }
 
 /// Every family setting the manifest records (TTL, version and column limits, bloom bits,
@@ -2243,6 +2417,9 @@ fn generate_corpus() {
         #[cfg(feature = "__unstable-txn-prepare")]
         if e.name == "spanning_txn" {
             assert_two_stream_shares(&vfs, &path);
+        }
+        if e.name == "xshard_crash" {
+            assert_two_stream_prepares(&vfs, &path);
         }
         let files = sim_files(&vfs);
         // What the files hold, as this build reads them (a reopen replays a crashed entry).
