@@ -288,5 +288,6 @@ The write rate stays flat from the first document to the millionth. A full compa
 | `Busy` | A write or search while `repair` runs: retry after it finishes. |
 | `PackRefused` | `pack` before an index's first pack while reader processes are attached, or while a rebuild is pending. Its message says which. Code `Busy`. |
 | `Db` with code `Conflict` | `pack`, when writers kept changing a chunk's postings through its retries, even at its smallest. The index is consistent and the pack's place is kept: pack again, and it carries on from there. |
+| `Db` with code `BatchTooLarge` or `RecordTooLarge` | `pack`, when one posting's chunk doesn't fit a commit: a posting written while the database was opened with a larger `memtable_budget` than now. Open it with that budget to pack the term. The index is consistent and the pack's place is kept. |
 | `Mismatch` | `open` with another tokeniser or tokeniser version than the index was made with, or a packed block in a format a later release wrote. |
 | `Db` | The database's own error, passed through. |
