@@ -580,6 +580,7 @@ impl Sessions {
                     span: e.span.take(),
                     watched: std::mem::take(&mut e.watched),
                     ended: false,
+                    if_dropped: None,
                 }))
             }
             State::Committing => Err(ApiError::session_busy()),
@@ -876,9 +877,30 @@ pub(crate) struct TxnGuard {
     /// The entry's [`Watched`], put back with the transaction.
     watched: Watched,
     ended: bool,
+    /// What ends the transaction if the guard is dropped while armed
+    /// ([`TxnGuard::end_if_dropped`]).
+    if_dropped: Option<(Arc<std::sync::atomic::AtomicBool>, EndDropped)>,
 }
 
+/// Ends a transaction whose call was dropped part-way ([`TxnGuard::end_if_dropped`]): given
+/// its coordinator state, it does what must follow elsewhere and returns the outcome the
+/// session records.
+pub(crate) type EndDropped = Box<dyn FnOnce(Option<Span>) -> ApiError + Send>;
+
 impl TxnGuard {
+    /// From here on, a guard dropped while the returned flag is set doesn't put the
+    /// transaction back: it ends it, and `end`'s error is the session's recorded outcome
+    /// (#2157). A spanning transaction's home sets the flag once a call has sent rows to a
+    /// branch: a client that goes away after that must not find the session open, or its
+    /// retry would send the rows again. Clear the flag once the call has nothing left that
+    /// can be cut short. A guard that ends some other way (a commit, an abort) never calls
+    /// `end`.
+    pub(crate) fn end_if_dropped(&mut self, end: EndDropped) -> Arc<std::sync::atomic::AtomicBool> {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.if_dropped = Some((Arc::clone(&armed), end));
+        armed
+    }
+
     pub(crate) fn txn(&mut self) -> &mut Transaction {
         self.txn
             .as_mut()
@@ -958,7 +980,20 @@ impl TxnGuard {
 
 impl Drop for TxnGuard {
     fn drop(&mut self) {
-        if !self.ended {
+        if self.ended {
+            return;
+        }
+        // A call cut short after it sent rows elsewhere (#2157): the transaction ends here,
+        // uncommitted, and the session records why.
+        if let Some((armed, end)) = self.if_dropped.take()
+            && armed.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let outcome = end(self.span.take());
+            drop(self.txn.take());
+            self.sessions.finish(&self.id, Err(outcome));
+            return;
+        }
+        {
             self.sessions.put_back(
                 &self.id,
                 self.txn.take(),
