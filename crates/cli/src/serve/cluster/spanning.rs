@@ -855,6 +855,12 @@ impl Driver {
         let reply = self
             .send(partition, forward::op_to_forward(op)?, wrote)
             .await?;
+        #[cfg(test)]
+        if wrote && seams::write_reply_lost(&self.xid) {
+            return Err(ApiError::outcome_unknown(
+                "the branch's answer was lost (a test's fault); the write may have been applied",
+            ));
+        }
         let reply = forward::reply_of(reply)?;
         let t = span.parts.entry(partition.to_owned()).or_default();
         t.read |= !wrote;
@@ -1274,6 +1280,29 @@ pub(crate) mod seams {
     }
 
     type Waiting = (Arc<Notify>, oneshot::Receiver<bool>);
+
+    static LOST_WRITE_REPLIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// A fault (#2161): the answer to the next write `xid`'s home sends a branch is lost
+    /// after the branch took it, as a connection cut between the two would lose it.
+    pub(crate) fn lose_write_reply(xid: &str) {
+        LOST_WRITE_REPLIES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(xid.to_owned());
+    }
+
+    /// Whether `xid`'s write reply is to be lost ([`lose_write_reply`]), once.
+    pub(crate) fn write_reply_lost(xid: &str) -> bool {
+        let mut lost = LOST_WRITE_REPLIES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(i) = lost.iter().position(|x| x == xid) else {
+            return false;
+        };
+        lost.swap_remove(i);
+        true
+    }
 
     static PAUSES: Mutex<Option<HashMap<(String, Step), Waiting>>> = Mutex::new(None);
 
