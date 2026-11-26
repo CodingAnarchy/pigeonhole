@@ -1153,7 +1153,10 @@ Any node still takes any call, before, during and after.
   - the writer, its term and its lease, and whether `failover` is on;
   - `failovers`: the map's last 16 finished events and every pending one. A partition's event has its old and new node, the writer and its term, `applied_seqno` and `primary_seqno`, the in-doubt shares, the epoch it stamped and its state (pending, done or abandoned). An election's event names the old and new writer;
   - `failover_blocked`: each down partition that isn't failed over, and why.
-- **`/metrics`:** `pigeonhole_cluster_failovers_total{partition}` and `pigeonhole_cluster_writer_term`. Every node shows the same values, since they come from the map.
+- **The old owner's tail (from 1.4.0, D336):** a partition's event also records whether its old owner may hold commits the new owner lacks: its `tail_state`, PENDING after a failover, after a promote with `--old-unreachable`, or after one whose owner had made durable more than the copy applied. With it, the event keeps the fork point (`fork_token`) and the old file's epochs, so a replay can bring those commits in later. While a partition's tail is PENDING, it keeps its node, history and ranges: a relocate, a restore and every range move into or out of it are refused, and the balancer leaves it alone.
+  - **At most 4 tails stay PENDING per partition** (the owner's ruling): a fifth failover marks the oldest DISCARDED, and the failover is never refused for it. **A discarded tail's commits are given up for good:** writes its old owner acknowledged and no replica had, which no later replay brings back. The event shows `tail_state` DISCARDED, and `/metrics` counts it (below). A partition that fails over that often without a replay has a bigger problem than its tails.
+  - The tail is recorded only once the cluster adopted `tail_replay` (see the adopted features above); before that, a promote warns and records none.
+- **`/metrics`:** `pigeonhole_cluster_failovers_total{partition}`, `pigeonhole_cluster_writer_term`, and `pigeonhole_cluster_old_owner_tails{partition,state}` (each partition's tails by state, `pending` or `discarded`). Every node shows the same values, since they come from the map.
 - **The writer's log** has a line for each failover and election.
 
 #### Two cases that settle themselves

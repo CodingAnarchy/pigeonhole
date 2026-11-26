@@ -44,6 +44,12 @@ pub(crate) const TAIL_REPLAY_FEATURE: &str = "tail_replay";
 /// it sets its map again without the tail's fields.
 pub(crate) const TAIL_REPLAY_WHAT: &str = "an old owner's tail";
 
+/// The words [`every_node_keeps`](Node::every_node_keeps)' refusal for [`TAIL_REPLAY_WHAT`]
+/// starts with, which only that gate writes (cli692's Q2 on #2239).
+pub(crate) fn tail_replay_refusal() -> String {
+    format!("the map can't add {TAIL_REPLAY_WHAT} until every node")
+}
+
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,
 /// `.balancer_events`, `Partition.pinned`, `.moves_history`, `TablePlacement.pinned_ranges`,
 /// `Node.weight`): a node without it would drop them from its copy and read as divergent.

@@ -1290,6 +1290,7 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     }
     validate_move_steps(old, new)?;
     validate_tail_holds(old, new)?;
+    validate_tail_events(old, new)?;
     let new_partitions: HashMap<&str, _> =
         new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
     for p in &old.partitions {
@@ -1328,15 +1329,36 @@ fn pending_promote<'m>(
 /// HANDED_OVER names this map as the hand-over and raises the source's epoch (by one, or past a promote's floor: [`super::promote::next_epoch`]), on
 /// the same node (S1).
 /// D336 (#2148), the owner's Q4: a partition with an old owner's tail PENDING keeps its
-/// node and history until the tail is replayed or discarded. Its epoch is raised only by a
-/// promote's own map (the event that map finishes is its) or a range move's hand-over,
-/// which keeps P on its node and its history. A relocate or a restore is refused.
+/// node, history and ranges until the tail is replayed or discarded (simp724's P1 on #2239:
+/// the replay writes P's rows where they are now). Its epoch is raised only by a promote's
+/// own map (the event that map finishes is its); a relocate, a restore, and the hand-over
+/// of a range move naming P (as its source or its target) are refused. No move naming P
+/// starts either ([`validate_move_steps`]).
 fn validate_tail_holds(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
     use crate::serve::proto::{FailoverKind as K, FailoverState as St};
     for o in &old.partitions {
         let Some(e) = pending_tail(old, &o.id) else {
             continue;
         };
+        let refused = |what: &str| {
+            format!(
+                "partition {:?} has an old owner's tail pending (node {:?}'s, from its failover \
+                 to node {:?} at epoch {}): {what} until the tail is replayed or discarded",
+                o.id, e.from, e.to, e.to_epoch
+            )
+        };
+        // A hand-over naming P moves rows into or out of it under the replay.
+        if new.moves.iter().any(|m| {
+            !node_move(m)
+                && (m.from == o.id || m.to == o.id)
+                && phase(m) == MovePhase::HandedOver
+                && old
+                    .moves
+                    .iter()
+                    .any(|q| q.id == m.id && phase(q) == MovePhase::HandingOver)
+        }) {
+            return Err(refused("no range move naming it hands over"));
+        }
         let Some(n) = new.partitions.iter().find(|p| p.id == o.id) else {
             continue;
         };
@@ -1356,22 +1378,71 @@ fn validate_tail_holds(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
                         && g.state() == St::Pending
                 })
         });
-        let handover = n.node == o.node
-            && new.moves.iter().any(|m| {
-                !node_move(m)
-                    && m.from == o.id
-                    && phase(m) == MovePhase::HandedOver
-                    && old
-                        .moves
-                        .iter()
-                        .any(|q| q.id == m.id && phase(q) == MovePhase::HandingOver)
-            });
-        if !promote && !handover {
+        if !promote {
+            return Err(refused("it keeps its node and history"));
+        }
+    }
+    Ok(())
+}
+
+/// D336 (cli692's S1 on #2239): an old owner's recorded tail is the map writer's, as its term
+/// is, so no map loses or rewrites one. Matched by partition, node and `to_epoch`:
+/// - a PENDING tail's event stays, with its fork token and the old file's epochs; its state
+///   only leaves PENDING, for DONE or DISCARDED (a replay, a discard or the cap of 4), when
+///   its token may be cleared;
+/// - a tail out of PENDING never changes again (its event may go, past the ring);
+/// - a new event carries no tail: only the map that finishes a pending promote records one
+///   ([`validate_failover_fields`]' finishing map).
+fn validate_tail_events(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    use crate::serve::proto::TailState as T;
+    let key = |e: &crate::serve::proto::FailoverEvent| {
+        (e.kind, e.partition.clone(), e.to.clone(), e.to_epoch)
+    };
+    let tailless = |e: &crate::serve::proto::FailoverEvent| {
+        e.tail_state() == T::Unspecified
+            && e.fork_token.is_empty()
+            && e.from_history_epoch == 0
+            && e.from_epoch == 0
+    };
+    for e in &old.failovers {
+        let now = new.failovers.iter().find(|n| key(n) == key(e));
+        let ok = match (e.tail_state(), now) {
+            (T::Unspecified, _) => true,
+            (T::Pending, None) => false,
+            (T::Pending, Some(n)) => {
+                n.from_history_epoch == e.from_history_epoch
+                    && n.from_epoch == e.from_epoch
+                    && match n.tail_state() {
+                        T::Pending => n.fork_token == e.fork_token,
+                        T::Done | T::Discarded => {
+                            n.fork_token.is_empty() || n.fork_token == e.fork_token
+                        }
+                        _ => false,
+                    }
+            }
+            (_, None) => true,
+            (_, Some(n)) => {
+                n.tail_state == e.tail_state
+                    && n.fork_token == e.fork_token
+                    && n.from_history_epoch == e.from_history_epoch
+                    && n.from_epoch == e.from_epoch
+            }
+        };
+        if !ok {
             return Err(format!(
-                "partition {:?} has an old owner's tail pending (node {:?}'s, from its \
-                 failover to node {:?} at epoch {}): it keeps its node and history until the \
-                 tail is replayed or discarded",
-                o.id, e.from, e.to, e.to_epoch
+                "the map drops or rewrites partition {:?}'s old owner's tail (its failover to \
+                 node {:?} at epoch {}): a tail is the map's writer's to keep; it only leaves \
+                 PENDING, by a replay or a discard",
+                e.partition, e.to, e.to_epoch
+            ));
+        }
+    }
+    for n in &new.failovers {
+        if !tailless(n) && !old.failovers.iter().any(|e| key(e) == key(n)) {
+            return Err(format!(
+                "a new failover event of partition {:?} carries an old owner's tail: only the \
+                 map that finishes a pending promote records one",
+                n.partition
             ));
         }
     }
@@ -2681,6 +2752,76 @@ mod tests {
         old.failovers[0].set_tail_state(crate::serve::proto::TailState::Discarded);
         new.failovers = old.failovers.clone();
         validate_change(&old, &new).unwrap();
+    }
+
+    /// cli692's S1 on #2239: no map drops or rewrites a recorded tail. A PENDING one only
+    /// leaves PENDING (for DONE or DISCARDED, its token cleared or kept), one out of PENDING
+    /// never changes, and a new event carries none.
+    #[test]
+    fn a_recorded_tail_is_neither_dropped_nor_rewritten() {
+        use crate::serve::proto::TailState as T;
+        let mut old = map();
+        old.failovers.push(tail("p3", "b", 1));
+        fn change(old: &ClusterMap, f: &dyn Fn(&mut ClusterMap)) -> Result<(), Refusal> {
+            let mut new = old.clone();
+            new.map_version += 1;
+            f(&mut new);
+            validate_change(old, &new)
+        }
+        refused(change(&old, &|m| m.failovers.clear()), "drops or rewrites");
+        refused(
+            change(&old, &|m| {
+                m.failovers[0].fork_token = b"other".to_vec().into()
+            }),
+            "drops or rewrites",
+        );
+        refused(
+            change(&old, &|m| m.failovers[0].set_tail_state(T::None)),
+            "drops or rewrites",
+        );
+        refused(
+            change(&old, &|m| m.failovers[0].from_epoch = 9),
+            "drops or rewrites",
+        );
+        change(&old, &|m| {
+            m.failovers[0].set_tail_state(T::Discarded);
+            m.failovers[0].fork_token = Default::default();
+        })
+        .unwrap();
+        change(&old, &|m| m.failovers[0].set_tail_state(T::Done)).unwrap();
+        // Out of PENDING: it never changes again.
+        old.failovers[0].set_tail_state(T::Discarded);
+        refused(
+            change(&old, &|m| m.failovers[0].set_tail_state(T::Pending)),
+            "drops or rewrites",
+        );
+        // A new event with a tail.
+        let mut fresh = map();
+        let mut new = fresh.clone();
+        new.map_version += 1;
+        new.failovers.push(tail("p3", "b", 1));
+        refused(validate_change(&fresh, &new), "carries an old owner's tail");
+        fresh.failovers.push(pending("p3", "b", 2));
+        validate_change(&fresh, &fresh.clone()).ok();
+    }
+
+    /// simp724's P1 on #2239: a range move naming a partition with a pending tail doesn't hand
+    /// over, as its source or its target.
+    #[test]
+    fn no_hand_over_names_a_partition_with_a_pending_tail() {
+        for p in ["p1", "p2"] {
+            let mut before = moving(MovePhase::HandingOver);
+            before.map_version = 4;
+            let epoch = before.partitions.iter().find(|q| q.id == p).unwrap().epoch;
+            before.failovers.push(tail(p, "a", epoch));
+            let mut after = moving(MovePhase::HandedOver);
+            after.map_version = 5;
+            after.moves[0].handed_over_version = 5;
+            after.tables[0] = handed_over(&after.tables[0], b"c", Some(b"f"), "p2");
+            after.partitions[0].epoch = 2;
+            after.failovers = before.failovers.clone();
+            refused(validate_change(&before, &after), "hands over");
+        }
     }
 
     #[test]

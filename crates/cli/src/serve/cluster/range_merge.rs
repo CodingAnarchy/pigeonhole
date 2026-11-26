@@ -124,7 +124,7 @@ pub(super) async fn run_as(
             break remove(args, from).await?;
         };
         if !planned {
-            plan(args, &m, from, fit).await?;
+            plan(args, &m, from, into, fit).await?;
             planned = true;
         }
         let spec = range_move::Spec {
@@ -172,7 +172,14 @@ pub(super) async fn run_as(
 /// D331's plan for the merge, once, before its first range: S's whole file is an exact
 /// bound for a merge's total (ai1249). As `move-range`'s: `Busy` refuses (retry-safe), a fit
 /// refusal unless `fit` is off (`--skip-fit-check`), and an unknown source refuses.
-async fn plan(args: &NodeArgs, m: &ClusterMap, from: &str, fit: bool) -> Result<(), Failure> {
+async fn plan(
+    args: &NodeArgs,
+    m: &ClusterMap,
+    from: &str,
+    into: &str,
+    fit: bool,
+) -> Result<(), Failure> {
+    into_takes_moves(m, into)?;
     let (node, address) = range_move::node_of(m, from)?;
     let at = At::new(args, node, address).await?;
     // As `move-range`'s: S's write rate is reported once its first load interval ends (30 s
@@ -201,6 +208,23 @@ async fn plan(args: &NodeArgs, m: &ClusterMap, from: &str, fit: bool) -> Result<
             "{why}: merge with --skip-fit-check to start anyway"
         ))),
         Err(range_move::Skip::Unknown(why)) => Err(Failure::usage(&why)),
+    }
+}
+
+/// D336: no move into a partition with an old owner's tail pending (the map would refuse the
+/// merge's first move; ai1249 on #2239): `Busy`, as the plan's own, so the balancer sets the
+/// merge aside rather than retry it at every pass.
+fn into_takes_moves(m: &ClusterMap, into: &str) -> Result<(), Failure> {
+    match super::map::pending_tail(m, into) {
+        None => Ok(()),
+        Some(e) => Err(Failure::coded(
+            pigeonhole::ErrorCode::Busy,
+            format!(
+                "{into} has an old owner's tail pending (node {:?}'s, from its failover at \
+                 epoch {}): run the merge again once it's replayed or discarded",
+                e.from, e.to_epoch
+            ),
+        )),
     }
 }
 
@@ -653,6 +677,28 @@ async fn unlisted_drops(
 
 #[cfg(test)]
 mod tests {
+    /// ai1249 on #2239: a merge into a partition with an old owner's tail pending is Busy
+    /// before it moves anything; once the tail leaves PENDING it goes ahead.
+    #[test]
+    fn a_merge_into_a_partition_with_a_pending_tail_is_busy() {
+        let mut m = ClusterMap::default();
+        let mut e = crate::serve::proto::FailoverEvent {
+            partition: "p2".into(),
+            from: "a".into(),
+            to: "b".into(),
+            to_epoch: 2,
+            fork_token: b"fork".to_vec().into(),
+            ..Default::default()
+        };
+        e.set_tail_state(crate::serve::proto::TailState::Pending);
+        m.failovers.push(e);
+        let f = super::into_takes_moves(&m, "p2").unwrap_err();
+        assert_eq!(f.code(), "Busy", "{}", f.message());
+        super::into_takes_moves(&m, "p1").unwrap();
+        m.failovers[0].set_tail_state(crate::serve::proto::TailState::Discarded);
+        super::into_takes_moves(&m, "p2").unwrap();
+    }
+
     use super::*;
     use crate::serve::proto::InDoubtShare;
 

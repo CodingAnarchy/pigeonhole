@@ -1165,11 +1165,16 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
 
 **Retention and the cap:**
 - An event whose tail is PENDING is pinned past the 16 finished events.
-- At most 4 PENDING tails per partition (the owner's Q5): past that, the oldest becomes DISCARDED and its token is cleared.
+- At most 4 PENDING tails per partition (the owner's Q5, 2026-11-25, in `numbers.md`): past that, the oldest becomes DISCARDED and its token is cleared. The failover is never refused for the cap. A discarded tail's commits (writes the old owner acknowledged that no replica had) are given up for good. The event shows DISCARDED, and `/metrics` counts it: `pigeonhole_cluster_old_owner_tails{partition,state}` (`pending`, `discarded`), from the map, the same on every node.
 
 **Guards (the owner's Q4), in `validate_change`:**
-- No range or whole-partition move of P starts while a tail of it is PENDING.
-- P's node and epoch change only by a promote's own map (the event it finishes) or a range move's hand-over (P stays on its node). A relocate or a restore is refused, naming the tail. The refusal lasts until the tail is replayed or discarded (PR 3).
+- No range or whole-partition move of P starts while a tail of it is PENDING. `range_move::plan` answers Busy for its source, and a merge's plan for its target (ai1249 on #2239), so the balancer sets such a move aside.
+- P keeps its node, history and ranges (simp724's P1 on #2239): its epoch changes only by a promote's own map (the event it finishes), and no range move naming P, as its source or its target, commits its hand-over. A relocate or a restore is refused, naming the tail. The refusal lasts until the tail is replayed or discarded (PR 3).
+- **A recorded tail is the writer's** (cli692's S1 on #2239), in `validate_change`, so on every map path:
+  - a PENDING tail's event can't be dropped, and its fork token and the old file's epochs can't change; its state only leaves PENDING, for DONE or DISCARDED, when its token may be cleared;
+  - a tail out of PENDING never changes again (its event may go past the ring);
+  - a new event carries no tail: only the map that finishes a pending promote records one.
+- **The promote's fallback** without the fields matches the gate's whole refusal (`tail_replay_refusal()`): a map set's error reaches the promote as text, both paths making it a usage failure (cli692's Q2).
 
 **Mixed versions:** a map using any of the event's new fields needs `tail_replay` on every node (`install.rs`, as for D332's fields).
 

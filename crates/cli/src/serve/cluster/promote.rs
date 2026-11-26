@@ -967,7 +967,9 @@ pub(crate) async fn run(
     }
     // 2. The copy, promoted and stamped at the target epoch. A copy an earlier run stamped
     // is stamped again, which does nothing but answer its fork token (D336, Amendment 4: an
-    // earlier run's reply may have been lost).
+    // earlier run's reply may have been lost). That's reached only while the event is still
+    // PENDING, so before the map gives `to` the partition: a stamp is refused while P is open
+    // on `to` (cli692's Q1 on #2239).
     let fork = {
         ops.stamp(
             to,
@@ -1085,7 +1087,9 @@ pub(crate) async fn run(
         discard_past_cap(&mut m2, partition);
     }
     let map_version = match ops.set_map(m2).await {
-        Err(f) if !fork.is_empty() && f.message().contains(super::TAIL_REPLAY_WHAT) => {
+        // The install's `tail_replay` gate, by its whole refusal (cli692's Q2 on #2239): a
+        // map set's error reaches here as text alone (both paths make it a usage failure).
+        Err(f) if !fork.is_empty() && f.message().contains(&super::tail_replay_refusal()) => {
             warnings.push(format!(
                 "the cluster hasn't adopted map feature {:?} (ClusterMap.adopted_features), \
                  and not every node answered with it now: {partition}'s old owner's tail isn't \
@@ -1363,6 +1367,8 @@ mod tests {
         clock: Cell<u64>,
         step: u64,
         stamped: Cell<bool>,
+        /// The next run stops after its stamp, before its map (as `STOP_AFTER_STAMP`).
+        stop_after_stamp: Cell<bool>,
     }
 
     impl Promoter for Fake {
@@ -1425,6 +1431,13 @@ mod tests {
         async fn wait_serving(&self, _id: &str, _p: &str, _epoch: u64) -> Result<(), Failure> {
             Ok(())
         }
+
+        fn after_stamp(&self) -> Result<(), Failure> {
+            if self.stop_after_stamp.replace(false) {
+                return Err(Failure::usage("the test's stop after the stamp"));
+            }
+            Ok(())
+        }
     }
 
     /// Runs `f` to its end: the fake never waits, so it's ready at once.
@@ -1485,7 +1498,32 @@ mod tests {
             clock: Cell::new(0),
             step: u64::try_from(step.as_nanos()).unwrap(),
             stamped: Cell::new(false),
+            stop_after_stamp: Cell::new(false),
         }
+    }
+
+    /// D336 (cli692's Q1 on #2239): a promote stopped after its stamp, before its map, is run
+    /// again. The rerun finds the copy stamped, stamps it again (which only answers its fork
+    /// token), and records the token and a PENDING tail in the event its map finishes.
+    #[test]
+    fn a_promote_rerun_after_its_stamp_records_the_fork_token() {
+        let f = fake(
+            vec![quiet(10_000), quiet(10_000)],
+            2,
+            Duration::from_secs(1),
+        );
+        f.stop_after_stamp.set(true);
+        block_on(run(&f, &three(), "p3", "b", &failover())).unwrap_err();
+        assert!(f.stamped.get());
+        assert_eq!(f.map.borrow().failovers[0].state(), S::Pending);
+        let m = f.map.borrow().clone();
+        block_on(run(&f, &m, "p3", "b", &failover())).unwrap();
+        let m = f.map.borrow();
+        let e = &m.failovers[0];
+        assert_eq!(e.state(), S::Done);
+        assert_eq!(e.tail_state(), proto::TailState::Pending);
+        assert_eq!(&e.fork_token[..], b"fork");
+        assert_eq!((e.from_history_epoch, e.from_epoch), (1, 3));
     }
 
     fn failover() -> How {

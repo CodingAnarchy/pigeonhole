@@ -881,6 +881,31 @@ impl Node {
              pigeonhole_cluster_writer_term gauge\npigeonhole_cluster_writer_term {}",
             map.writer_term
         );
+        // D336: each partition's old owners' tails the map holds, by state. A discarded one
+        // (an operator's, or past the cap of 4 pending) is acknowledged writes given up.
+        let _ = writeln!(
+            text,
+            "# HELP pigeonhole_cluster_old_owner_tails Old owners' tails of each partition the \
+             map holds, by state: pending (kept for a replay) or discarded (given up) (D336).\n\
+             # TYPE pigeonhole_cluster_old_owner_tails gauge"
+        );
+        for p in &map.partitions {
+            for (state, label) in [
+                (crate::serve::proto::TailState::Pending, "pending"),
+                (crate::serve::proto::TailState::Discarded, "discarded"),
+            ] {
+                let n = map
+                    .failovers
+                    .iter()
+                    .filter(|e| e.partition == p.id && e.tail_state() == state)
+                    .count();
+                let _ = writeln!(
+                    text,
+                    "pigeonhole_cluster_old_owner_tails{{partition=\"{}\",state=\"{label}\"}} {n}",
+                    p.id
+                );
+            }
+        }
     }
 
     /// Node `id`'s address in this node's map.
