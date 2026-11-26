@@ -292,15 +292,13 @@ impl Node {
             }
             // A recovery waits for no majority: it's what `--force` means.
             map.previous_nodes.clear();
-            // A forced map keeps every feature the cluster adopted: nothing removes one.
-            if let Ok(current) = self.get_map() {
-                for f in current.adopted_features {
-                    if !map.adopted_features.contains(&f) {
-                        map.adopted_features.push(f);
-                    }
-                }
-                map.adopted_features.sort();
-            }
+            // A forced map keeps exactly the features this node's map adopted, never what the
+            // map sent says (cli692's B2 on #2237): none without a current map, so a first
+            // forced map, a restore's, adopts again from its first set.
+            map.adopted_features = self
+                .get_map()
+                .map(|c| c.adopted_features)
+                .unwrap_or_default();
             let version = self.install_async(map, None, |_| Ok(None)).await?;
             let pushed = self.push_all().await;
             return Ok(SetMapResponse {
@@ -334,6 +332,10 @@ impl Node {
             // can't change them, and from term 1 a change needs the writer lease.
             map.writer = current.writer.clone();
             map.writer_term = current.writer_term;
+            // The cluster's adopted features are the writer's to keep, as its term is: an
+            // operator's map can neither drop nor add one, and every gate below reads the
+            // current map's (cli692's B1 on #2237).
+            map.adopted_features = current.adopted_features.clone();
             self.await_writer_lease(&current).await?;
             if !map::uses_failover(&current) && map::uses_failover(&map) {
                 self.every_node_keeps(&map, WRITER_TERMS_FEATURE, "failover")
@@ -372,10 +374,8 @@ impl Node {
                 self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
                     .await?;
             }
-            // The cluster's adopted features are the writer's to keep, as its term is: an
-            // operator's map can't drop or add one. A node it adds must report each, and the
-            // writer adopts what every node reports now.
-            map.adopted_features = current.adopted_features.clone();
+            // A node the map adds must report each adopted feature, and the writer adopts
+            // what every node reports now.
             self.new_nodes_keep_adopted(&current, &map).await?;
             self.adopt_features(&mut map).await;
             if !current.previous_nodes.is_empty() {
@@ -391,6 +391,9 @@ impl Node {
                 current.nodes.clone()
             };
         } else {
+            // A first map adopts nothing on trust (cli692's B2 on #2237): its features are
+            // adopted from the cluster's first all-answering set.
+            map.adopted_features.clear();
             // The node's first map: its nodes keep a memory store too, or none goes in.
             if map.memory.is_some() {
                 self.every_node_keeps(&map, MEMORY_FEATURE, "a memory store")

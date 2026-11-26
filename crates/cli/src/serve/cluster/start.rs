@@ -371,12 +371,6 @@ pub(crate) fn run(
     )
 }
 
-/// The node's start split of its budget across `mine`, the partitions the map gives it
-/// (D317 ticket 8a): each one's share of `shards` and `compaction`, and, when
-/// `--engine-memory` or the map sets any, each one's memory: the map's `memory_bytes` off
-/// the top, the rest of `engine_memory` in equal shares. A restart re-splits it across
-/// every partition the map gives the node, which is how a node a run-time open refused
-/// for memory takes that partition (D317 ticket 6).
 /// A node rolled back below the cluster's adopted features refuses to start from its own
 /// map `m`, before it serves anything (cli692 on the adopted-features ruling): the map it
 /// stored names a feature its build lacks.
@@ -393,6 +387,12 @@ pub(super) fn own_map_adopted(dir: &Path, m: &ClusterMap) -> Result<(), String> 
     }
 }
 
+/// The node's start split of its budget across `mine`, the partitions the map gives it
+/// (D317 ticket 8a): each one's share of `shards` and `compaction`, and, when
+/// `--engine-memory` or the map sets any, each one's memory: the map's `memory_bytes` off
+/// the top, the rest of `engine_memory` in equal shares. A restart re-splits it across
+/// every partition the map gives the node, which is how a node a run-time open refused
+/// for memory takes that partition (D317 ticket 6).
 pub(crate) fn start_budget(
     map: Option<&ClusterMap>,
     mine: &[(String, u64)],

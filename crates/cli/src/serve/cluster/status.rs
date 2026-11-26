@@ -367,6 +367,15 @@ pub(crate) fn build_features(dir: &std::path::Path) -> Vec<String> {
         .iter()
         .filter(|&&f| {
             #[cfg(test)]
+            if OLD_FEATURE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|(d, g)| *g == f && dir.starts_with(d))
+            {
+                return false;
+            }
+            #[cfg(test)]
             if f == NEAREST_QUALIFIERS_FEATURE && old_nearest(dir, OldNearest::Status) {
                 return false;
             }
