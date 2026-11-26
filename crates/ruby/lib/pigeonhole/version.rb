@@ -2,5 +2,5 @@
 
 module Pigeonhole
   # The gem's version: the `pigeonhole` crate's.
-  VERSION = "1.3.0"
+  VERSION = "1.3.1"
 end

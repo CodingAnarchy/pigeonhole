@@ -1,2 +1,0 @@
-### Fixed
-- **A spanning transaction ended before its commit point no longer answers `OutcomeUnknown`** (#2161). When a branch's answer to a buffered write was lost, the home ended the transaction but recorded that write's `OutcomeUnknown` as the transaction's outcome, so the write and a later `Commit` both sent the client to `Outcome` for a transaction that could not have committed. They now answer `Conflict` (retry the transaction), and say what was lost.
