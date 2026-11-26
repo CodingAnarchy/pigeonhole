@@ -50,6 +50,10 @@ pub struct WriteBatch {
     pub(crate) row_deletes: Vec<RowDelete>,
     /// Scratch for value encoding (kept between calls).
     value_buf: Vec<u8>,
+    /// Changes pushed as a primary logged them beside this batch's ordinary writes
+    /// ([`push_logged_beside`](Self::push_logged_beside), D336): routed after the ordinary
+    /// part is rewritten, then appended to it. `None` on every batch but a tail replay's.
+    pub(crate) logged_beside: Option<Box<BatchBuilder>>,
 }
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
@@ -104,6 +108,7 @@ impl Default for WriteBatch {
             builder,
             row_deletes: Vec::new(),
             value_buf: Vec::new(),
+            logged_beside: None,
         }
     }
 }
@@ -308,6 +313,44 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Appends one change exactly as a primary logged it, **beside** the batch's ordinary
+    /// writes (D336, ICR 0147): its kind, explicit timestamp and stored value, as
+    /// [`push_logged`](Self::push_logged) takes them, but without marking the batch logged.
+    /// An old owner's tail commit replayed into a partition's new owner mixes the two in one
+    /// transaction: its plain changes exactly as logged, its text and vector index writes
+    /// through the indexes' own paths.
+    ///
+    /// The commit routes the ordinary writes as any batch's (row deletes expanded, counter
+    /// writes prepared, HLL and bloom inputs converted), then appends these after them,
+    /// checked as a logged batch's are and never rewritten. So in one commit, where an
+    /// ordinary write and one of these write the same cell at the same timestamp, this one
+    /// wins (D34's last mutation), a row delete's family delete at the commit's timestamp
+    /// included. An ordinary write without a timestamp takes the clock, which may be below
+    /// this change's: the timestamp floor isn't raised to it, as for
+    /// [`Engine::commit_logged`](crate::Engine::commit_logged); the caller decides. The batch
+    /// stays an ordinary one: a replica refuses it, and so do `commit_logged` and
+    /// `apply_replicated` (`InvalidArgument`). Not for a batch [`push_logged`] marked
+    /// (`InvalidArgument` at commit). Not part of the stable API.
+    ///
+    /// [`push_logged`]: Self::push_logged
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_logged_beside(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        kind: Kind,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Timestamp,
+        stored: &[u8],
+    ) -> crate::Result<()> {
+        self.logged_beside
+            .get_or_insert_with(|| Box::new(BatchBuilder::with_capacity(INITIAL_BATCH_BYTES)))
+            .push(table, family, kind, row, qualifier, Some(ts), stored)?;
+        Ok(())
+    }
+
     /// Marks the batch feed-silent (D331, ICR 0141): logged, durable and applied as any
     /// commit, replicated to a replica database, but never delivered to a change-feed
     /// subscription. A range move's copy and its source's cleanup write so, as the range's
@@ -334,7 +377,9 @@ impl WriteBatch {
 
     /// Mutations so far.
     pub fn len(&self) -> usize {
-        self.builder.len() + self.row_deletes.len()
+        self.builder.len()
+            + self.row_deletes.len()
+            + self.logged_beside.as_ref().map_or(0, |b| b.len())
     }
 
     /// Whether empty.
@@ -346,6 +391,7 @@ impl WriteBatch {
     pub fn clear(&mut self) {
         self.builder.clear();
         self.row_deletes.clear();
+        self.logged_beside = None;
     }
 
     /// The encoded mutations (row deletes excluded until expanded).
@@ -1367,6 +1413,49 @@ impl Txn {
         // operands only. A read-your-writes overlay must not checkpoint.
         self.engine
             .get(&self.snapshot, table, family, row, qualifier)
+    }
+
+    /// Row `row` of `table` at the transaction's snapshot as it is stored (D336, ICR 0147):
+    /// every version and delete marker a reader there could need, in each cell's logged form,
+    /// as a range move's copy reads it ([`Engine::copy_range`](crate::Engine::copy_range)).
+    /// A replayed tail change asks whether anything newer than it is there, and a delete
+    /// marker counts, which a plain read hides (simp724 on D336 Amendment 3). Records a read
+    /// of every family of the table at the snapshot, as
+    /// [`read_row_into`](Self::read_row_into) with no families does: a commit to the row
+    /// after the snapshot, a marker included, conflicts with this transaction. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn read_row_logged(
+        &mut self,
+        table: TableId,
+        row: &[u8],
+    ) -> crate::Result<Vec<crate::CopiedCell>> {
+        self.snapshot.check_process()?;
+        let families = crate::engine::families_in_order(&self.snapshot.view, table, &[])?;
+        for &family in &families {
+            record_read(
+                &mut self.reads,
+                ReadKey {
+                    table,
+                    row: row.to_vec(),
+                    family,
+                    qualifier: None,
+                },
+            );
+        }
+        // `[row, row\0)`: the row alone.
+        let mut end = row.to_vec();
+        end.push(0);
+        let now = self.engine.shared.clock_vfs.now_micros();
+        let chunk = self.snapshot.checked(crate::range_copy::copy_range(
+            &self.snapshot,
+            now,
+            table,
+            row,
+            Some(&end),
+            usize::MAX,
+        ))?;
+        Ok(chunk.cells)
     }
 
     /// Reads one row of `table` at the transaction's snapshot into `sink`, projected by

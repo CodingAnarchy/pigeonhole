@@ -373,7 +373,11 @@ impl Drop for Admit {
 /// The bytes an async commit is charged: its encoded batch and row deletes.
 pub(crate) fn batch_bytes(batch: &WriteBatch) -> u64 {
     let rows: usize = batch.row_deletes.iter().map(|d| d.row.len() + 16).sum();
-    (batch.builder.batch().as_bytes().len() + rows) as u64
+    let logged = batch
+        .logged_beside
+        .as_ref()
+        .map_or(0, |b| b.batch().as_bytes().len());
+    (batch.builder.batch().as_bytes().len() + logged + rows) as u64
 }
 
 #[cfg(all(test, engine_loom))]

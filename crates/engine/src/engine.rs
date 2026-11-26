@@ -2576,6 +2576,22 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
+        self.commit_logged_with(batch, durability, None)
+    }
+
+    /// [`commit_logged`](Self::commit_logged), tagged with `xid` (D336, ICR 0147): an old
+    /// owner's tail commit replayed into a partition's new owner names its origin there, so
+    /// its change-feed events deliver it and a later replay of the same commit skips it. The
+    /// tag is a spanning commit's trailer (D329 2b), behind `incompat` bit 2 as there; 1–255
+    /// bytes, checked when the commit is routed. `None` is `commit_logged`. Not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub fn commit_logged_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        xid: Option<&[u8]>,
+    ) -> Result<CommitInfo> {
         if self.inner.replica.load(Ordering::Relaxed) {
             return Err(replica_refusal());
         }
@@ -2584,7 +2600,8 @@ impl Engine {
                 "a logged commit is a non-empty batch of logged mutations".to_owned(),
             ));
         }
-        self.commit(batch, durability)
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
+        self.inner.commit_blocking_with(batch, durability, xid)
     }
 
     /// Holds the change feed's retained history from now on (D331, ICR 0141): a feed token
@@ -6209,6 +6226,11 @@ impl Inner {
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
         if batch.logged() {
+            if batch.logged_beside.is_some() {
+                return Err(Error::InvalidArgument(
+                    "a logged batch takes its changes with push_logged alone".to_owned(),
+                ));
+            }
             if batch.builder.is_silent() {
                 self.flag_silent()?;
             }
@@ -6302,14 +6324,18 @@ impl Inner {
                 shards.push(shard);
             }
         }
-        if fixed_ts || counter_writes > 1 || converts {
+        let mut out = if fixed_ts || counter_writes > 1 || converts {
             let combines = counter_writes > 1 || converts;
-            return Ok((
-                prepare_counter_writes(&batch.builder, catalog, combines)?,
-                shards,
-            ));
+            prepare_counter_writes(&batch.builder, catalog, combines)?
+        } else {
+            batch.builder
+        };
+        // D336: changes as their primary logged them, after the ordinary part's rewrite, so
+        // none of it touches them.
+        if let Some(logged) = batch.logged_beside {
+            append_logged(&mut out, &logged, view, &mut shards)?;
         }
-        Ok((batch.builder, shards))
+        Ok((out, shards))
     }
 
     pub(crate) fn submit(
@@ -8029,9 +8055,32 @@ const REPLICA_STATE_TS: Timestamp = 1;
 /// only for such a batch.
 #[inline(never)]
 fn route_logged(batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
-    let catalog = &view.catalog;
     let mut shards = Shards::new();
-    for m in batch.batch().iter() {
+    check_logged(&batch.builder, view, &mut shards)?;
+    Ok((batch.builder, shards))
+}
+
+/// Appends `logged`'s changes to the routed `out` as they are (D336,
+/// [`WriteBatch::push_logged_beside`]), checked as a logged batch's, their shards added.
+fn append_logged(
+    out: &mut BatchBuilder,
+    logged: &BatchBuilder,
+    view: &View,
+    shards: &mut Shards,
+) -> Result<()> {
+    check_logged(logged, view, shards)?;
+    for m in logged.batch().iter() {
+        let m = m?;
+        out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
+    }
+    Ok(())
+}
+
+/// Checks logged changes as a logged batch's are routed (each family in its table, a merge's
+/// operator known, the table's tablets there), adding their shards to `shards`.
+fn check_logged(builder: &BatchBuilder, view: &View, shards: &mut Shards) -> Result<()> {
+    let catalog = &view.catalog;
+    for m in builder.batch().iter() {
         let m = m?;
         let Some(meta) = catalog.family(m.family) else {
             return Err(Error::FamilyNotFound(format!("family {}", m.family.0)));
@@ -8054,7 +8103,7 @@ fn route_logged(batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)
             shards.push(shard);
         }
     }
-    Ok((batch.builder, shards))
+    Ok(())
 }
 
 /// The ids reserved for a replica's own state (D315 PR 3; simp724's R1): never allocated (the

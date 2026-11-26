@@ -60,6 +60,8 @@ serve = [
     "pigeonhole/__unstable-replication",
     # D329: a cluster transaction's branches prepare and are decided by the home partition.
     "pigeonhole/__unstable-txn-prepare",
+    # D336: an old owner's tail, replayed into the partition's new owner.
+    "pigeonhole/__unstable-tail-replay",
     # D317 ticket 8a: a node's compaction default from the physical cores this process may
     # run on, counted as the library counts them.
     "dep:pigeonhole-io",
