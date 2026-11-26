@@ -7348,6 +7348,15 @@ pub struct ClusterMap {
     /// D332: the balancer's last 32 actions, and each change of its reason for none.
     #[prost(message, repeated, tag = "17")]
     pub balancer_events: ::prost::alloc::vec::Vec<BalancerEvent>,
+    /// The cluster's adopted features (ICR 0117's adopted-features section): the high-water
+    /// mark of `NodeStatus.map_features`. The writer adds a string once every node of the map
+    /// answered with it, in one round of asks, and nothing ever removes one. A gate that needs
+    /// every node to keep a field passes for an adopted feature without asking, so a node that
+    /// is down (a failover's old owner) doesn't hold it back. A node whose build lacks an
+    /// adopted feature refuses the map, at start or when it takes one, and a map adding such a
+    /// node is refused: running a node below the cluster's adopted features is unsupported.
+    #[prost(string, repeated, tag = "18")]
+    pub adopted_features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// D332: the balancer's bounds. A field at 0 takes the default given.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

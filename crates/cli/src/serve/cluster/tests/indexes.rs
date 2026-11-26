@@ -453,11 +453,14 @@ fn the_first_index_waits_for_every_node_to_keep_indexes() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, [p1, _p2], [a, _b, c], dirs) = three_nodes(&rt);
     rt.block_on(async {
-        users_family(a).await;
+        // c runs a build without indexes from the start: armed before the first map set,
+        // which would otherwise adopt the feature (ClusterMap.adopted_features), after which
+        // a node without it is a rollback below the cluster's features.
         super::super::OLD_INDEXES
             .lock()
             .unwrap()
             .push(dirs[2].clone());
+        users_family(a).await;
         let mut v = vector_index("uv");
         v.follows = "users".into();
         let e = VectorsClient::new(channel(a).await)

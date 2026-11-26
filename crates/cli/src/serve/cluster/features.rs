@@ -18,9 +18,15 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     MOVE_ABORTING_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
     BALANCER_FEATURE,
+    ADOPTED_FEATURES_FEATURE,
     REPLICA_ACKS_FEATURE,
     REPLICA_ACK_WAIT_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.adopted_features` itself: a node without it (1.3)
+/// would drop the field and read as divergent, so nothing is adopted until every node
+/// reports it.
+pub(crate) const ADOPTED_FEATURES_FEATURE: &str = "adopted_features";
 
 /// [`MAP_FEATURES`]' name for D335 (ICR 0146): a build that serves
 /// `Replication.FollowAcked`, so its replica copies acknowledge what they applied.
@@ -127,6 +133,12 @@ impl Node {
         feature: &str,
         what: &str,
     ) -> Result<(), ApiError> {
+        // An adopted feature (`ClusterMap.adopted_features`): every node of the map answered
+        // with it once, and none may run a build below it since, so a node that's down (a
+        // failover's old owner) doesn't hold the map back.
+        if map.adopted_features.iter().any(|f| f == feature) {
+            return Ok(());
+        }
         // Every node at once, as a confirm round asks them (simp724's n2 on #1920): k nodes
         // that don't answer cost one push timeout, not k.
         let peers = map
@@ -143,6 +155,169 @@ impl Node {
                  map, or that node would read as divergent: {}. Finish the upgrade first",
                 lacking.join(", ")
             )))
+        }
+    }
+
+    /// Adds to `map.adopted_features` every feature this build keeps that every node of the
+    /// map reports now, in one round of fresh asks (never the cache: cli692 on the ruling).
+    /// Nothing when a node doesn't answer, or when one didn't in the last [`PEER_DOWN_TTL`]
+    /// (no round then: simp724's S1 on #2237), or once this build's features are all
+    /// adopted. Never removes one. Whether it added any.
+    pub(super) async fn adopt_features(self: &Arc<Self>, map: &mut ClusterMap) -> bool {
+        let missing: Vec<String> = super::status::build_features(&self.dir)
+            .into_iter()
+            .filter(|f| !map.adopted_features.contains(f))
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
+        let peers: Vec<(String, String)> = map
+            .nodes
+            .iter()
+            .filter(|n| n.id != self.id)
+            .map(|n| (n.id.clone(), n.address.clone()))
+            .collect();
+        // A peer down lately: the round would wait a push timeout for it and adopt nothing.
+        let down_lately = {
+            let known = self
+                .peer_features
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            peers.iter().any(|(id, _)| {
+                known
+                    .get(id)
+                    .is_some_and(|(at, fs)| fs.is_none() && at.elapsed() < PEER_DOWN_TTL)
+            })
+        };
+        if down_lately {
+            return false;
+        }
+        let mut lists = Vec::new();
+        for (_, _, fs) in self
+            .asked_features(peers.into_iter(), ADOPTED_FEATURES_FEATURE, false)
+            .await
+        {
+            match fs {
+                Some(fs) => lists.push(fs),
+                None => return false,
+            }
+        }
+        // A node that would drop the field itself (1.3) holds every adoption back.
+        if !lists
+            .iter()
+            .all(|fs| fs.iter().any(|f| f == ADOPTED_FEATURES_FEATURE))
+        {
+            return false;
+        }
+        let mut added = false;
+        for f in missing {
+            if lists.iter().all(|fs| fs.contains(&f)) {
+                map.adopted_features.push(f);
+                added = true;
+            }
+        }
+        map.adopted_features.sort();
+        added
+    }
+
+    /// `FailedPrecondition` naming each node `map` adds to `current`'s nodes that doesn't
+    /// report every feature `map` adopted, asked now in one round: a node below the
+    /// cluster's adopted features would drop their fields and read as divergent.
+    pub(super) async fn new_nodes_keep_adopted(
+        self: &Arc<Self>,
+        current: &ClusterMap,
+        map: &ClusterMap,
+    ) -> Result<(), ApiError> {
+        let added: Vec<(String, String)> = map
+            .nodes
+            .iter()
+            .filter(|n| n.id != self.id && !current.nodes.iter().any(|c| c.id == n.id))
+            .map(|n| (n.id.clone(), n.address.clone()))
+            .collect();
+        let Some(first) = map.adopted_features.first() else {
+            return Ok(());
+        };
+        if added.is_empty() {
+            return Ok(());
+        }
+        let mut below = Vec::new();
+        for (id, _, fs) in self.asked_features(added.into_iter(), first, false).await {
+            match fs {
+                None => below.push(format!("{id} (no answer)")),
+                Some(fs) => {
+                    let lacks: Vec<&String> = map
+                        .adopted_features
+                        .iter()
+                        .filter(|f| !fs.contains(f))
+                        .collect();
+                    if !lacks.is_empty() {
+                        below.push(format!("{id} (lacks {lacks:?})"));
+                    }
+                }
+            }
+        }
+        if below.is_empty() {
+            return Ok(());
+        }
+        below.sort();
+        Err(ApiError::failed_precondition(format!(
+            "this map adds nodes that don't report every feature the cluster adopted \
+             (ClusterMap.adopted_features): {}. Upgrade them before adding them",
+            below.join(", ")
+        )))
+    }
+
+    /// The writer's duty (cli692's Q1 on #2237): with automatic failover on, once every node
+    /// runs a build with features the cluster hasn't adopted (after an upgrade), it adopts
+    /// them by setting its map again, so a cluster with no map change since its upgrade has
+    /// them at its first failover. Without failover, only a map set adopts (no map version is
+    /// raised in the background). Nothing while this node isn't the writer or a node is down.
+    pub(crate) async fn maybe_adopt_features(self: &Arc<Self>) {
+        let Ok(current) = self.get_map() else {
+            return;
+        };
+        if !current.failover || super::schema::writer(&current) != self.id {
+            return;
+        }
+        // A peer that answered lately without a feature not yet adopted (a mixed-version
+        // window): no fan-out each lease period until its answer ages out (simp724's S2).
+        let missing: Vec<String> = super::status::build_features(&self.dir)
+            .into_iter()
+            .filter(|f| !current.adopted_features.contains(f))
+            .collect();
+        let lacking_lately = {
+            let known = self
+                .peer_features
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            current.nodes.iter().filter(|n| n.id != self.id).any(|n| {
+                known.get(&n.id).is_some_and(|(at, fs)| {
+                    at.elapsed() < PEER_FEATURES_TTL
+                        && fs
+                            .as_ref()
+                            .is_some_and(|fs| missing.iter().all(|f| !fs.contains(f)))
+                })
+            })
+        };
+        if lacking_lately {
+            return;
+        }
+        let mut probe = current.clone();
+        if !self.adopt_features(&mut probe).await {
+            return;
+        }
+        let mut next = current;
+        next.map_version += 1;
+        if let Err(e) = self
+            .set_map(SetMapRequest {
+                copies: Vec::new(),
+                expected_map_version: next.map_version - 1,
+                map: Some(next),
+                force: false,
+            })
+            .await
+        {
+            eprintln!("phdb serve: adopting the cluster's features: {}", e.message);
         }
     }
 
@@ -177,6 +352,22 @@ impl Node {
         feature: &str,
         cached: bool,
     ) -> Vec<(String, PeerFeature)> {
+        self.asked_features(peers, feature, cached)
+            .await
+            .into_iter()
+            .map(|(id, v, _)| (id, v))
+            .collect()
+    }
+
+    /// [`features_of`](Self::features_of), with each peer's whole list of features as it
+    /// answered (`None`: no answer), so a caller needs no read of the shared cache after
+    /// (simp724 on #2237).
+    async fn asked_features(
+        self: &Arc<Self>,
+        peers: impl Iterator<Item = (String, String)>,
+        feature: &str,
+        cached: bool,
+    ) -> Vec<(String, PeerFeature, Option<Vec<String>>)> {
         let verdict = |fs: &Option<Vec<String>>| match fs {
             Some(fs) if fs.iter().any(|f| f == feature) => PeerFeature::Has,
             Some(_) => PeerFeature::Lacks,
@@ -199,9 +390,9 @@ impl Node {
                         };
                         at.elapsed() < ttl
                     })
-                    .map(|(_, fs)| verdict(fs));
-                if let Some(v) = known {
-                    out.push((id, v));
+                    .map(|(_, fs)| (verdict(fs), fs.clone()));
+                if let Some((v, fs)) = known {
+                    out.push((id, v, fs));
                     continue;
                 }
             }
@@ -232,8 +423,8 @@ impl Node {
                 node.peer_features
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(id.clone(), (std::time::Instant::now(), seen));
-                (id, v)
+                    .insert(id.clone(), (std::time::Instant::now(), seen.clone()));
+                (id, v, seen)
             });
         }
         out.extend(asks.join_all().await);

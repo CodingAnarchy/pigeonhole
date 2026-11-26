@@ -418,6 +418,7 @@ mod tests {
             balance: Default::default(),
             balancer: Default::default(),
             balancer_events: Default::default(),
+            adopted_features: Vec::new(),
             cluster_id: "c1".into(),
             map_version: 7,
             previous_nodes: Vec::new(),

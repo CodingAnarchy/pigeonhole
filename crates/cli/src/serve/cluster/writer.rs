@@ -329,6 +329,9 @@ impl Node {
                 node.maybe_fail_over().await;
             }
             if let Some(node) = claimed.0.upgrade() {
+                node.maybe_adopt_features().await;
+            }
+            if let Some(node) = claimed.0.upgrade() {
                 node.abort_orphaned_hand_overs();
             }
             if let Some(node) = claimed.0.upgrade() {
