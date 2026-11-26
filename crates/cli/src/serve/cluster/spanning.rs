@@ -1140,6 +1140,34 @@ pub(crate) async fn check_feature(
 
 /// Whether `op` is a spanning transaction's call (D329): a `Begin` that opts in, or a
 /// transaction call on a spanning id. Its home's owner serves it with [`serve_home`].
+/// D335 PR 2a (the coordinator, after simp724's P1 on #2238): a spanning transaction that
+/// writes and touches a partition whose map sets `replica_acks` is refused at its commit,
+/// before any prepare, so nothing is written and the transaction stays open: its writes
+/// can't be covered until D335 PR 4 replicates prepares, and an uncovered answer would
+/// break REFUSE's promise for a client that doesn't read `replica_acks`. One that opted
+/// down (`REPLICATION_MODE_ASYNC`, or the header) commits, answered with `replica_acks` 0.
+fn refuse_uncovered(node: &Node, touched: &[String]) -> Result<(), ApiError> {
+    let Ok(map) = node.get_map() else {
+        return Ok(());
+    };
+    let covered: Vec<&str> = map
+        .partitions
+        .iter()
+        .filter(|p| p.replica_acks > 0 && touched.contains(&p.id))
+        .map(|p| p.id.as_str())
+        .collect();
+    if covered.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::failed_precondition(format!(
+        "this spanning transaction writes across partitions, and {covered:?} wait for replica \
+         acknowledgements (replica_acks), which spanning transactions can't get yet (D335 PR \
+         4): nothing was committed, and the transaction is still open. Commit it with \
+         replication REPLICATION_MODE_ASYNC (or x-pigeonhole-replication: async) to commit it \
+         uncovered, or abort it"
+    )))
+}
+
 pub(crate) fn spanning_call(op: &ServiceOp) -> bool {
     let spanning = |id: &str| super::super::sessions::spanning_parts(id).is_some();
     match op {
@@ -1329,6 +1357,17 @@ pub(crate) async fn serve_home(
                 || span.parts.values().any(|t| t.wrote);
             if writes && !caller.scope.allows(super::super::auth::Scope::Write) {
                 return Err(ApiError::permission_denied("commit writes"));
+            }
+            // D335 PR 2a: refused before anything is prepared, unless it opted down.
+            if writes
+                && !caller.replication_async
+                && r.replication != proto::ReplicationMode::Async as i32
+            {
+                let touched: Vec<String> = std::iter::once(driver.home.to_string())
+                    .chain(span.parts.keys().cloned())
+                    .chain(others.keys().map(|p| p.to_string()))
+                    .collect();
+                refuse_uncovered(&driver.node, &touched)?;
             }
             drop(home.txn_rows(&mine).await?);
             // D331 (#2155): the home's rows, before any row goes to a branch. The commit

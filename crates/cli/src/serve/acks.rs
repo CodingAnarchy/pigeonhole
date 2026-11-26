@@ -163,10 +163,13 @@ struct Inner {
     frontier: Option<Pos>,
     /// Writes waiting for the frontier, by their position, each with when it began.
     waiters: BTreeMap<Pos, Vec<(oneshot::Sender<u32>, Instant)>>,
-    /// The oldest write that waited and isn't covered yet, and when it began to wait: one
-    /// that timed out stays here until the frontier passes it, so a replica that stopped
-    /// acknowledging reads as unhealthy (§7) though no write waits on it any more.
-    oldest: Option<(Pos, Instant)>,
+    /// Every write that waited and isn't covered yet, by position, with when it began to
+    /// wait (the earliest at a position). One that timed out or was answered otherwise
+    /// stays here until the frontier passes it, so a replica that stopped acknowledging
+    /// reads as unhealthy (§7) though no write waits on it any more (simp724's N1 on
+    /// #2238). At most [`PENDING_CAP`]: past it a write isn't added, which only keeps the
+    /// lowest positions, the ones health reads.
+    uncovered: BTreeMap<Pos, Instant>,
     /// The partition closed here: no write waits any more.
     closed: bool,
     /// The wait histogram: per bucket (not cumulative; the last is past the last bound),
@@ -199,26 +202,28 @@ impl ReplicaAcks {
     }
 
     /// Takes what the map says of the partition, at open and on every install (each
-    /// under the node's install lock, so the newest wins; an older version is ignored).
-    /// A node no longer among `replicas` stops counting, and so does every node when the
-    /// partition's history changed (feed1248's A1); waiters the new frontier covers wake.
+    /// under the node's install lock, so the newest wins; an older version is ignored);
+    /// waiters the new frontier covers wake.
+    ///
+    /// A node no longer among `replicas` stops counting (feed1248's A1) by the count's
+    /// filter ([`Inner::counted`]), not by dropping its stream's entry: nothing makes that
+    /// stream end at the install, and a node removed and added again by two quick installs
+    /// may keep the same live stream, whose acknowledgements stay true of its copy. When
+    /// the partition's history changed, every entry's acknowledgement is forgotten (its
+    /// positions were the old history's) but the streams stay attached, so each counts
+    /// again from its next acknowledgement, without a reconnect (feed1248's Q1 and Q2 on
+    /// #2238).
     pub(crate) fn configure(&self, config: AckConfig) {
         let mut inner = self.lock();
         if config.version < inner.config.version {
             return;
         }
-        let history_changed = inner.config.version > 0 && inner.config.history != config.history;
-        let before = inner.nodes.len();
-        if history_changed {
-            inner.nodes.clear();
-        } else {
-            inner
-                .nodes
-                .retain(|node, _| config.replicas.iter().any(|r| r == node));
-        }
-        let gone = before - inner.nodes.len();
-        if gone > 0 {
-            self.streams.fetch_sub(gone, Ordering::Relaxed);
+        if inner.config.version > 0 && inner.config.history != config.history {
+            let now = Instant::now();
+            for e in inner.nodes.values_mut() {
+                e.acked = None;
+                e.moved = now;
+            }
         }
         self.k.store(config.k, Ordering::Relaxed);
         inner.config = config;
@@ -336,10 +341,9 @@ impl ReplicaAcks {
             let (tx, rx) = oneshot::channel();
             let now = Instant::now();
             inner.waiters.entry(pos).or_default().push((tx, now));
-            inner.oldest = Some(match inner.oldest {
-                Some((p, at)) => (p.min(pos), at.min(now)),
-                None => (pos, now),
-            });
+            if inner.uncovered.len() < PENDING_CAP {
+                inner.uncovered.entry(pos).or_insert(now);
+            }
             (rx, timeout)
         };
         let deadline = tokio::time::Instant::now() + timeout;
@@ -406,7 +410,11 @@ impl ReplicaAcks {
         let healthy = inner
             .nodes
             .iter()
-            .filter(|(node, e)| replicas.iter().any(|r| r == *node) && inner.is_healthy(e, now))
+            .filter(|(node, e)| {
+                replicas.iter().any(|r| r == *node)
+                    && inner.config.replicas.iter().any(|r| r == *node)
+                    && inner.is_healthy(e, now)
+            })
             .count();
         (inner.frontier, u32::try_from(healthy).unwrap_or(u32::MAX))
     }
@@ -601,16 +609,14 @@ impl Inner {
                     let _ = tx.send(n);
                 }
             }
-            // Covered: the oldest uncovered write is now the first still waiting, if any.
-            if self.oldest.is_some_and(|(p, _)| p <= f) {
-                self.oldest = self
-                    .waiters
-                    .first_key_value()
-                    .map(|(&p, ws)| (p, ws.iter().map(|(_, at)| *at).min().unwrap_or(now)));
+            while let Some(first) = self.uncovered.first_entry()
+                && *first.key() <= f
+            {
+                first.remove();
             }
         }
         if self.config.k == 0 {
-            self.oldest = None;
+            self.uncovered.clear();
         }
         self.track_short(now);
     }
@@ -624,11 +630,11 @@ impl Inner {
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 
-    /// §7's healthy: a counted replica, unless the oldest uncovered write began waiting
+    /// §7's healthy: a counted replica, unless the lowest uncovered write began waiting
     /// [`STALL`] ago for a position past its last acknowledgement, and it acknowledged
     /// nothing new in that time.
     fn is_healthy(&self, e: &Entry, now: Instant) -> bool {
-        let Some((pos, since)) = self.oldest else {
+        let Some((&pos, &since)) = self.uncovered.first_key_value() else {
             return true;
         };
         let stalled = now.saturating_duration_since(since) >= STALL
@@ -801,12 +807,22 @@ mod tests {
             acks.status(&replicas(&["a", "b"])),
             (Some(Pos::commit(3)), 1)
         );
-        // A new history uncounts every stream.
+        // A new history forgets every acknowledgement, but the streams stay attached: the
+        // next acknowledgement counts without a reconnect (feed1248's Q1 on #2238).
         acks.configure(AckConfig {
             history: 2,
             ..config(0, &["a"], 3)
         });
-        assert_eq!(acks.status(&replicas(&["a"])), (None, 0));
+        assert_eq!(acks.status(&replicas(&["a"])), (None, 1));
+        a.ack(Pos::commit(2));
+        assert_eq!(acks.status(&replicas(&["a"])), (Some(Pos::commit(2)), 1));
+        // b, added again while its stream lived: counted again (feed1248's Q2).
+        acks.configure(AckConfig {
+            history: 2,
+            ..config(0, &["a", "b"], 4)
+        });
+        b.ack(Pos::commit(9));
+        assert_eq!(acks.status(&replicas(&["a", "b"])).1, 2);
     }
 
     #[test]
@@ -984,7 +1000,7 @@ mod tests {
             "idle: healthy on its stream"
         );
         // A write that waited past STALL, and timed out: still uncovered.
-        inner.oldest = Some((Pos::commit(2), long_ago));
+        inner.uncovered.insert(Pos::commit(2), long_ago);
         assert_eq!(
             inner.healthy(Instant::now()),
             0,
@@ -994,6 +1010,38 @@ mod tests {
         drop(inner);
         a.ack(Pos::commit(2));
         assert_eq!(acks.lock().healthy(Instant::now()), 1);
-        assert_eq!(acks.lock().oldest, None);
+        assert!(acks.lock().uncovered.is_empty());
+    }
+
+    /// simp724's N1 on #2238: two writes timed out, and one replica covers only the first.
+    /// The second stays uncovered, so the replica that acknowledged neither stays unhealthy
+    /// (with a single "oldest", the first's cover forgot it).
+    #[test]
+    fn every_timed_out_write_stays_uncovered_until_the_frontier_passes_it() {
+        let acks = configured(1, &["a", "b"]);
+        let a = acks.attach("a");
+        let b = acks.attach("b");
+        a.ack(Pos::commit(1));
+        b.ack(Pos::commit(1));
+        let long_ago = Instant::now() - STALL - Duration::from_millis(1);
+        {
+            let mut inner = acks.lock();
+            for e in inner.nodes.values_mut() {
+                e.moved = long_ago;
+            }
+            inner.uncovered.insert(Pos::commit(2), long_ago);
+            inner.uncovered.insert(Pos::commit(3), long_ago);
+            assert_eq!(inner.healthy(Instant::now()), 0);
+        }
+        // a covers 2 (the frontier at k = 1): a moved, b didn't, and 3 is still uncovered.
+        a.ack(Pos::commit(2));
+        let inner = acks.lock();
+        assert_eq!(
+            inner.uncovered.keys().copied().collect::<Vec<_>>(),
+            [Pos::commit(3)]
+        );
+        assert_eq!(inner.healthy(Instant::now()), 1, "a alone: b still stalled");
+        drop(inner);
+        drop(b);
     }
 }

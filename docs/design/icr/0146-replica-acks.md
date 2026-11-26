@@ -94,26 +94,32 @@ The network API (`pigeonhole.v1`), additive:
 - **The wait:**
   - It comes after the engine's commit and before D326's after-commit lease check.
   - It lasts until k of the map's replicas acknowledged the commit's own position (`(seqno, 0)`, the seqno its `CommitInfo` names). A reply that names no seqno waits for the node's visible seqno read after the commit. That's at or past its own, so it may wait longer, never less.
-  - **At the timeout,** `OutcomeUnknown` ("not acknowledged within"). The write is committed on the owner and may be covered later.
+  - **At the timeout,** `OutcomeUnknown` ("not acknowledged within"). The write is committed on the owner and may be covered later. A transaction's `Commit` records that outcome, so a repeated `Commit` or `Transactions.Outcome` keeps answering `OutcomeUnknown`, even once the write is covered (simp724's Q1).
   - **When the partition's lease ends first,** `OutcomeUnknown` at once: a lapse wakes it, and a lease that runs out wakes it at its end.
   - **When the partition closes here,** `OutcomeUnknown`.
 - **Too few healthy replicas (REFUSE):**
   - A write that would wait is refused at admission with `Unavailable` while fewer than k of the map's replicas are healthy. It's retry-safe: nothing was written.
-  - **Healthy:** a counted replica, unless the oldest uncovered write began waiting at least 2 s ago (twice the follow's heartbeat) for a position past the replica's last acknowledgement, and the replica acknowledged nothing new in that time.
-  - A write that timed out stays uncovered until the frontier passes it, so a replica that stopped acknowledging reads unhealthy though no write waits any more.
+  - **Healthy:** a counted replica, unless the lowest uncovered write began waiting at least 2 s ago (twice the follow's heartbeat) for a position past the replica's last acknowledgement, and the replica acknowledged nothing new in that time.
+  - Every write that waited stays uncovered until the frontier passes it, a timed-out one included, so a replica that stopped acknowledging reads unhealthy though no write waits any more (simp724's N1).
   - An idle partition's replicas stay healthy on their stream alone.
   - `ASYNC` (acknowledging uncovered while short) is D335 PR 2b.
 - **Who counts:**
   - Only the map's replicas of the partition.
-  - An install that drops a node from `replicas` uncounts its stream (feed1248's A1). Its later acknowledgements are ignored until it follows again.
-  - An install that changes the partition's `history_epoch` uncounts every stream.
+  - A node the map no longer lists stops counting at that install (feed1248's A1), by the count's filter. Its stream's entry is kept: nothing ends the stream at the install, and a node removed and added back by two quick installs may keep the same live stream, whose acknowledgements stay true of its copy.
+  - An install that changes the partition's `history_epoch` forgets every acknowledgement, since its positions were the old history's. The streams stay attached, so each counts again from its next acknowledgement, without a reconnect (feed1248's Q1 and Q2).
   - Any other install leaves the counted streams and the waiting writes alone.
   - A stream that attaches while its node isn't listed yet is kept, and counts once the map lists it.
 - **The write paths that wait:**
   - every call `Service::call` admits as a write on a cluster partition: `Data`'s `Mutate`, `MutateReturning`, `CheckAndMutate` (when it applied) and `Batch`; `Text.Put` and `Text.Delete`; `Vectors.Insert`, `Vectors.Delete` and `Vectors.BulkLoad` (once, after its last chunk); and a `Memory` write where it reaches its partition through `Service::call`;
   - a single-partition transaction's `Commit`, before its outcome is recorded, so a repeated `Commit` or `Transactions.Outcome` never reads it as answered sooner.
+- **Spanning transactions (D329), until D335 PR 4:**
+  - Their writes can't be covered until PR 4 replicates prepares, and no ack wait goes on a decide (simp724's S4).
+  - So a spanning transaction that writes, and touches a partition whose map sets `replica_acks` (its home, a branch, or a partition its commit's rows go to), is refused at its `Commit`: `FailedPrecondition`, before any prepare. Nothing is written and the transaction stays open. This fails closed, like REFUSE (simp724's P1, the coordinator's ruling).
+  - Committed opted down (`REPLICATION_MODE_ASYNC`, or the header), it commits uncovered, answered with `replica_acks` 0.
+  - A read-only spanning transaction commits as before.
+  - PR 4 lifts the refusal.
 - **The write paths that don't wait:**
-  - A spanning transaction (D329), until D335 PR 4: the home's commit, `BranchDecide`'s shares and the resolver's decisions are answered uncovered (`replica_acks` 0). Coverage needs PR 4's replicated prepares, and no ack wait goes on a decide (simp724's S4).
+  - A spanning transaction that opted down: its home's commit, `BranchDecide`'s shares and the resolver's decisions.
   - Work no client waits on: range-move copies, catch-ups, drops and prunes (feed-silent), text index rebuilds and packs, vector rebalances, and a memory store's background loops.
 
 ### Callers

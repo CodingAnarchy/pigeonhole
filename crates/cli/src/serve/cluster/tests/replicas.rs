@@ -23,7 +23,7 @@ async fn copy_of(port: u16, p: &str) -> Option<LocalPartition> {
 
 /// Sets the writer's (a's) map with `p`'s replicas as `replicas`, retried while a node that
 /// just started is still taking its peers' maps.
-async fn set_replicas(a: u16, p: &str, replicas: &[&str]) {
+pub(super) async fn set_replicas(a: u16, p: &str, replicas: &[&str]) {
     let mut last = None;
     for _ in 0..100 {
         let mut m = client(a)
@@ -2093,7 +2093,7 @@ fn a_replica_copy_of_an_owner_without_acknowledgements_follows_as_before() {
 /// Sets `p`'s `replica_acks` to `k` through the writer at `a` (D335 PR 2), retried while a
 /// node that just started is still taking its peers' maps. `InvalidArgument` is the map's
 /// refusal, answered at once.
-async fn set_acks(a: u16, p: &str, k: u32) -> Result<(), tonic::Status> {
+pub(super) async fn set_acks(a: u16, p: &str, k: u32) -> Result<(), tonic::Status> {
     let mut last = None;
     for _ in 0..100 {
         let mut m = client(a)
