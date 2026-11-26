@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package pigeonhole.v1;
 
+import "pigeonhole/v1/common.proto";
+
 service Replication {
   // The primary's durable feed of every table from `token`, as encoded events in batches,
   // each with the primary's durable frontier (a batch with no events is sent while the
@@ -13,6 +15,42 @@ service Replication {
   // fails its apply. FeedExpired (OUT_OF_RANGE) once the token is older than the primary
   // keeps: the replica bootstraps again. Refused on a server that is itself a replica.
   rpc Follow(FollowRequest) returns (stream ReplicationBatch);
+  // D335 (ICR 0146): `Follow` for a cluster partition's replica copy, with the replica's
+  // acknowledgements on the request stream. The first message is a `FollowStart`; each later
+  // one an `Ack`. The owner sends what `Follow` sends. Only a cluster partition's map
+  // replicas call it, under the cluster token, and only on an owner that reports the map
+  // feature `replica_acks`; an older owner answers UNIMPLEMENTED, and the replica uses
+  // `Follow`. gRPC only.
+  rpc FollowAcked(stream FollowMessage) returns (stream ReplicationBatch);
+}
+
+// D335: a message of `FollowAcked`'s request stream.
+message FollowMessage {
+  oneof kind {
+    // The first message, and only the first.
+    FollowStart start = 1;
+    // Every later message.
+    Ack ack = 2;
+  }
+}
+
+// D335: what `FollowAcked` follows, and who follows it.
+message FollowStart {
+  // As `Follow`'s.
+  FollowRequest request = 1;
+  // The replica's node id, as the cluster member claims it (the cluster token proves
+  // membership, not which node). It must match the request's node-id header.
+  string node = 2;
+  // The partition followed: the owner serves this partition only.
+  string partition = 3;
+}
+
+// D335: the replica's acknowledgement. Every commit at or before `position` is applied in
+// its copy and durable there, and the copy's stored token is at `position`. A replica sends
+// one after each apply that stored a token, never for a batch with no events, and never
+// past what it stored. While one stream lives, its positions only rise.
+message Ack {
+  Position position = 1;
 }
 
 message FollowRequest {

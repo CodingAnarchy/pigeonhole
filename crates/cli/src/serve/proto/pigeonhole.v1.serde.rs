@@ -1,3 +1,94 @@
+impl serde::Serialize for Ack {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.position.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.Ack", len)?;
+        if let Some(v) = self.position.as_ref() {
+            struct_ser.serialize_field("position", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Ack {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "position",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Position,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "position" => Ok(GeneratedField::Position),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Ack;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.Ack")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Ack, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut position__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Position => {
+                            if position__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("position"));
+                            }
+                            position__ = map_.next_value()?;
+                        }
+                    }
+                }
+                Ok(Ack {
+                    position: position__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.Ack", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for AggregateInput {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -8195,6 +8286,115 @@ impl<'de> serde::Deserialize<'de> for FenceReason {
         deserializer.deserialize_any(GeneratedVisitor)
     }
 }
+impl serde::Serialize for FollowMessage {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.kind.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.FollowMessage", len)?;
+        if let Some(v) = self.kind.as_ref() {
+            match v {
+                follow_message::Kind::Start(v) => {
+                    struct_ser.serialize_field("start", v)?;
+                }
+                follow_message::Kind::Ack(v) => {
+                    struct_ser.serialize_field("ack", v)?;
+                }
+            }
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for FollowMessage {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "start",
+            "ack",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Start,
+            Ack,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "start" => Ok(GeneratedField::Start),
+                            "ack" => Ok(GeneratedField::Ack),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = FollowMessage;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.FollowMessage")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<FollowMessage, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut kind__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Start => {
+                            if kind__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("start"));
+                            }
+                            kind__ = map_.next_value::<::std::option::Option<_>>()?.map(follow_message::Kind::Start)
+;
+                        }
+                        GeneratedField::Ack => {
+                            if kind__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("ack"));
+                            }
+                            kind__ = map_.next_value::<::std::option::Option<_>>()?.map(follow_message::Kind::Ack)
+;
+                        }
+                    }
+                }
+                Ok(FollowMessage {
+                    kind: kind__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.FollowMessage", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for FollowRequest {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -8288,6 +8488,131 @@ impl<'de> serde::Deserialize<'de> for FollowRequest {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.FollowRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for FollowStart {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.request.is_some() {
+            len += 1;
+        }
+        if !self.node.is_empty() {
+            len += 1;
+        }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.FollowStart", len)?;
+        if let Some(v) = self.request.as_ref() {
+            struct_ser.serialize_field("request", v)?;
+        }
+        if !self.node.is_empty() {
+            struct_ser.serialize_field("node", &self.node)?;
+        }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for FollowStart {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "request",
+            "node",
+            "partition",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Request,
+            Node,
+            Partition,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "request" => Ok(GeneratedField::Request),
+                            "node" => Ok(GeneratedField::Node),
+                            "partition" => Ok(GeneratedField::Partition),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = FollowStart;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.FollowStart")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<FollowStart, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut request__ = None;
+                let mut node__ = None;
+                let mut partition__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Request => {
+                            if request__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("request"));
+                            }
+                            request__ = map_.next_value()?;
+                        }
+                        GeneratedField::Node => {
+                            if node__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("node"));
+                            }
+                            node__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(FollowStart {
+                    request: request__,
+                    node: node__.unwrap_or_default(),
+                    partition: partition__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.FollowStart", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for ForgetRequest {
@@ -13747,6 +14072,15 @@ impl serde::Serialize for LocalPartition {
         if self.write_bytes_rate.is_some() {
             len += 1;
         }
+        if self.acked_position.is_some() {
+            len += 1;
+        }
+        if self.healthy_replicas != 0 {
+            len += 1;
+        }
+        if self.replica_applied_position.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -13877,6 +14211,15 @@ impl serde::Serialize for LocalPartition {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("write_bytes_rate", ToString::to_string(&v).as_str())?;
         }
+        if let Some(v) = self.acked_position.as_ref() {
+            struct_ser.serialize_field("acked_position", v)?;
+        }
+        if self.healthy_replicas != 0 {
+            struct_ser.serialize_field("healthy_replicas", &self.healthy_replicas)?;
+        }
+        if let Some(v) = self.replica_applied_position.as_ref() {
+            struct_ser.serialize_field("replica_applied_position", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -13943,6 +14286,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "dropWaits",
             "write_bytes_rate",
             "writeBytesRate",
+            "acked_position",
+            "ackedPosition",
+            "healthy_replicas",
+            "healthyReplicas",
+            "replica_applied_position",
+            "replicaAppliedPosition",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -13980,6 +14329,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             FileBytes,
             DropWaits,
             WriteBytesRate,
+            AckedPosition,
+            HealthyReplicas,
+            ReplicaAppliedPosition,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -14034,6 +14386,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "fileBytes" | "file_bytes" => Ok(GeneratedField::FileBytes),
                             "dropWaits" | "drop_waits" => Ok(GeneratedField::DropWaits),
                             "writeBytesRate" | "write_bytes_rate" => Ok(GeneratedField::WriteBytesRate),
+                            "ackedPosition" | "acked_position" => Ok(GeneratedField::AckedPosition),
+                            "healthyReplicas" | "healthy_replicas" => Ok(GeneratedField::HealthyReplicas),
+                            "replicaAppliedPosition" | "replica_applied_position" => Ok(GeneratedField::ReplicaAppliedPosition),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14086,6 +14441,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut file_bytes__ = None;
                 let mut drop_waits__ = None;
                 let mut write_bytes_rate__ = None;
+                let mut acked_position__ = None;
+                let mut healthy_replicas__ = None;
+                let mut replica_applied_position__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -14316,6 +14674,26 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                                 map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
                             ;
                         }
+                        GeneratedField::AckedPosition => {
+                            if acked_position__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("ackedPosition"));
+                            }
+                            acked_position__ = map_.next_value()?;
+                        }
+                        GeneratedField::HealthyReplicas => {
+                            if healthy_replicas__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("healthyReplicas"));
+                            }
+                            healthy_replicas__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::ReplicaAppliedPosition => {
+                            if replica_applied_position__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaAppliedPosition"));
+                            }
+                            replica_applied_position__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -14352,6 +14730,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     file_bytes: file_bytes__.unwrap_or_default(),
                     drop_waits: drop_waits__.unwrap_or_default(),
                     write_bytes_rate: write_bytes_rate__,
+                    acked_position: acked_position__,
+                    healthy_replicas: healthy_replicas__.unwrap_or_default(),
+                    replica_applied_position: replica_applied_position__,
                 })
             }
         }
@@ -21307,6 +21688,120 @@ impl<'de> serde::Deserialize<'de> for Phrase {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.Phrase", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for Position {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.seqno != 0 {
+            len += 1;
+        }
+        if self.n != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.Position", len)?;
+        if self.seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("seqno", ToString::to_string(&self.seqno).as_str())?;
+        }
+        if self.n != 0 {
+            struct_ser.serialize_field("n", &self.n)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Position {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "seqno",
+            "n",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Seqno,
+            N,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "seqno" => Ok(GeneratedField::Seqno),
+                            "n" => Ok(GeneratedField::N),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Position;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.Position")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Position, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut seqno__ = None;
+                let mut n__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Seqno => {
+                            if seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("seqno"));
+                            }
+                            seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::N => {
+                            if n__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("n"));
+                            }
+                            n__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(Position {
+                    seqno: seqno__.unwrap_or_default(),
+                    n: n__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.Position", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for Priority {

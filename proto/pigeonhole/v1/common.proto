@@ -21,6 +21,15 @@ enum Durability {
   DURABILITY_SYNC = 4;
 }
 
+// D335 (ICR 0146): a position in a partition's replicated feed. The last commit at or
+// below `seqno`, then the first `n` of the events the owner's durable feed delivered after
+// it that aren't commits. A commit's position has `n` 0. Positions compare as
+// `(seqno, n)`, lexicographically.
+message Position {
+  uint64 seqno = 1;
+  uint32 n = 2;
+}
+
 // A row of a table.
 message RowKey {
   string table = 1;

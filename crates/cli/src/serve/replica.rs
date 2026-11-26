@@ -1314,19 +1314,16 @@ impl Replica {
         };
         let mut client = proto::replication_client::ReplicationClient::new(channel)
             .max_decoding_message_size(usize::MAX);
-        let req = match self.request(proto::FollowRequest {
+        let request = proto::FollowRequest {
             token: token.as_bytes().to_vec().into(),
-        }) {
-            Ok(r) => r,
-            Err(e) => return Halt::Failed(e),
         };
         let opened = tokio::select! {
-            r = client.follow(req) => r,
+            r = self.open(&mut client, request) => r,
             _ = stop.changed() => return Halt::Stopped,
         };
-        let mut stream = match opened {
-            Ok(r) => r.into_inner(),
-            Err(status) => return halt_of(&status),
+        let (mut stream, mut acker) = match opened {
+            Ok(o) => o,
+            Err(halt) => return halt,
         };
         self.set_state(State::Following);
         let mut run = Run::default();
@@ -1341,14 +1338,31 @@ impl Replica {
             let (next, at) = match queued {
                 Some(m) => (m, waited_at),
                 None => {
-                    let m = tokio::select! {
-                        m = stream.message() => m,
-                        _ = stop.changed() => {
-                            // Promote or shutdown: what arrived is applied first.
-                            return match self.apply_run(&db, &mut run).await {
-                                Ok(()) => Halt::Stopped,
-                                Err(halt) => halt,
-                            };
+                    let m = loop {
+                        // D335: an acknowledgement the queue had no room for goes as soon
+                        // as it has, while the loop waits for the owner.
+                        let room = acker
+                            .as_ref()
+                            .filter(|a| a.pending.is_some())
+                            .map(|a| a.tx.clone());
+                        let waiting = room.is_some();
+                        tokio::select! {
+                            m = stream.message() => break m,
+                            permit = async { room?.reserve_owned().await.ok() }, if waiting => {
+                                if let (Some(permit), Some(a)) = (permit, acker.as_mut()) {
+                                    a.send(permit);
+                                } else if let Some(a) = acker.as_mut() {
+                                    // The owner's side ended: the stream's end says why.
+                                    a.pending = None;
+                                }
+                            }
+                            _ = stop.changed() => {
+                                // Promote or shutdown: what arrived is applied first.
+                                return match self.apply_run(&db, &mut run).await {
+                                    Ok(()) => Halt::Stopped,
+                                    Err(halt) => halt,
+                                };
+                            }
                         }
                     };
                     waited_at = Instant::now();
@@ -1381,6 +1395,7 @@ impl Replica {
                     if let Err(halt) = self.apply_catalog(on, event).await {
                         return halt;
                     }
+                    self.ack(&mut acker);
                     continue;
                 }
                 if event.is_range_drop() {
@@ -1392,23 +1407,37 @@ impl Replica {
                     if let Err(halt) = self.apply_range_drop(on, event).await {
                         return halt;
                     }
+                    self.ack(&mut acker);
                     continue;
                 }
                 run.bytes += bytes.len();
                 run.events.push(event);
-                if (run.events.len() >= self.config.run_events.max(1) || run.bytes >= RUN_BYTES)
-                    && let Err(halt) = self.apply_run(&db, &mut run).await
-                {
-                    return halt;
+                if run.events.len() >= self.config.run_events.max(1) || run.bytes >= RUN_BYTES {
+                    if let Err(halt) = self.apply_run(&db, &mut run).await {
+                        return halt;
+                    }
+                    self.ack(&mut acker);
                 }
             }
+            // D335 (feed1248's A3): with acknowledgements, a run is also cut where the
+            // owner's sync group ends (the batch's last event reaches its durable frontier),
+            // so each group is applied and acknowledged without waiting for the next one.
+            // A copy far behind still merges groups: its owner's waiters are late anyway.
+            let group_end = acker.is_some()
+                && run
+                    .events
+                    .last()
+                    .is_some_and(|e| e.primary_seqno() >= batch.primary_seqno);
             // The latency bound: no further message ready, so what arrived is applied now.
             if !run.events.is_empty() {
-                peeked = ready(&mut stream);
-                if peeked.is_none()
-                    && let Err(halt) = self.apply_run(&db, &mut run).await
-                {
-                    return halt;
+                if !group_end {
+                    peeked = ready(&mut stream);
+                }
+                if peeked.is_none() {
+                    if let Err(halt) = self.apply_run(&db, &mut run).await {
+                        return halt;
+                    }
+                    self.ack(&mut acker);
                 }
             }
             // Every event up to the batch's end is applied (#1853 part C2): the replica's
@@ -1455,6 +1484,61 @@ impl Replica {
             }
             if !s.last_error.is_empty() && s.state == State::Following {
                 s.last_error.clear();
+            }
+        }
+    }
+
+    /// Opens the follow: `FollowAcked` for a cluster replica copy (D335), with its node id and
+    /// partition, then `Follow` if its owner answers UNIMPLEMENTED (an older build). Tried on
+    /// every open, never remembered: an owner upgraded at the same address (a rolling
+    /// upgrade) takes acknowledgements from its next follow on (feed1248's 2 on #2236). An
+    /// older owner costs one refused call per open.
+    async fn open(
+        &self,
+        client: &mut proto::replication_client::ReplicationClient<tonic::transport::Channel>,
+        request: proto::FollowRequest,
+    ) -> Result<(tonic::Streaming<proto::ReplicationBatch>, Option<Acker>), Halt> {
+        if let Upstream::Owner { node, partition } = &self.upstream
+            && let Some(node) = node.upgrade()
+        {
+            let (tx, rx) = mpsc::channel(ACKS_QUEUED);
+            let start = proto::FollowMessage {
+                kind: Some(proto::follow_message::Kind::Start(proto::FollowStart {
+                    request: Some(request.clone()),
+                    node: node.id().to_owned(),
+                    partition: partition.clone(),
+                })),
+            };
+            if tx.try_send(start).is_ok() {
+                let req = self.request(AckStream(rx)).map_err(Halt::Failed)?;
+                match client.follow_acked(req).await {
+                    Ok(r) => {
+                        let acker = Acker {
+                            tx,
+                            pending: None,
+                            sent: None,
+                        };
+                        return Ok((r.into_inner(), Some(acker)));
+                    }
+                    Err(s) if s.code() == tonic::Code::Unimplemented => {}
+                    Err(s) => return Err(halt_of(&s)),
+                }
+            }
+        }
+        let req = self.request(request).map_err(Halt::Failed)?;
+        match client.follow(req).await {
+            Ok(r) => Ok((r.into_inner(), None)),
+            Err(s) => Err(halt_of(&s)),
+        }
+    }
+
+    /// D335: acknowledges what the copy applied through, once an apply that stored its
+    /// token returned (each is a `GroupSync` commit, so it's durable). Never past it.
+    fn ack(&self, acker: &mut Option<Acker>) {
+        if let Some(a) = acker {
+            let applied = self.status().applied;
+            if applied > 0 {
+                a.note(super::acks::Pos::commit(applied));
             }
         }
     }
@@ -1765,6 +1849,64 @@ impl super::download::Sink for SideFile {
 struct Run {
     events: Vec<ReplicatedEvent>,
     bytes: usize,
+}
+
+/// How many acknowledgements may wait to be sent (D335). A full queue keeps only the
+/// newest, sent once there's room: each covers every earlier one.
+const ACKS_QUEUED: usize = 64;
+
+/// A `FollowAcked` stream's sending side (D335): the replica's acknowledgements.
+struct Acker {
+    tx: mpsc::Sender<proto::FollowMessage>,
+    /// The newest position not sent yet, for want of room.
+    pending: Option<super::acks::Pos>,
+    /// The last position sent: the next must be past it.
+    sent: Option<super::acks::Pos>,
+}
+
+impl Acker {
+    fn message(p: super::acks::Pos) -> proto::FollowMessage {
+        proto::FollowMessage {
+            kind: Some(proto::follow_message::Kind::Ack(proto::Ack {
+                position: Some(p.into()),
+            })),
+        }
+    }
+
+    /// Acknowledges `p` now if there's room, else once there is.
+    fn note(&mut self, p: super::acks::Pos) {
+        if self.sent.is_some_and(|s| s >= p) {
+            return;
+        }
+        match self.tx.try_send(Self::message(p)) {
+            Ok(()) => {
+                self.sent = Some(p);
+                self.pending = None;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => self.pending = Some(p),
+            // The owner's side ended: the stream's end says why.
+            Err(mpsc::error::TrySendError::Closed(_)) => self.pending = None,
+        }
+    }
+
+    /// Sends the pending acknowledgement into `permit`'s room.
+    fn send(&mut self, permit: mpsc::OwnedPermit<proto::FollowMessage>) {
+        if let Some(p) = self.pending.take() {
+            permit.send(Self::message(p));
+            self.sent = Some(p);
+        }
+    }
+}
+
+/// `FollowAcked`'s request stream: the `FollowStart`, then the acknowledgements.
+struct AckStream(mpsc::Receiver<proto::FollowMessage>);
+
+impl Stream for AckStream {
+    type Item = proto::FollowMessage;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
 }
 
 /// The next message if one is ready now, without waiting.

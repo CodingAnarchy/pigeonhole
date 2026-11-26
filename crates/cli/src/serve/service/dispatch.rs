@@ -90,6 +90,11 @@ impl Service {
                 && let Err(e) = h.committed()
             {
                 reply = Err(e);
+            } else if held.is_some()
+                && let Some(part) = &self.part
+            {
+                // D335: timed until a replica acknowledges it (one load with no stream).
+                part.acks.committed(|| part.db.visible_seqno());
             } else if let Some(gate) = read
                 && let Err(e) = gate.serving()
             {

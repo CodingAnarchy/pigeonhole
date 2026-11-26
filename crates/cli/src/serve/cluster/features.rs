@@ -18,7 +18,14 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     MOVE_ABORTING_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
     BALANCER_FEATURE,
+    REPLICA_ACKS_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for D335 (ICR 0146): a build that serves
+/// `Replication.FollowAcked`, so its replica copies acknowledge what they applied. D335's
+/// map fields (a partition's `replica_acks`) come under the same name: a map sets them only
+/// once every node reports it.
+pub(crate) const REPLICA_ACKS_FEATURE: &str = "replica_acks";
 
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,
 /// `.balancer_events`, `Partition.pinned`, `.moves_history`, `TablePlacement.pinned_ranges`,

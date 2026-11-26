@@ -178,6 +178,9 @@ tokio::task_local! {
     /// [`Router::follow_owned`]'s check that the follower is one of the partition's map
     /// replicas. Set by the gRPC handler; unset (or `None`) for any other caller.
     pub(crate) static FOLLOWER: Option<String>;
+    /// A `Replication.FollowAcked` call's partition (D335): [`Router::follow_owned`] tries
+    /// the token on it alone. Unset (or `None`) for `Follow`, which tries each it owns.
+    pub(crate) static FOLLOW_PARTITION: Option<String>;
 }
 
 /// Where `partition` is served, by `routes`, as an entry node sees it: here, or the node the
@@ -516,6 +519,14 @@ impl Router {
             .map(|(id, c)| (id.as_str(), &*c.follower))
             .collect();
         super::replica::Replica::render_copies(&followers, &mut text);
+        // D335: each owned partition's replica acknowledgements.
+        let (mut waits, mut acked) = (String::new(), String::new());
+        for (id, service) in open.iter() {
+            if let Some(part) = service.part_opt() {
+                part.acks.render(id, &mut waits, &mut acked);
+            }
+        }
+        super::acks::ReplicaAcks::render_all(&mut text, &waits, &acked);
         // The map's failover counts and writer term (D330).
         cluster.node.render_failover_metrics(&mut text);
         // D331 PR 4b: the range moves followed here, and copies refused for the cap.
@@ -749,6 +760,7 @@ impl Router {
         };
         let me = cluster.node.id();
         let follower = FOLLOWER.try_with(Clone::clone).ok().flatten();
+        let only = FOLLOW_PARTITION.try_with(Clone::clone).ok().flatten();
         // A cluster-scope token, or a cluster without tokens (loopback only), where every
         // caller is the anonymous admin: the node id must still be a map replica's.
         let cluster_caller = caller.scope == super::auth::Scope::Cluster
@@ -765,7 +777,9 @@ impl Router {
         let parts = cluster.parts.load_full();
         let mut refused = false;
         for (id, service) in parts.iter() {
-            if routes.owner(id).is_none_or(|o| o.node != me) {
+            if routes.owner(id).is_none_or(|o| o.node != me)
+                || only.as_deref().is_some_and(|only| only != id)
+            {
                 continue;
             }
             let replica = cluster_caller

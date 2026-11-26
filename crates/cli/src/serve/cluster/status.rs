@@ -86,6 +86,10 @@ impl Node {
                 lp.set_replica_state(c.state);
                 lp.replica_of = c.owner;
                 lp.replica_applied_seqno = c.applied;
+                // D335: what it acknowledges, its stored token's position (commits only
+                // until replicated prepares arrive, so `n` is 0).
+                lp.replica_applied_position =
+                    (c.applied > 0).then(|| crate::serve::acks::Pos::commit(c.applied).into());
                 lp.replica_primary_seqno = c.primary_seqno;
                 lp.replica_lag_ms = c.lag_ms;
                 // The copy's identity epoch: its owner's at the bootstrap (`e_b`), which a
@@ -260,6 +264,16 @@ impl Node {
                     // D331 PR 5's plan: absent until the first interval ends.
                     lp.write_bytes_rate = l.write_rate.map(|r| r as u64);
                     lp.file_bytes = used_bytes(&part.db);
+                    // D335: its map replicas' acknowledgements, on its owner.
+                    if let Some(p) = map
+                        .as_ref()
+                        .and_then(|m| m.partitions.iter().find(|p| p.id == id))
+                        .filter(|p| p.node == self.id)
+                    {
+                        let (acked, healthy) = part.acks.status(&p.replicas);
+                        lp.acked_position = acked.map(Into::into);
+                        lp.healthy_replicas = healthy;
+                    }
                     // D331 PR 6: an owner's partition the map places nothing on (a merge
                     // emptied it): what still keeps it listed.
                     if let Some(m) = &map
