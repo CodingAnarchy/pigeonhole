@@ -36,7 +36,7 @@ The network API (`pigeonhole.v1`), additive:
   A replica sends one after each apply that stored its token (all are `GroupSync` commits), never for a batch with no events, and never past what it stored.
 - **On the owner:** one counted stream per replica node. A new stream from the node replaces the old one's entry, and its first acknowledgement replaces the entry even when lower. After that the entry only rises while the stream lives. A stream's end removes it. `Status` counts only the streams of the partition's map replicas now.
 - **The replica:**
-  - A cluster replica copy uses `FollowAcked` unless its owner answered `Unimplemented`; it then uses `Follow` until the owner's address changes.
+  - A cluster replica copy opens `FollowAcked` on every follow, and `Follow` when its owner answers `Unimplemented` (an older build). Nothing is remembered, so an owner upgraded at the same address takes acknowledgements from its next follow on.
   - With acknowledgements, it also cuts a run where the owner's sync group ends (a batch whose last event reaches the batch's `primary_seqno`), so each group is applied and acknowledged on its own.
   - A single node's `--replica-of` replica keeps `Follow`.
 - **No write waits yet:** D335 PR 2 adds the map's `replica_acks` and the wait.

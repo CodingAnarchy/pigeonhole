@@ -996,6 +996,18 @@ impl proto::replication_server::Replication for ReplicationGrpc {
             ))
             .to_status());
         }
+        // The partition's table, before and after the follow opens: a reopen in between
+        // (another `Partition`, so another table) refuses the call, retry-safe, rather than
+        // count this stream against a partition it may not be reading (feed1248's 3 on
+        // #2236). The parts map is swapped whole, so equal tables mean the same open.
+        let table = || {
+            cluster
+                .parts
+                .load()
+                .get(&start.partition)
+                .and_then(|s| s.part_opt().map(|p| Arc::clone(&p.acks)))
+        };
+        let before = table();
         let req = Request::from_parts(metadata, extensions, start.request.unwrap_or_default());
         let followed = super::router::FOLLOWER.scope(
             Some(start.node.clone()),
@@ -1009,18 +1021,16 @@ impl proto::replication_server::Replication for ReplicationGrpc {
             _ => return Err(unexpected()),
         };
         // The partition that answered: `FOLLOW_PARTITION` kept the call to it.
-        let acks = cluster
-            .parts
-            .load()
-            .get(&start.partition)
-            .and_then(|s| s.part_opt().map(|p| Arc::clone(&p.acks)))
-            .ok_or_else(|| {
-                ApiError::partition_unavailable(format!(
-                    "partition {:?} closed here as its follow began",
+        let acks = match (before, table()) {
+            (Some(b), Some(a)) if Arc::ptr_eq(&a, &b) => a,
+            _ => {
+                return Err(ApiError::partition_unavailable(format!(
+                    "partition {:?} closed or reopened here as its follow began",
                     start.partition
                 ))
-                .to_status()
-            })?;
+                .to_status());
+            }
+        };
         let attached = acks.attach(&start.node);
         let reader = tokio::spawn(read_acks(inbound, attached));
         Ok(Response::new(Box::pin(Acked {

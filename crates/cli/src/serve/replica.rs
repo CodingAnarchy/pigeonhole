@@ -574,9 +574,6 @@ pub(crate) struct Replica {
     /// partition it copies, from the node's map and the rows its file holds. Never set on a
     /// single node's replica.
     ranges: super::ranges::RangeGate,
-    /// A replica copy's owner address that answered `FollowAcked` UNIMPLEMENTED (an older
-    /// build, D335): the copy follows it with `Follow` until the owner's address changes.
-    acked_off: Mutex<Option<String>>,
 }
 
 /// A copy's range rows and its file's visible seqno ([`Replica::arm_ranges`]).
@@ -695,7 +692,6 @@ impl Replica {
             promoting: AtomicBool::new(false),
             unconfirmed: AtomicBool::new(false),
             ranges: super::ranges::RangeGate::default(),
-            acked_off: Mutex::new(None),
             stop: watch::channel(false).0,
             wake: tokio::sync::Notify::new(),
             task: Mutex::new(None),
@@ -1493,7 +1489,10 @@ impl Replica {
     }
 
     /// Opens the follow: `FollowAcked` for a cluster replica copy (D335), with its node id and
-    /// partition, unless its owner answered UNIMPLEMENTED (an older build), then `Follow`.
+    /// partition, then `Follow` if its owner answers UNIMPLEMENTED (an older build). Tried on
+    /// every open, never remembered: an owner upgraded at the same address (a rolling
+    /// upgrade) takes acknowledgements from its next follow on (feed1248's 2 on #2236). An
+    /// older owner costs one refused call per open.
     async fn open(
         &self,
         client: &mut proto::replication_client::ReplicationClient<tonic::transport::Channel>,
@@ -1502,46 +1501,27 @@ impl Replica {
         if let Upstream::Owner { node, partition } = &self.upstream
             && let Some(node) = node.upgrade()
         {
-            let address = self
-                .now
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .1
-                .clone();
-            let off = self
-                .acked_off
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(|a| *a == address);
-            if !off {
-                let (tx, rx) = mpsc::channel(ACKS_QUEUED);
-                let start = proto::FollowMessage {
-                    kind: Some(proto::follow_message::Kind::Start(proto::FollowStart {
-                        request: Some(request.clone()),
-                        node: node.id().to_owned(),
-                        partition: partition.clone(),
-                    })),
-                };
-                if tx.try_send(start).is_ok() {
-                    let req = self.request(AckStream(rx)).map_err(Halt::Failed)?;
-                    match client.follow_acked(req).await {
-                        Ok(r) => {
-                            let acker = Acker {
-                                tx,
-                                pending: None,
-                                sent: None,
-                            };
-                            return Ok((r.into_inner(), Some(acker)));
-                        }
-                        Err(s) if s.code() == tonic::Code::Unimplemented => {
-                            *self
-                                .acked_off
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner) = Some(address);
-                        }
-                        Err(s) => return Err(halt_of(&s)),
+            let (tx, rx) = mpsc::channel(ACKS_QUEUED);
+            let start = proto::FollowMessage {
+                kind: Some(proto::follow_message::Kind::Start(proto::FollowStart {
+                    request: Some(request.clone()),
+                    node: node.id().to_owned(),
+                    partition: partition.clone(),
+                })),
+            };
+            if tx.try_send(start).is_ok() {
+                let req = self.request(AckStream(rx)).map_err(Halt::Failed)?;
+                match client.follow_acked(req).await {
+                    Ok(r) => {
+                        let acker = Acker {
+                            tx,
+                            pending: None,
+                            sent: None,
+                        };
+                        return Ok((r.into_inner(), Some(acker)));
                     }
+                    Err(s) if s.code() == tonic::Code::Unimplemented => {}
+                    Err(s) => return Err(halt_of(&s)),
                 }
             }
         }
