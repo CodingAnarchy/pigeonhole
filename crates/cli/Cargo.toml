@@ -117,8 +117,11 @@ pigeonhole-io = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 h2 = { version = "0.4", optional = true }
 # `serve` (#2212): a forward's hyper error, cancelled before it was sent. Already in the tree
-# through tonic and hyper-util.
-hyper = { version = "1", optional = true }
+# through tonic and hyper-util. Keep it at tonic's major version: the forward's downcast only
+# recognizes the hyper tonic links, so a split would answer such a forward OutcomeUnknown
+# again (failing safe), and forward.rs's cancelled-forward test would fail (cli692's N1 on
+# #2219).
+hyper ={ version = "1", optional = true }
 # `serve`: a charged reply's body, which holds its share of --inflight-bytes until written (#1567).
 http-body = { version = "1", optional = true }
 

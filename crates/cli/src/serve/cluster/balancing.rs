@@ -446,6 +446,34 @@ fn emptied(m: &ClusterMap) -> Vec<String> {
 }
 
 /// What `state` says of a partition an aborted move left fenced (#2151).
+/// `st`, then each of `more` that says something, after a `; `.
+fn with_waiting(mut st: String, more: &[String]) -> String {
+    for m in more.iter().filter(|m| !m.is_empty()) {
+        st.push_str("; ");
+        st.push_str(m);
+    }
+    st
+}
+
+/// #2240: the node of each partition an abort left fenced, whose unfence hasn't succeeded
+/// yet ([`Node::retry_unfences`]), sits out the pass. Not fresh, it's neither a source nor
+/// a target, and its numbers stay out of the means: they leave out or misstate the fenced
+/// partition. A fenced partition answering in its node's Status counts as measured in
+/// [`views`], so this doesn't rest on that. The rest of the cluster is balanced meanwhile
+/// (#2170 decided nothing at all).
+fn hold_back(nodes: &mut [NodeView], held: &[Unfence]) {
+    for u in held {
+        if let Some(n) = nodes.iter_mut().find(|n| n.id == u.node) {
+            n.fresh = false;
+            n.incomplete = Some(format!(
+                "node {} sits out the balancer's passes while partition {} waits for its \
+                 unfence after aborted move {}",
+                n.id, u.partition, u.move_id
+            ));
+        }
+    }
+}
+
 fn still_fenced(partition: &str, move_id: &str, error: &str) -> String {
     format!(
         "{partition} is still fenced and closed after aborted move {move_id} ({error}): the \
@@ -617,11 +645,14 @@ impl Node {
             }
             r.last_pass = Some(now);
         }
-        // A partition an abort left fenced (#2151): nothing else is decided until it serves
-        // again, since a closed partition's size and load read as nothing.
-        if self.retry_unfences(&map).await {
-            return;
-        }
+        // A partition an abort left fenced (#2151): each pass tries its unfence again. Until
+        // it serves, its node sits out the pass ([`hold_back`]), and the rest of the cluster
+        // is still balanced (#2240). `state` names it whatever the pass decides to wait on.
+        let held = self.retry_unfences(&map).await;
+        let mut waiting: Vec<String> = held
+            .iter()
+            .map(|u| still_fenced(&u.partition, &u.move_id, &u.error))
+            .collect();
         // An earlier writer's balancer move, which no task of this writer's runs (M1).
         if let Some(rec) = map
             .moves
@@ -661,12 +692,14 @@ impl Node {
             return;
         }
         if let Some(m) = map.moves.first() {
-            self.set_balancer_state(format!("waiting: move {} is in flight", m.id));
+            self.set_balancer_state(with_waiting(
+                format!("waiting: move {} is in flight", m.id),
+                &waiting,
+            ));
             return;
         }
         // A source the balancer emptied by a merge (D332 PR 5's design §3): its removal.
         let emptied = emptied(&map);
-        let mut waiting = Vec::new();
         for s in &emptied {
             let Some(args) = self.own_args(&map) else {
                 return;
@@ -700,12 +733,7 @@ impl Node {
         // A paused balancer names the removals that wait or stopped, as a skip does (audit120's
         // nit on #2137): pausing doesn't hide a fence an operator has to lift.
         if mode == BalancerMode::Paused {
-            let mut st = String::from("paused");
-            for more in &waiting {
-                st.push_str("; ");
-                st.push_str(more);
-            }
-            self.set_balancer_state(st);
+            self.set_balancer_state(with_waiting("paused".into(), &waiting));
             return;
         }
         let mut statuses: HashMap<String, NodeStatus> = self
@@ -723,7 +751,8 @@ impl Node {
                 .last_grant(p)
                 .is_some_and(|g| g.in_doubt_count > 0)
         };
-        let (nodes, mut parts) = views(&map, &statuses, in_doubt);
+        let (mut nodes, mut parts) = views(&map, &statuses, in_doubt);
+        hold_back(&mut nodes, &held);
         // An emptied source is neither moved whole nor merged into while it waits.
         parts.retain(|p| !emptied.contains(&p.id));
         let bounds = bounds_of(&map);
@@ -776,15 +805,8 @@ impl Node {
         };
         match decision {
             Decision::Skip(why) => {
-                let mut st = format!("skip: {why}");
-                let aside = self.set_aside_now(at);
-                for more in waiting.iter().chain(std::iter::once(&aside)) {
-                    if !more.is_empty() {
-                        st.push_str("; ");
-                        st.push_str(more);
-                    }
-                }
-                self.set_balancer_state(st);
+                waiting.push(self.set_aside_now(at));
+                self.set_balancer_state(with_waiting(format!("skip: {why}"), &waiting));
             }
             Decision::Act(a @ Action::Split { .. }, why) => {
                 self.start_split(&map, &statuses, a, &why, at);
@@ -1408,12 +1430,12 @@ impl Node {
 
     /// Tries again each unfence an abort left ([`Run::unfence`], #2151). One is dropped once
     /// it succeeds, or once the map no longer has its partition as the abort left it
-    /// ([`Unfence::stands`]). Whether any is still waiting, with `state` naming them: the
-    /// pass decides nothing else meanwhile.
-    async fn retry_unfences(&self, map: &ClusterMap) -> bool {
+    /// ([`Unfence::stands`]). The ones still waiting, whose nodes sit out the pass
+    /// ([`hold_back`], #2240).
+    async fn retry_unfences(&self, map: &ClusterMap) -> Vec<Unfence> {
         let pending = self.balancing().unfence.clone();
         if pending.is_empty() {
-            return false;
+            return Vec::new();
         }
         let mut left = Vec::new();
         for mut u in pending {
@@ -1431,17 +1453,8 @@ impl Node {
                 }
             }
         }
-        let waiting = left
-            .iter()
-            .map(|u| still_fenced(&u.partition, &u.move_id, &u.error))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let any = !left.is_empty();
-        self.balancing().unfence = left;
-        if any {
-            self.set_balancer_state(format!("waiting: {waiting}"));
-        }
-        any
+        self.balancing().unfence.clone_from(&left);
+        left
     }
 
     /// An auto-pin, or its expiry.
@@ -1604,6 +1617,35 @@ mod tests {
         let mut last = kept();
         last.term = u64::MAX;
         assert!(!last.carries(0));
+    }
+
+    /// #2240: the node of a partition whose unfence is still waiting sits out the pass, even
+    /// when it answered with every partition measured (a fenced one counts as measured);
+    /// the other nodes are left as they were.
+    #[test]
+    fn a_waiting_unfence_holds_back_only_its_node() {
+        use super::balance::NodeView;
+        let view = |id: &str| NodeView {
+            id: id.into(),
+            weight: 1.0,
+            fresh: true,
+            incomplete: None,
+        };
+        let mut nodes = vec![view("a"), view("b"), view("c")];
+        super::hold_back(&mut nodes, &[]);
+        assert!(nodes.iter().all(|n| n.fresh && n.incomplete.is_none()));
+        let mut gone = kept();
+        gone.node = "z".into();
+        super::hold_back(&mut nodes, &[kept(), gone]);
+        assert!(!nodes[0].fresh);
+        assert_eq!(
+            nodes[0].incomplete.as_deref(),
+            Some(
+                "node a sits out the balancer's passes while partition p1 waits for its \
+                 unfence after aborted move bal-1"
+            )
+        );
+        assert!(nodes[1..].iter().all(|n| n.fresh && n.incomplete.is_none()));
     }
 
     /// #2158 item 1: a node that answered, but without numbers for a partition the map
