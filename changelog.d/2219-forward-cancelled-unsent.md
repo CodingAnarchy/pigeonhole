@@ -1,2 +1,0 @@
-### Fixed
-- **A forwarded write cancelled before it was sent answers `PartitionUnavailable`, not `OutcomeUnknown`** (#2212). When a node forwarded a write to the partition's owner over a pooled connection that closed while the write was still queued on it (for example, the owner shutting down), the write was never sent but answered `OutcomeUnknown` ("may have been applied"). It now answers `PartitionUnavailable`, so it is safe to retry, like a forward that couldn't connect.

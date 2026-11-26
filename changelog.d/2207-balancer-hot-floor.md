@@ -1,2 +1,0 @@
-### Fixed
-- **A partition that only trickles, under 1 MiB/s on its device, no longer reads as hot** (#2174). Its `load_device` in `Cluster.Status` was its device rate over the node's ceiling, the node's own highest second. On a nearly idle node that ceiling is close to the partition's own rate, so a lone idle partition read near 1.0: the balancer saw its node as too hot to receive a move and the partition as never cold enough to give one. Under 1 MiB/s `load_device` is now 0. `load_cpu` is unchanged: it is already a share of the node's cores.
