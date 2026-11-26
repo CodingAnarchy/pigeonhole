@@ -1,0 +1,2 @@
+### Fixed
+- **Range moves: a move stopped at its hand-over no longer leaves its range fenced for good, and a read can't be served from a range handed over under it** (#2160). The driver aborts a HANDING_OVER that the target hasn't caught up through within 60 s, and the map's writer aborts a record left at HANDING_OVER for 120 s (its driver killed or timed out), so the range takes writes again. A read admitted before the hand-over whose snapshot came after it is refused (retry it; it reaches the new owner).

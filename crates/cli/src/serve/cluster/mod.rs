@@ -218,6 +218,10 @@ struct Peers {
     /// How often the node prunes its partitions' range-move rows ([`range_prune::INTERVAL`];
     /// shorter in tests).
     prune_interval: Duration,
+    /// How long the writer lets a range move sit at HANDING_OVER before it aborts it as
+    /// orphaned ([`range_move::ORPHANED_HAND_OVER`]; an hour in tests, where many hold a
+    /// hand-built move there, and a second in the test of the duty itself).
+    orphaned_hand_over: Duration,
 }
 
 /// A cluster node.
@@ -314,6 +318,9 @@ pub(crate) struct Node {
     watching_device: std::sync::atomic::AtomicBool,
     /// The range rows' pruning timer runs ([`Node::watch_range_prunes`]).
     pruning: std::sync::atomic::AtomicBool,
+    /// Each range move at HANDING_OVER in the map: when this node first saw it there, and
+    /// whether the writer's abort of it runs (#2160, [`Node::abort_orphaned_hand_overs`]).
+    hand_overs_seen: Mutex<std::collections::HashMap<String, (tokio::time::Instant, bool)>>,
 }
 
 impl Node {
@@ -336,6 +343,7 @@ impl Node {
             device_ceiling,
             watching_device: std::sync::atomic::AtomicBool::new(false),
             pruning: std::sync::atomic::AtomicBool::new(false),
+            hand_overs_seen: Mutex::new(std::collections::HashMap::new()),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),

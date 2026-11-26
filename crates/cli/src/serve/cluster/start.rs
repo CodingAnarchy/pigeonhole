@@ -117,6 +117,7 @@ pub(crate) fn run(
             balance_window: Duration::from_secs(args.balance_window),
             load_interval: load::INTERVAL,
             prune_interval: super::range_prune::INTERVAL,
+            orphaned_hand_over: super::range_move::ORPHANED_HAND_OVER,
         },
         state,
         voted,

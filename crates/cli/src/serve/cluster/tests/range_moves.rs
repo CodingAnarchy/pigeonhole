@@ -1441,6 +1441,21 @@ struct Three {
 }
 
 fn three() -> Three {
+    three_with(None)
+}
+
+/// Node `port`'s map.
+async fn map_of(port: u16) -> crate::serve::proto::ClusterMap {
+    client(port)
+        .await
+        .get_map(crate::serve::proto::GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// [`three`], its nodes' writer bound for a move left at HANDING_OVER `orphaned` when set.
+fn three_with(orphaned: Option<Duration>) -> Three {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -1454,11 +1469,33 @@ fn three() -> Three {
     let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
     for dir in &dirs {
         super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+        if let Some(bound) = orphaned {
+            super::ORPHANED_HAND_OVER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((dir.clone(), bound));
+        }
     }
     let mut it = listeners.into_iter();
-    let (s_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
-    let (s_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
-    let (s_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    // With a writer bound set, started as `run` starts a node (its start sync), so its lease
+    // renewals, and the writer's duties with them, run from the start.
+    let restart = orphaned.is_some();
+    let start = |dir: &PathBuf, id: &str, local: Option<&str>, l| {
+        super::data_node_full(
+            &rt,
+            dir,
+            id,
+            local,
+            l,
+            "",
+            crate::serve::server_tests::limits(),
+            None,
+            restart,
+        )
+    };
+    let (s_a, db_a) = start(&dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (s_b, db_b) = start(&dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (s_c, _) = start(&dirs[2], "c", None, it.next().unwrap());
     rt.block_on(eventually("p1 takes writes", async || {
         try_put(ports[2], "c", "0").await.is_ok()
     }));
@@ -2907,6 +2944,116 @@ fn a_move_whose_source_is_down_after_the_hand_over_goes_on_to_cleaning() {
         assert_eq!(super::super::map::phase(&m.moves[0]), MovePhase::Cleaning);
         assert_eq!(super::super::promote::range_move_holds(&m, "p2"), None);
         assert_eq!(get_row(a, "n05").await.unwrap(), Some(b"0".to_vec()));
+    });
+    let _ = (&t.db_a, &t.db_b);
+}
+
+/// #2160 (audit120's point 1 on #2218): a move whose driver stopped at HANDING_OVER is
+/// aborted by the map's writer once it has sat there for the writer's bound (a second
+/// here), and the range takes writes again.
+#[test]
+fn the_writer_aborts_a_move_its_driver_left_at_handing_over() {
+    let t = three_with(Some(Duration::from_secs(1)));
+    let (a, c) = (t.ports[0], t.ports[2]);
+    let args = super::backup::args(a);
+    t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, &format!("n{i:02}"), "0").await.unwrap();
+        }
+        let spec = super::super::range_move::Spec {
+            table: "users".into(),
+            from: "p2".into(),
+            to: "p1".into(),
+            start: None,
+            end: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::HandingOver));
+        let stopped =
+            super::super::range_move::run(&args, &spec, Some(Duration::from_secs(120)), true).await;
+        assert!(stopped.is_err(), "the move ran past HANDING_OVER");
+        let m = map_of(a).await;
+        assert_eq!(
+            super::super::map::phase(&m.moves[0]),
+            MovePhase::HandingOver
+        );
+        // Fenced while it sits there; the writer aborts it past its bound (ABORTING lifts the
+        // fence), and the record goes once the target dropped its copy.
+        eventually_within(
+            Duration::from_secs(30),
+            "the writer aborts the move",
+            async || {
+                map_of(a)
+                    .await
+                    .moves
+                    .first()
+                    .is_none_or(|r| super::super::map::phase(r) == MovePhase::Aborting)
+            },
+        )
+        .await;
+        eventually("the range takes writes again", async || {
+            try_put(c, "n05", "1").await.is_ok()
+        })
+        .await;
+        assert_eq!(get_row(c, "n05").await.unwrap(), Some(b"1".to_vec()));
+    });
+    let _ = (&t.db_a, &t.db_b);
+}
+
+/// audit120's point 2 on #2218: an abort that read the move before its hand-over committed
+/// neither aborts nor removes it after: past the commit point it fails at once, and the
+/// record stays for its driver to finish. At CLEANING, where the map takes a removal (a
+/// move's normal end), only the abort's own check keeps the source's drop from being
+/// skipped.
+#[test]
+fn an_abort_that_lost_the_race_with_the_hand_over_leaves_the_committed_record() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    let args = super::backup::args(a);
+    t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, &format!("n{i:02}"), "0").await.unwrap();
+        }
+        let spec = super::super::range_move::Spec {
+            table: "users".into(),
+            from: "p2".into(),
+            to: "p1".into(),
+            start: None,
+            end: None,
+        };
+        super::super::range_move::STOP
+            .lock()
+            .unwrap()
+            .push((args.node.clone(), MovePhase::Cleaning));
+        let stopped =
+            super::super::range_move::run(&args, &spec, Some(Duration::from_secs(120)), true).await;
+        assert!(stopped.is_err(), "the move ran past CLEANING");
+        let committed = map_of(a).await.moves[0].clone();
+        assert_eq!(super::super::map::phase(&committed), MovePhase::Cleaning);
+        // As the abort read it: before the commit point (the change refuses), and already
+        // ABORTING (the change is skipped; the removal refuses).
+        for phase in [MovePhase::HandingOver, MovePhase::Aborting] {
+            let mut read = committed.clone();
+            read.set_phase(phase);
+            let e =
+                super::super::range_move::abort_record(&args, &read, Some(Duration::from_secs(1)))
+                    .await
+                    .expect_err("an abort past the commit point");
+            assert!(
+                e.message().contains("can't be aborted"),
+                "{phase:?}: {}",
+                e.message()
+            );
+            let m = map_of(a).await;
+            assert_eq!(m.moves.len(), 1, "{phase:?}: the record stays");
+            assert_eq!(
+                super::super::map::phase(&m.moves[0]),
+                MovePhase::Cleaning,
+                "{phase:?}"
+            );
+        }
     });
     let _ = (&t.db_a, &t.db_b);
 }

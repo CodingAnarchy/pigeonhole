@@ -369,6 +369,39 @@ pub(crate) struct RangeState {
 /// What walks a call's keys calls for each (table or index, key) ([`ServiceOp::touches`]).
 type KeyVisitor<'v> = &'v mut dyn FnMut(&str, Touch<'_>) -> ControlFlow<()>;
 
+/// A read's touched keys, owned, so the range check can run again once the read has
+/// consumed its call (#2160): taken only while a move names the partition.
+#[derive(Debug)]
+pub(crate) struct Touched(Vec<(String, OwnedTouch)>);
+
+#[derive(Debug)]
+enum OwnedTouch {
+    Row(Vec<u8>),
+    Prefix(Vec<u8>),
+    Range(Bound<Vec<u8>>, Bound<Vec<u8>>),
+}
+
+impl Touched {
+    /// `op`'s touched keys.
+    pub(crate) fn of(op: &ServiceOp) -> Self {
+        let mut out = Vec::new();
+        let _ = op.touches(&mut |table, t| {
+            out.push((
+                table.to_owned(),
+                match t {
+                    Touch::Row(k) => OwnedTouch::Row(k.to_vec()),
+                    Touch::Prefix(k) => OwnedTouch::Prefix(k.to_vec()),
+                    Touch::Range { start, end } => {
+                        OwnedTouch::Range(start.map(<[u8]>::to_vec), end.map(<[u8]>::to_vec))
+                    }
+                },
+            ));
+            ControlFlow::Continue(())
+        });
+        Self(out)
+    }
+}
+
 impl RangeState {
     /// Checks `op`, a write when `write`, against the spans: `Ok` when it touches none it
     /// may not. Out of line: only a partition a move names, or one a range moved off, gets
@@ -377,6 +410,25 @@ impl RangeState {
     #[inline(never)]
     pub(crate) fn check(&self, op: &ServiceOp, write: bool) -> Result<(), ApiError> {
         self.check_keys(write, &mut |f| op.touches(f))
+    }
+
+    /// [`check`](Self::check) of a read's keys taken before it ran ([`Touched`]), after it
+    /// (#2160): a range handed over since is refused.
+    pub(crate) fn check_touched(&self, touched: &Touched) -> Result<(), ApiError> {
+        self.check_keys(false, &mut |f| {
+            for (table, t) in &touched.0 {
+                let touch = match t {
+                    OwnedTouch::Row(k) => Touch::Row(k),
+                    OwnedTouch::Prefix(k) => Touch::Prefix(k),
+                    OwnedTouch::Range(start, end) => Touch::Range {
+                        start: start.as_ref().map(Vec::as_slice),
+                        end: end.as_ref().map(Vec::as_slice),
+                    },
+                };
+                f(table, touch)?;
+            }
+            ControlFlow::Continue(())
+        })
     }
 
     /// [`check`](Self::check) of the keys `walk` names, each as a write when `write`.
@@ -1228,6 +1280,11 @@ mod tests {
             .expect("gated");
         assert_eq!(code(&s, &get("d")).as_deref(), Some("WrongPartition"));
         assert_eq!(code(&s, &get("a")), None);
+        // #2160: the same check on a read's keys taken before it ran, as dispatch makes it
+        // again past the read's snapshot.
+        let e = s.check_touched(&Touched::of(&get("d"))).unwrap_err();
+        assert_eq!(e.code, "WrongPartition");
+        assert!(s.check_touched(&Touched::of(&get("a"))).is_ok());
         // cli692's point: a map that places the range on p1 again with no move bringing it
         // back (a forced map) doesn't make p1 serve rows it may have cleaned.
         let s = gate(&map(None), "p1", vec![row("mv1", b"c", b"f", 5)], 50)
