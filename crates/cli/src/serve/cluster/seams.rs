@@ -55,6 +55,12 @@ pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static OLD_BULK_LOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// A fault seam (tests): nodes acting as a build before `replica_acks` (D335 PR 1), by
+/// cluster directory: their `Replication.FollowAcked` answers UNIMPLEMENTED, as an older
+/// build's tonic router would.
+#[cfg(test)]
+pub(crate) static OLD_FOLLOW: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// A fault seam (tests): nodes acting as a build before `ClusterMap.indexes` (#1722), by
 /// cluster directory: their `Status` leaves `indexes` out.
 #[cfg(test)]

@@ -19,12 +19,19 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     spanning::SPANNING_TXNS_FEATURE,
     BALANCER_FEATURE,
     ADOPTED_FEATURES_FEATURE,
+    REPLICA_ACKS_FEATURE,
 ];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.adopted_features` itself: a node without it (1.3)
 /// would drop the field and read as divergent, so nothing is adopted until every node
 /// reports it.
 pub(crate) const ADOPTED_FEATURES_FEATURE: &str = "adopted_features";
+
+/// [`MAP_FEATURES`]' name for D335 (ICR 0146): a build that serves
+/// `Replication.FollowAcked`, so its replica copies acknowledge what they applied. D335's
+/// map fields (a partition's `replica_acks`) come under the same name: a map sets them only
+/// once every node reports it.
+pub(crate) const REPLICA_ACKS_FEATURE: &str = "replica_acks";
 
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,
 /// `.balancer_events`, `Partition.pinned`, `.moves_history`, `TablePlacement.pinned_ranges`,

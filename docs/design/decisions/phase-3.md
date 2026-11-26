@@ -5271,3 +5271,26 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 **PRs.** 1, the engine; 2, the map record and the gates; 3, the paths that must clip, the cluster feed's hold, and backups; 4, the copy and the range follower; 5, the driver, hand-over, cleanup and CLI; 6, merge. Follow-ups #2052 (SST ingest for the copy) and #2053 (dropping whole SSTs on cleanup), both Post-1.0 unless perf287's box run says otherwise.
 
 **Design:** `.coord/cli692-design-1499.md` (with simp724's, perf287's and Amendment 5's reviews), `.coord/ai1249-plan-1499.md`.
+
+<a id="d335"></a>
+## D335 — Semi-synchronous replication of a cluster partition: writes wait for k replica acknowledgements (cli692, design; owner, 2026-11-25; reviewed by simp724 and feed1248; cli, #2149, ICR 0146) · D326, D328, D329, D330, D331
+
+**Decided** (design note rev 2, on #2149; the owner's rulings of 2026-11-25):
+- **The setting.** A partition's map entry gets `replica_acks` (k; 0, the default, is today's asynchronous replication) and a policy for too few healthy replicas. A covered commit is raised to `GroupSync` at least, since the feed ships only owner-durable commits.
+- **The ack path.** Replicas acknowledge on the stream they follow on, a new bidirectional `Replication.FollowAcked`, with feed **positions** `(seqno, n)` from the start (simp724's M3, feed1248's P1). An ack means the copy's stored token is there and durable. A replica cuts its runs at the owner's sync groups, so one fsync and one ack covers a group (feed1248's A3).
+- **The owner** keeps each counted replica's last ack (one stream per node; a new stream's first ack replaces the entry, simp724's M2), and wakes every waiter at or below the k-th highest. It lives in the serve layer, never the engine.
+- **The wait** comes after the engine's commit and before D326's after-commit lease check. A timeout (latency policy, not safety) or the lease's end answers `OutcomeUnknown`.
+- **Too few healthy replicas:** `REFUSE` by default (Q1): writes are refused, retry-safe. `ASYNC` acknowledges uncovered writes only once a majority has durably recorded the fallback's start (simp724's M1).
+- **Per request**, a write may opt down to asynchronous (Q2). It can't raise k.
+- **Failover and promote** choose only a replica that provably holds every covered write: the highest acked position among `R − k + 1` answers in P's current history. Config changes go in two steps, and range moves, splits and merges carry the guarantee across their hand-over.
+- **Spanning transactions are covered in 1.4.0** (Q3): a prepare is replicated as an inert record, converted at promote (simp724's Q6 (b)).
+- **The bar** (Q4): in-region k = 1 p99 at most GroupSync's p99 + 1 ms, and throughput at 256 threads within 10% of GroupSync without the wait, on the AX102 (perf287).
+
+**PRs:**
+1. The ack stream: `FollowAcked`, positions, run cuts at group ends, the owner's table, `Status` and metrics. No wait yet.
+2. The wait: map fields, opt-down, timeout, lease loss, `REFUSE` and `ASYNC`.
+3. Failover and promote: the candidate rule, two-step config changes, range moves.
+4. Spanning transactions.
+5. The guide and perf287's numbers.
+
+**Design:** the note on #2149 (rev 2, with simp724's and feed1248's reviews, mapped point by point in its §16).

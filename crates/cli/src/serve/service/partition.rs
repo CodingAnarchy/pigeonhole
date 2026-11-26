@@ -53,6 +53,9 @@ pub(crate) struct Partition {
     pub(crate) pinning: Pinning,
     /// Its sampled load, for the cluster balancer (D332): request CPU and read keys.
     pub(crate) load: Arc<super::super::cluster::load::PartitionLoad>,
+    /// Its map replicas' acknowledgements, on its owner (D335): `Replication.FollowAcked`
+    /// streams record them, its writes are timed against them.
+    pub(crate) acks: Arc<super::super::acks::ReplicaAcks>,
     /// Its engine memory (D317 ticket 8a's `--engine-memory`): as resolved at open, then as a
     /// node's re-split at another partition's open or close changed its caches (#1761). A
     /// cluster node's gauges, and the next re-split's starting point.
@@ -185,6 +188,7 @@ impl Partition {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: config.pinning,
             load: Arc::default(),
+            acks: Arc::default(),
             engine_memory: std::sync::Mutex::new(config.engine_memory),
             backups: config.backups,
             indexes: Arc::new(super::super::indexes::Indexes::new(
