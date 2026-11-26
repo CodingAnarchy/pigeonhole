@@ -2372,6 +2372,85 @@ impl Transaction {
             .map_err(|e| commit_error(e, largest, max))
     }
 
+    /// Buffers one change exactly as an old owner logged it (D336, ICR 0147): its kind,
+    /// timestamp and stored value (the tag byte first; empty for a delete), as
+    /// [`LoggedBatch::push`](crate::replication::LoggedBatch::push) takes them, beside the
+    /// transaction's ordinary writes. A replayed tail commit is one transaction: its plain
+    /// changes through this, its text and vector index writes through the indexes' own
+    /// paths, so a column delete at its timestamp keeps a newer version written since,
+    /// which [`delete_column`](Self::delete_column) at the commit's timestamp wouldn't.
+    ///
+    /// The commit rewrites the ordinary writes as usual, then appends these unchanged: where
+    /// both write one cell at one timestamp, this one wins. An ordinary write without a
+    /// timestamp takes the clock, which may be below this one's, and the timestamp floor
+    /// isn't raised to it. Refused on a replica, as any transaction is. Hidden: not part of
+    /// the API, outside the semver promise.
+    #[cfg(feature = "__unstable-tail-replay")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_logged(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        kind: crate::feed::ChangeKind,
+        qualifier: &[u8],
+        ts: u64,
+        stored: &[u8],
+    ) -> &mut Self {
+        let kind = crate::replication::logged_kind(kind);
+        self.op(table, row, family, qualifier, stored.len(), |b, t, f| {
+            b.push_logged_beside(t, f, kind, row, qualifier, ts, stored)
+        })
+    }
+
+    /// Row `row` of `table` at the transaction's snapshot as it is stored (D336, ICR 0147):
+    /// every version and delete marker a reader there could need, each cell as its commit
+    /// logged it, named by family, as [`Pigeonhole::copy_range`](crate::Pigeonhole::copy_range)
+    /// gives them. A replayed tail change asks whether anything newer is there, and a delete
+    /// marker counts, which [`get_row`](Self::get_row) hides. Counted as a read of the whole
+    /// row (every family), so a commit to it after the snapshot conflicts. Hidden: not part
+    /// of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-tail-replay")]
+    #[doc(hidden)]
+    pub fn read_row_logged(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+    ) -> Result<Vec<crate::replication::CopiedCell>> {
+        let read = (|| {
+            check_table(&self.db, table)?;
+            self.db.check_generation(self.generation)?;
+            let info = table.core.info_at(self.txn.snapshot());
+            let cells = self.txn.read_row_logged(table.core.info.id, row)?;
+            cells
+                .into_iter()
+                .map(|c| {
+                    let Some(family) = info.families.iter().find(|f| f.id == c.family) else {
+                        return Err(Error::new(
+                            crate::ErrorCode::FamilyNotFound,
+                            format!("family {} of table {:?}", c.family.0, info.name),
+                        ));
+                    };
+                    Ok(crate::replication::CopiedCell {
+                        family: family.name.clone(),
+                        kind: crate::feed::ChangeKind::of(c.kind),
+                        row: c.row,
+                        qualifier: c.qualifier,
+                        ts: c.ts,
+                        stored: c.stored,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })();
+        if let Err(e) = &read
+            && self.failed_read.is_none()
+        {
+            self.failed_read = Some(e.clone());
+        }
+        read
+    }
+
     /// Tags the transaction's commit with `xid` (D329 2b, ICR 0140 amendment 2): its records
     /// carry it, and its change-feed events deliver it ([`feed::Commit::xid`]), so a
     /// subscriber can group a spanning commit's shares. 1–255 bytes, checked at commit.

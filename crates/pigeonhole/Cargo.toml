@@ -37,6 +37,10 @@ __unstable-replication = []
 # `Pigeonhole::decide` and `Pigeonhole::in_doubt`, for `phdb serve`'s spanning transactions.
 # Not part of the API and outside the semver promise.
 __unstable-txn-prepare = []
+# Replaying an old owner's tail (D336, ICR 0147): a logged batch tagged with an xid, a
+# transaction's logged changes and its raw row read with delete markers, for `phdb serve`'s
+# tail replay. Not part of the API and outside the semver promise.
+__unstable-tail-replay = ["__unstable-replication", "__unstable-txn-prepare"]
 
 [dependencies]
 pigeonhole-engine = { workspace = true }

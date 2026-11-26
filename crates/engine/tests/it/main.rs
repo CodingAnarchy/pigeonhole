@@ -75,6 +75,7 @@ mod idle_counts;
 mod inflight_window;
 mod knn;
 mod large_values;
+mod logged_beside;
 mod milestone_b;
 mod network_fs;
 mod open_cost;
