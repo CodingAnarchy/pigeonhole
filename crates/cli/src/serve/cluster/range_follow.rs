@@ -972,6 +972,34 @@ fn progress_table(db: &Pigeonhole) -> pigeonhole::Result<pigeonhole::Table> {
         .create_if_missing()
 }
 
+/// What move `id`'s progress rows in `db` show (#2154): whether its copy is done, and the
+/// source's seqno its catch-up has passed. A replica copy of the target reads these from its
+/// own file, for `Status`. The target writes each row in the commit that carries the data it
+/// covers, so a copy that holds the rows holds that data too. `(false, 0)` when unreadable.
+/// Read-only: a replica's copy takes no catalog change of its own, so the progress family
+/// is opened, never created.
+pub(crate) fn shown(db: &Pigeonhole, id: &str) -> (bool, u64) {
+    let Some(t) = db
+        .table(identity::TABLE)
+        .and_then(|b| b.open())
+        .ok()
+        .filter(|t| t.families().contains(&FAMILY))
+    else {
+        return (false, 0);
+    };
+    let cell = |row: &[u8], q: &[u8]| {
+        t.get(row, FAMILY, q)
+            .ok()
+            .flatten()
+            .map(|c| c.value().to_vec())
+    };
+    let done = cell(&[b"copy/".as_slice(), id.as_bytes()].concat(), b"done").is_some();
+    let applied = cell(&[b"follow/".as_slice(), id.as_bytes()].concat(), b"token")
+        .and_then(|t| super::token::token_seqno(&t))
+        .unwrap_or(0);
+    (done, applied)
+}
+
 fn read_head(db: &Pigeonhole, id: &str) -> Result<Head, ApiError> {
     let t = progress_table(db)?;
     let row = [b"copy/".as_slice(), id.as_bytes()].concat();
