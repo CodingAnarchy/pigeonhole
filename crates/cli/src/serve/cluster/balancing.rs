@@ -445,7 +445,6 @@ fn emptied(m: &ClusterMap) -> Vec<String> {
         .collect()
 }
 
-/// What `state` says of a partition an aborted move left fenced (#2151).
 /// `st`, then each of `more` that says something, after a `; `.
 fn with_waiting(mut st: String, more: &[String]) -> String {
     for m in more.iter().filter(|m| !m.is_empty()) {
@@ -474,6 +473,7 @@ fn hold_back(nodes: &mut [NodeView], held: &[Unfence]) {
     }
 }
 
+/// What `state` says of a partition an aborted move left fenced (#2151).
 fn still_fenced(partition: &str, move_id: &str, error: &str) -> String {
     format!(
         "{partition} is still fenced and closed after aborted move {move_id} ({error}): the \
