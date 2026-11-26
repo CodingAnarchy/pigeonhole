@@ -1951,3 +1951,138 @@ fn a_targets_copy_reports_its_moves_progress_from_its_own_rows() {
         step(a, &|m, _| m.moves.clear()).await;
     });
 }
+
+/// Node `port`'s own row for `p` (not a replica copy's), if it reports one.
+async fn owned_row(port: u16, p: &str) -> Option<LocalPartition> {
+    client(port)
+        .await
+        .status(StatusRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == p && lp.role == PartitionRole::Owner as i32)
+}
+
+/// Node `port`'s `/metrics` text, through `Admin.Metrics`.
+async fn metrics_at(port: u16) -> String {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    crate::serve::proto::admin_client::AdminClient::new(channel)
+        .metrics(crate::serve::proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .text
+}
+
+#[test]
+fn a_replica_copy_acknowledges_what_it_applied_to_its_owner() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        // A write on c's p3 after the copy follows: the copy applies it and acknowledges it
+        // (D335 PR 1), and c's row says so.
+        let second = put_in(ports[2], "r", "k2").await;
+        eventually_why(
+            FOLLOW,
+            "c to hold a's acknowledgement of the write",
+            async || {
+                let owner = owned_row(ports[2], "p3").await;
+                let copy = copy_of(ports[0], "p3").await;
+                let acked = owner
+                    .as_ref()
+                    .and_then(|lp| lp.acked_position)
+                    .map_or(0, |p| p.seqno);
+                let applied = copy
+                    .as_ref()
+                    .and_then(|lp| lp.replica_applied_position)
+                    .map_or(0, |p| p.seqno);
+                let healthy = owner.as_ref().map_or(0, |lp| lp.healthy_replicas);
+                if healthy == 1 && acked >= second && applied >= second {
+                    return Ok(());
+                }
+                Err(format!(
+                    "past {second}: c's acked {acked} with {healthy} healthy; the copy's \
+                 position {applied}, {}",
+                    copy_why(copy.as_ref())
+                ))
+            },
+        )
+        .await;
+        // Never past what the copy stored.
+        let owner = owned_row(ports[2], "p3").await.unwrap();
+        let copy = copy_of(ports[0], "p3").await.unwrap();
+        assert!(
+            owner.acked_position.unwrap().seqno <= copy.replica_applied_seqno,
+            "{owner:?} {copy:?}"
+        );
+        // /metrics on the owner: the replica's gauge, and the write timed to its ack.
+        let text = metrics_at(ports[2]).await;
+        assert!(
+            text.contains("pigeonhole_cluster_replica_acked_seqno{partition=\"p3\",replica=\"a\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pigeonhole_cluster_replica_ack_wait_seconds_count{partition=\"p3\"}"),
+            "{text}"
+        );
+        // The map drops the copy: its stream ends, and nothing counts.
+        set_replicas(ports[0], "p3", &[]).await;
+        eventually_why(FOLLOW, "c to count no replica of p3", async || {
+            let owner = owned_row(ports[2], "p3").await;
+            match owner {
+                Some(lp) if lp.healthy_replicas == 0 && lp.acked_position.is_none() => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+    });
+}
+
+#[test]
+fn a_replica_copy_of_an_owner_without_acknowledgements_follows_as_before() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    // c, p3's owner, acts as a build before D335: FollowAcked is UNIMPLEMENTED there.
+    super::super::OLD_FOLLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dirs[2].clone());
+    let (_stops, ports, _dbs) = three_nodes_in(&rt, &dirs);
+    rt.block_on(async {
+        table_on_p3(ports[0]).await;
+        set_replicas(ports[0], "p3", &["a"]).await;
+        let first = put_in(ports[1], "r", "k1").await;
+        eventually_why(
+            FOLLOW,
+            "a's replica of p3 to follow c with Follow",
+            async || {
+                let lp = copy_of(ports[0], "p3").await;
+                if lp.as_ref().is_some_and(|lp| {
+                    lp.replica_state() == ReplicaState::Following
+                        && lp.replica_applied_seqno >= first
+                }) {
+                    return Ok(());
+                }
+                Err(format!("past {first}: {}", copy_why(lp.as_ref())))
+            },
+        )
+        .await;
+        // It applies, but acknowledges nothing: c counts no replica.
+        let owner = owned_row(ports[2], "p3").await.unwrap();
+        assert_eq!(
+            (owner.healthy_replicas, owner.acked_position),
+            (0, None),
+            "{owner:?}"
+        );
+    });
+    super::super::OLD_FOLLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|d| *d != dirs[2]);
+}

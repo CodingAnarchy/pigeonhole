@@ -18,6 +18,7 @@ use crate::ExitStatus;
 use crate::args::Cli;
 use crate::exit::Failure;
 
+mod acks;
 mod auth;
 mod backup;
 #[doc(hidden)]

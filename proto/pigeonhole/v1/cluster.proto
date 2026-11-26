@@ -811,6 +811,19 @@ message LocalPartition {
   // change-feed hold keeps), for a move's plan. Absent until the first interval ends (or
   // from an older node): unknown. 0 is an idle partition.
   optional uint64 write_bytes_rate = 34;
+  // Unused: kept for #2150's `allocated_bytes`, which 1.3.1 didn't need.
+  reserved 35;
+  // D335 (ICR 0146), on the partition's owner: the acknowledged frontier of its map
+  // replicas' `FollowAcked` streams. Until the map sets how many acknowledgements a write
+  // waits for, it's the highest acknowledged position of any counted replica. Absent with
+  // no counted stream, on a replica copy, and from an older node.
+  Position acked_position = 36;
+  // D335, on the partition's owner: how many of its map replicas have a counted
+  // `FollowAcked` stream to it now. 0 on a replica copy.
+  uint32 healthy_replicas = 37;
+  // D335, on a replica copy: the position its stored token is at, which is what it
+  // acknowledges. Absent on an owner, before the copy's first apply, and from an older node.
+  Position replica_applied_position = 38;
 }
 
 // A share held in doubt (D329).

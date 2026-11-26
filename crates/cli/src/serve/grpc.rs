@@ -939,6 +939,133 @@ impl proto::replication_server::Replication for ReplicationGrpc {
             _ => Err(unexpected()),
         }
     }
+
+    type FollowAckedStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ReplicationBatch, Status>> + Send>>;
+
+    /// `Replication.FollowAcked` (D335 PR 1): `Follow` for a cluster partition's map
+    /// replica, whose acknowledgements on the request stream go to the partition's
+    /// [`ReplicaAcks`](super::acks::ReplicaAcks) while the call lasts.
+    async fn follow_acked(
+        &self,
+        req: Request<tonic::Streaming<proto::FollowMessage>>,
+    ) -> Result<Response<Self::FollowAckedStream>, Status> {
+        use proto::follow_message::Kind;
+        let Some(cluster) = self.0.router.cluster.as_ref() else {
+            return Err(ApiError::failed_precondition(
+                "Replication.FollowAcked is for a cluster partition's replica copies: a \
+                 single node's replica uses Follow",
+            )
+            .to_status());
+        };
+        #[cfg(test)]
+        if super::cluster::OLD_FOLLOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|d| cluster.node.dir().starts_with(d))
+        {
+            return Err(Status::unimplemented("the test's older build"));
+        }
+        let header = req
+            .metadata()
+            .get(super::cluster::NODE_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let (metadata, extensions, mut inbound) = req.into_parts();
+        let start = match inbound.message().await? {
+            Some(proto::FollowMessage {
+                kind: Some(Kind::Start(start)),
+            }) => start,
+            _ => {
+                // Never InvalidArgument: a replica takes that as another database's token,
+                // and bootstraps again.
+                return Err(ApiError::failed_precondition(
+                    "Replication.FollowAcked's first message must be a FollowStart",
+                )
+                .to_status());
+            }
+        };
+        // The node a cluster member claims (the cluster token proves membership, not which
+        // node: feed1248's A4), the same in both places.
+        if header.as_deref() != Some(start.node.as_str()) {
+            return Err(ApiError::failed_precondition(format!(
+                "FollowStart's node {:?} isn't the request's node id {:?}",
+                start.node,
+                header.unwrap_or_default()
+            ))
+            .to_status());
+        }
+        let req = Request::from_parts(metadata, extensions, start.request.unwrap_or_default());
+        let followed = super::router::FOLLOWER.scope(
+            Some(start.node.clone()),
+            super::router::FOLLOW_PARTITION.scope(
+                Some(start.partition.clone()),
+                call(&self.0, req, ServiceOp::Follow),
+            ),
+        );
+        let batches = match followed.await? {
+            ServiceReply::Follow(b) => b,
+            _ => return Err(unexpected()),
+        };
+        // The partition that answered: `FOLLOW_PARTITION` kept the call to it.
+        let acks = cluster
+            .parts
+            .load()
+            .get(&start.partition)
+            .and_then(|s| s.part_opt().map(|p| Arc::clone(&p.acks)))
+            .ok_or_else(|| {
+                ApiError::partition_unavailable(format!(
+                    "partition {:?} closed here as its follow began",
+                    start.partition
+                ))
+                .to_status()
+            })?;
+        let attached = acks.attach(&start.node);
+        let reader = tokio::spawn(read_acks(inbound, attached));
+        Ok(Response::new(Box::pin(Acked {
+            batches: GrpcStream(batches),
+            reader,
+        })))
+    }
+}
+
+/// A `FollowAcked` stream's acknowledgements, until the replica ends its side (or sends
+/// something else than an `Ack`). Its entry in the partition's table goes with `attached`.
+async fn read_acks(
+    mut inbound: tonic::Streaming<proto::FollowMessage>,
+    attached: super::acks::Attached,
+) {
+    use proto::follow_message::Kind;
+    while let Ok(Some(m)) = inbound.message().await {
+        match m.kind {
+            Some(Kind::Ack(proto::Ack { position: Some(p) })) => {
+                attached.ack(super::acks::Pos::from(&p))
+            }
+            _ => return,
+        }
+    }
+}
+
+/// `FollowAcked`'s reply stream: `Follow`'s batches. Dropped (the call ended), it stops
+/// reading acknowledgements, so the replica's stop counting at once.
+struct Acked {
+    batches: GrpcStream<super::replica::FollowBatches>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Stream for Acked {
+    type Item = Result<proto::ReplicationBatch, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.batches).poll_next(cx)
+    }
+}
+
+impl Drop for Acked {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 /// `Graph` over gRPC (D313 ticket 7).
