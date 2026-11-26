@@ -1,4 +1,13 @@
 name: Sweep
+# The run's title names what it tests, so a merge check can count distinct sweeps instead of
+# runs. A run count can't tell five sweeps from repeats of fewer, and an untitled run shows
+# what it tested only in its log (on #2213 a listing missed two of its five green sweeps, and
+# the "missing" ones were dispatched again as duplicates):
+#   Sweep <package> <test> [filter=<filter>] [<KEY=VALUE> ...] seeds=<first>+<count>
+# Everything before " seeds=" is the sweep's identity (the env words in any order); the seed
+# range, chunks and tools aren't. Keep this shape: the merge job parses it.
+run-name: >-
+  Sweep ${{ inputs.package }} ${{ inputs.test }}${{ inputs.filter != '' && format(' filter={0}', inputs.filter) || '' }}${{ inputs.env != '' && format(' {0}', inputs.env) || '' }} seeds=${{ inputs.first }}+${{ inputs.count }}
 
 # Seed sweeps on runners instead of developer machines (CONTRIBUTING.md, "Seed sweeps").
 # Dispatch on a pushed branch:
