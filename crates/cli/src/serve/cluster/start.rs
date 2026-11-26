@@ -92,6 +92,7 @@ pub(crate) fn run(
     if let Some(m) = read_map(dir).map_err(|e| Failure::usage(&e))? {
         map::validate(&m, loopback_only)
             .map_err(|e| Failure::usage(&format!("{}: {e}", dir.join(MAP_FILE).display())))?;
+        own_map_adopted(dir, &m).map_err(|e| Failure::usage(&e))?;
         let json = map::canonical_json(&m);
         state.map = Some((map::canonical(&m), json));
     }
@@ -376,6 +377,22 @@ pub(crate) fn run(
 /// the top, the rest of `engine_memory` in equal shares. A restart re-splits it across
 /// every partition the map gives the node, which is how a node a run-time open refused
 /// for memory takes that partition (D317 ticket 6).
+/// A node rolled back below the cluster's adopted features refuses to start from its own
+/// map `m`, before it serves anything (cli692 on the adopted-features ruling): the map it
+/// stored names a feature its build lacks.
+pub(super) fn own_map_adopted(dir: &Path, m: &ClusterMap) -> Result<(), String> {
+    let lacked = map::lacked_adopted(m, &status::build_features(dir));
+    if lacked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: {}",
+            dir.join(MAP_FILE).display(),
+            map::below_adopted(&lacked)
+        ))
+    }
+}
+
 pub(crate) fn start_budget(
     map: Option<&ClusterMap>,
     mine: &[(String, u64)],

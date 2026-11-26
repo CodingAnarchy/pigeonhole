@@ -79,6 +79,11 @@ impl Node {
         check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError>,
     ) -> Result<u64, ApiError> {
         map::validate(map, self.loopback_only).map_err(ApiError::invalid)?;
+        // A map that adopted a feature this build lacks: refused, whatever its source.
+        let lacked = map::lacked_adopted(map, &super::status::build_features(&self.dir));
+        if !lacked.is_empty() {
+            return Err(ApiError::failed_precondition(map::below_adopted(&lacked)));
+        }
         // A map set here, forced or not, gets its partitions' `history_epoch` derived from
         // the current one, or from none for a first map (D317 ticket 6); a peer's arrives
         // derived.
@@ -287,6 +292,15 @@ impl Node {
             }
             // A recovery waits for no majority: it's what `--force` means.
             map.previous_nodes.clear();
+            // A forced map keeps every feature the cluster adopted: nothing removes one.
+            if let Ok(current) = self.get_map() {
+                for f in current.adopted_features {
+                    if !map.adopted_features.contains(&f) {
+                        map.adopted_features.push(f);
+                    }
+                }
+                map.adopted_features.sort();
+            }
             let version = self.install_async(map, None, |_| Ok(None)).await?;
             let pushed = self.push_all().await;
             return Ok(SetMapResponse {
@@ -358,6 +372,12 @@ impl Node {
                 self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
                     .await?;
             }
+            // The cluster's adopted features are the writer's to keep, as its term is: an
+            // operator's map can't drop or add one. A node it adds must report each, and the
+            // writer adopts what every node reports now.
+            map.adopted_features = current.adopted_features.clone();
+            self.new_nodes_keep_adopted(&current, &map).await?;
+            self.adopt_features(&mut map).await;
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {

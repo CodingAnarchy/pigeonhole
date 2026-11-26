@@ -117,6 +117,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         balance: Default::default(),
         balancer: Default::default(),
         balancer_events: Default::default(),
+        adopted_features: Vec::new(),
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
@@ -300,6 +301,72 @@ fn bounded(limit: Duration, test: impl FnOnce() + Send + 'static) {
             panic!("the test didn't finish within {limit:?}")
         }
     }
+}
+
+/// The adopted features (ClusterMap.adopted_features): a map set while every node answers
+/// adopts every feature the nodes all report, a later set keeps them though the operator's
+/// map leaves them out, and nothing removes one.
+#[test]
+fn a_map_set_while_every_node_answers_adopts_their_features() {
+    let t = Three::start(["", "", ""]);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        let set = async |m: ClusterMap| {
+            client(a)
+                .await
+                .set_map(SetMapRequest {
+                    expected_map_version: m.map_version - 1,
+                    map: Some(m),
+                    copies: Vec::new(),
+                    force: false,
+                })
+                .await
+                .unwrap();
+        };
+        let get = async || {
+            client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let mut m = get().await;
+        assert!(m.adopted_features.is_empty(), "{m:?}");
+        m.map_version += 1;
+        set(m).await;
+        let adopted = get().await.adopted_features;
+        let mut want: Vec<String> = super::MAP_FEATURES.iter().map(|f| f.to_string()).collect();
+        want.sort();
+        assert_eq!(adopted, want);
+        // An operator's map that leaves them out keeps them.
+        let mut m = get().await;
+        m.map_version += 1;
+        m.adopted_features.clear();
+        set(m).await;
+        assert_eq!(get().await.adopted_features, want);
+    });
+}
+
+/// cli692 on the ruling: a node whose build lacks a feature its stored map adopted refuses
+/// to start from that map (a rollback below the cluster's features), before it serves.
+#[test]
+fn a_node_below_its_maps_adopted_features_refuses_to_start() {
+    let dir = test_dir();
+    let mut m = the_map(1, &[1, 2, 3]);
+    m.adopted_features = vec![super::MEMORY_TOOL_FIELDS_FEATURE.to_owned()];
+    super::start::own_map_adopted(&dir, &m).unwrap();
+    super::OLD_MEMORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dir.clone());
+    let e = super::start::own_map_adopted(&dir, &m).unwrap_err();
+    assert!(
+        e.contains("lacks") && e.contains("memory_tool_fields"),
+        "{e}"
+    );
+    // So does taking such a map.
+    assert!(!super::map::lacked_adopted(&m, &super::status::build_features(&dir)).is_empty());
 }
 
 #[test]
@@ -4560,6 +4627,7 @@ fn split_nodes(
         balance: Default::default(),
         balancer: Default::default(),
         balancer_events: Default::default(),
+        adopted_features: Vec::new(),
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),

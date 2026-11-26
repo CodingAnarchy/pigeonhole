@@ -18,7 +18,13 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     MOVE_ABORTING_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
     BALANCER_FEATURE,
+    ADOPTED_FEATURES_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.adopted_features` itself: a node without it (1.3)
+/// would drop the field and read as divergent, so nothing is adopted until every node
+/// reports it.
+pub(crate) const ADOPTED_FEATURES_FEATURE: &str = "adopted_features";
 
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,
 /// `.balancer_events`, `Partition.pinned`, `.moves_history`, `TablePlacement.pinned_ranges`,
@@ -110,6 +116,12 @@ impl Node {
         feature: &str,
         what: &str,
     ) -> Result<(), ApiError> {
+        // An adopted feature (`ClusterMap.adopted_features`): every node of the map answered
+        // with it once, and none may run a build below it since, so a node that's down (a
+        // failover's old owner) doesn't hold the map back.
+        if map.adopted_features.iter().any(|f| f == feature) {
+            return Ok(());
+        }
         // Every node at once, as a confirm round asks them (simp724's n2 on #1920): k nodes
         // that don't answer cost one push timeout, not k.
         let peers = map
@@ -127,6 +139,91 @@ impl Node {
                 lacking.join(", ")
             )))
         }
+    }
+
+    /// Adds to `map.adopted_features` every feature this build keeps that every node of the
+    /// map reports now, in one round of fresh asks (never the cache: cli692 on the ruling).
+    /// Nothing if any node doesn't answer, or once this build's features are all adopted.
+    /// Never removes one.
+    pub(super) async fn adopt_features(self: &Arc<Self>, map: &mut ClusterMap) {
+        let missing: Vec<String> = super::status::build_features(&self.dir)
+            .into_iter()
+            .filter(|f| !map.adopted_features.contains(f))
+            .collect();
+        let Some(first) = missing.first() else {
+            return;
+        };
+        let peers: Vec<(String, String)> = map
+            .nodes
+            .iter()
+            .filter(|n| n.id != self.id)
+            .map(|n| (n.id.clone(), n.address.clone()))
+            .collect();
+        let answers = self.features_of(peers.iter().cloned(), first, false).await;
+        if answers
+            .iter()
+            .any(|(_, v)| matches!(v, PeerFeature::NoAnswer(_)))
+        {
+            return;
+        }
+        // Every peer answered just now: its whole list is what `features_of` stored.
+        let lists: Vec<Vec<String>> = {
+            let known = self
+                .peer_features
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut lists = Vec::new();
+            for (id, _) in &peers {
+                match known.get(id) {
+                    Some((_, Some(fs))) => lists.push(fs.clone()),
+                    _ => return,
+                }
+            }
+            lists
+        };
+        // A node that would drop the field itself (1.3) holds every adoption back.
+        if !lists
+            .iter()
+            .all(|fs| fs.iter().any(|f| f == ADOPTED_FEATURES_FEATURE))
+        {
+            return;
+        }
+        for f in missing {
+            if lists.iter().all(|fs| fs.contains(&f)) {
+                map.adopted_features.push(f);
+            }
+        }
+        map.adopted_features.sort();
+    }
+
+    /// `FailedPrecondition` naming each node `map` adds to `current`'s nodes that doesn't
+    /// report every feature `map` adopted, asked now: a node below the cluster's adopted
+    /// features would drop their fields and read as divergent.
+    pub(super) async fn new_nodes_keep_adopted(
+        self: &Arc<Self>,
+        current: &ClusterMap,
+        map: &ClusterMap,
+    ) -> Result<(), ApiError> {
+        let added: Vec<(String, String)> = map
+            .nodes
+            .iter()
+            .filter(|n| n.id != self.id && !current.nodes.iter().any(|c| c.id == n.id))
+            .map(|n| (n.id.clone(), n.address.clone()))
+            .collect();
+        if added.is_empty() {
+            return Ok(());
+        }
+        for f in &map.adopted_features {
+            let lacking = self.lacking(added.iter().cloned(), f).await;
+            if !lacking.is_empty() {
+                return Err(ApiError::failed_precondition(format!(
+                    "the cluster adopted feature {f:?} (ClusterMap.adopted_features), and a \
+                     node added by this map doesn't report it: {}. Upgrade it before adding it",
+                    lacking.join(", ")
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The peers of `peers` (id, address) that don't report `feature` in `Status`, each
