@@ -1027,13 +1027,13 @@ impl Promoter for NodeOps {
         Ok(statuses)
     }
 
-    async fn stamp(&self, id: &str, req: StampRequest) -> Result<(), Failure> {
+    async fn stamp(&self, id: &str, req: StampRequest) -> Result<Vec<u8>, Failure> {
         let node = self.node()?;
         if id == node.id {
             return node
                 .stamp(req)
                 .await
-                .map(|_| ())
+                .map(|(_, fork)| fork)
                 .map_err(|e| Failure::usage(&format!("stamp: {}", e.message)));
         }
         let address = node.address_of(id)?;
@@ -1041,10 +1041,12 @@ impl Promoter for NodeOps {
             .client(&address)
             .await
             .map_err(|e| Failure::usage(&e))?;
-        c.stamp(node.request(req).map_err(|e| Failure::usage(&e))?)
+        let lp = c
+            .stamp(node.request(req).map_err(|e| Failure::usage(&e))?)
             .await
-            .map_err(|s| Failure::usage(&format!("node {id:?}: stamp: {}", s.message())))?;
-        Ok(())
+            .map_err(|s| Failure::usage(&format!("node {id:?}: stamp: {}", s.message())))?
+            .into_inner();
+        Ok(lp.fork_token.to_vec())
     }
 
     async fn wait_closed(&self, id: &str, partition: &str) -> Result<(), Failure> {

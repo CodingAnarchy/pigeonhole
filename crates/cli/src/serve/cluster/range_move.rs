@@ -120,6 +120,15 @@ pub(super) fn plan(
         .find(|p| p.id == from)
         .map(|p| p.node.as_str())
         .ok_or_else(|| Skip::Unknown(format!("the map has no partition {from:?}")))?;
+    // D336: a partition with an old owner's tail pending keeps its ranges until the tail is
+    // replayed or discarded, which the map's change rules enforce; the balancer waits.
+    if let Some(e) = map::pending_tail(m, from) {
+        return Err(Skip::Busy(format!(
+            "{from} has an old owner's tail pending (node {:?}'s, from its failover at epoch \
+             {}): replay or discard it first",
+            e.from, e.to_epoch
+        )));
+    }
     let st = statuses
         .get(node)
         .ok_or_else(|| Skip::Unknown(format!("node {node:?}, {from}'s, gave no status")))?;

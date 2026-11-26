@@ -1138,3 +1138,41 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
 - A map that adds a node to the map's nodes is refused unless that node reports every adopted feature, in one round of fresh asks, naming each node and what it lacks.
 - The guide says rolling a node back below the adopted features is unsupported.
 - A 1.3 build doesn't know the field: nothing is adopted while one runs, since adoption needs every node to report `adopted_features`.
+
+## D336 PR 2: an old owner's tail recorded at a promote (1.4.0, #2148)
+**A promote records where the old owner's history and the new one fork,** and whether the old owner's tail (its commits past that point) is kept for a replay. PR 3 replays it, and PR 4 runs that automatically.
+
+**Proto** (coordinator-assigned):
+- `FailoverEvent.fork_token = 14` (bytes), `.tail_state = 15` (`TailState`), `.from_history_epoch = 16`, `.from_epoch = 17`;
+- `enum TailState { UNSPECIFIED = 0; NONE = 1; PENDING = 2; DONE = 3; DISCARDED = 4; }`;
+- `LocalPartition.fork_token = 39`, in a stamp's reply only (never in `Status`);
+- `LocalPartition.tail_kept = 40` (`TailKept { bytes = 1; last_durable_seqno = 2; }`), set from PR 3 on;
+- the map feature `tail_replay`.
+
+**The fork token** (D336 Amendment 4, with cli692's review): the copy's primary token from before its promote.
+- **Before the promote:** the stamp reads it in its `following` branch and writes it to `<P>.phdb.promoting.fork`, hex-encoded and synced, before #2156's intent. The intent itself is unchanged, so a node rolled back to 1.3.1 still matches it.
+- **With the identity:** the stamp writes it as `__phdb_cluster`'s row `fork/<to_epoch>` (family `id`, column `token`), in the same atomic batch as the identity at `to_epoch`. It then removes the intent and the fork file. `drop-partition` moves the fork file aside with the partition's files.
+- **Every stamp of a promote answers it** in `LocalPartition.fork_token`: from the fork file before the identity commit, and from the row after it, the "run again once done" path included. Other stamps answer none.
+- **A missing token is never an error.** That covers a 1.3 build's intent, a done file with no row, a fork file that isn't hex, or an unreadable one. The answer is empty, and the promote reports a warning.
+- **The promote** stamps a copy an earlier run stamped again, which writes nothing and only answers the token, since that run's reply may have been lost. It records the token in the event its map finishes.
+
+**`tail_state`:**
+- **PENDING** when the old owner may hold commits the copy lacks: a writer failover, a promote with `--old-unreachable`, or a reachable owner whose durable seqno, as the copy last heard it, is past what the copy applied or unknown.
+- **NONE** otherwise.
+- With PENDING, the event also carries `fork_token`, `from_history_epoch` (P's) and `from_epoch` (the old owner's epoch).
+- The event's fields stay unset (UNSPECIFIED, read as NONE) when the token is empty, or when the map can't take them: `tail_replay` isn't in `ClusterMap.adopted_features` and not every node answers with it now (the install's gate refuses, and the promote sets its map again without the fields). The promote goes on either way, with a warning that names the remedy (cli692's note 2 on #2237): once every node runs a build with it, set any map while they all answer. With failover on, the writer adopts it on its own. A promote never asks the nodes itself.
+- `tail_state` is independent of `state`, and every reader of a promote keys on `state` alone.
+
+**Retention and the cap:**
+- An event whose tail is PENDING is pinned past the 16 finished events.
+- At most 4 PENDING tails per partition (the owner's Q5): past that, the oldest becomes DISCARDED and its token is cleared.
+
+**Guards (the owner's Q4), in `validate_change`:**
+- No range or whole-partition move of P starts while a tail of it is PENDING.
+- P's node and epoch change only by a promote's own map (the event it finishes) or a range move's hand-over (P stays on its node). A relocate or a restore is refused, naming the tail. The refusal lasts until the tail is replayed or discarded (PR 3).
+
+**Mixed versions:** a map using any of the event's new fields needs `tail_replay` on every node (`install.rs`, as for D332's fields).
+
+**Not in PR 2:**
+- The fork row's removal once the tail leaves PENDING (PR 3). A stale row is harmless: nothing reads a row of another epoch.
+- The balancer's skip reason, and `Status`'s report of a discarded tail (PR 4, with the guide).

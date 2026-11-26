@@ -58,6 +58,43 @@ fn read_as_of(db: &Pigeonhole, snapshot: Option<&Snapshot>) -> Result<Option<Ide
 /// another cluster's or another partition; the same identity again only updates the epoch,
 /// which never falls.
 pub(crate) fn write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
+    check_write(db, id)?;
+    put(db, id, None)
+}
+
+/// [`write`] for a promote (D336, #2148): the identity at the promote's epoch and the copy's
+/// fork token (its primary token from before the promote) as row `fork/<epoch>`, in one
+/// commit, so the token is durable once the identity is, before the promote's intent goes.
+/// An empty token writes the identity alone.
+pub(crate) fn write_promoted(db: &Pigeonhole, id: &Identity, fork: &[u8]) -> Result<(), String> {
+    check_write(db, id)?;
+    put(db, id, (!fork.is_empty()).then_some(fork))
+}
+
+/// A promote's fork token in `db`, from [`write_promoted`] at `epoch` (D336): `None` when
+/// there's none (an older build's promote, or a copy whose token was unknown).
+pub(crate) fn fork_token(db: &Pigeonhole, epoch: u64) -> Result<Option<Vec<u8>>, String> {
+    let table = match db.table(TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(None),
+        Err(e) => return Err(format!("read {TABLE}: {e}")),
+    };
+    Ok(table
+        .get(&fork_row(epoch), FAMILY, FORK)
+        .map_err(|e| format!("read {TABLE}: {e}"))?
+        .map(|c| c.value().to_vec()))
+}
+
+/// The row of a promote's fork token at `epoch`: in family `id`, which every stamped file
+/// has and nothing scans (cli692's (4) on D336 Amendment 4).
+fn fork_row(epoch: u64) -> Vec<u8> {
+    format!("fork/{epoch}").into_bytes()
+}
+
+const FORK: &[u8] = b"token";
+
+/// [`write`]'s checks: the same cluster and partition, and an epoch that never falls.
+fn check_write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
     if let Some(old) = read(db)? {
         if old.cluster_id != id.cluster_id || old.partition_id != id.partition_id {
             return Err(format!(
@@ -72,7 +109,7 @@ pub(crate) fn write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
             ));
         }
     }
-    put(db, id)
+    Ok(())
 }
 
 /// Restores `db`, a backup of cluster `from`'s partition, into `id`'s cluster (D317 ticket
@@ -80,7 +117,9 @@ pub(crate) fn write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
 /// Refused unless the file says it's that partition of `from`.
 pub(crate) fn restore(db: &Pigeonhole, id: &Identity, from: &str) -> Result<(), String> {
     match read(db)? {
-        Some(old) if old.cluster_id == from && old.partition_id == id.partition_id => put(db, id),
+        Some(old) if old.cluster_id == from && old.partition_id == id.partition_id => {
+            put(db, id, None)
+        }
         Some(old) => Err(format!(
             "the file is partition {:?} of cluster {:?}, not partition {:?} of cluster {from:?}",
             old.partition_id, old.cluster_id, id.partition_id
@@ -90,7 +129,7 @@ pub(crate) fn restore(db: &Pigeonhole, id: &Identity, from: &str) -> Result<(), 
 }
 
 /// Writes `id` into `db`'s identity row, creating the table.
-fn put(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
+fn put(db: &Pigeonhole, id: &Identity, fork: Option<&[u8]>) -> Result<(), String> {
     let table = db
         .table(TABLE)
         .map_err(|e| format!("{TABLE}: {e}"))?
@@ -98,13 +137,29 @@ fn put(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
         .create_if_missing()
         .map_err(|e| format!("create {TABLE}: {e}"))?;
     let epoch = id.epoch.to_string();
-    table
-        .mutate(ROW)
-        .put(FAMILY, b"cluster_id", id.cluster_id.as_bytes())
-        .put(FAMILY, b"partition_id", id.partition_id.as_bytes())
-        .put(FAMILY, b"epoch", epoch.as_bytes())
-        .commit()
-        .map_err(|e| format!("write {TABLE}: {e}"))?;
+    let Some(fork) = fork else {
+        table
+            .mutate(ROW)
+            .put(FAMILY, b"cluster_id", id.cluster_id.as_bytes())
+            .put(FAMILY, b"partition_id", id.partition_id.as_bytes())
+            .put(FAMILY, b"epoch", epoch.as_bytes())
+            .commit()
+            .map_err(|e| format!("write {TABLE}: {e}"))?;
+        return Ok(());
+    };
+    // A promote's (D336): the identity and its fork token, one atomic commit.
+    let mut b = db.write_batch();
+    b.put(&table, ROW, FAMILY, b"cluster_id", id.cluster_id.as_bytes())
+        .put(
+            &table,
+            ROW,
+            FAMILY,
+            b"partition_id",
+            id.partition_id.as_bytes(),
+        )
+        .put(&table, ROW, FAMILY, b"epoch", epoch.as_bytes())
+        .put(&table, &fork_row(id.epoch), FAMILY, FORK, fork);
+    b.commit().map_err(|e| format!("write {TABLE}: {e}"))?;
     Ok(())
 }
 

@@ -2005,6 +2005,72 @@ fn failover_rig(on: bool) -> Rig {
     failover_rig_with(on, &["b"])
 }
 
+/// D336 (the coordinator's test): a restarted writer records an old owner's tail at the
+/// failover that follows. The cluster adopted `tail_replay` while every node answered
+/// (ClusterMap.adopted_features), so the restarted writer, which holds no features cache
+/// and gets no answer from the owner once it's down, needs none. The owner goes down after
+/// the restart: a writer fails nothing over until it has seen the owner renew since it
+/// started (simp724's B1 on #2069), so one restarted with the owner already down never
+/// fails it over at all.
+#[test]
+fn a_restarted_writer_records_the_tail_of_an_owner_that_then_dies() {
+    let mut t = failover_rig(true);
+    let [a, _b, _c] = t.ports;
+    t.rt.block_on(async {
+        eventually("tail_replay to be adopted", async || {
+            map_of(a)
+                .await
+                .adopted_features
+                .iter()
+                .any(|f| f == crate::serve::cluster::TAIL_REPLAY_FEATURE)
+        })
+        .await;
+    });
+    t.stop(0);
+    t.restart(0);
+    t.rt.block_on(async {
+        eventually_within(
+            Duration::from_secs(20),
+            "the restarted a to grant c's p3",
+            async || {
+                status_of(a)
+                    .await
+                    .grants
+                    .iter()
+                    .any(|g| g.partition == "p3" && g.holder == "c")
+            },
+        )
+        .await;
+    });
+    cut(&t, 2, true);
+    t.rt.block_on(async {
+        eventually_within(FAILOVER_WINDOW * 2, "p3 to fail over", async || {
+            map_of(a)
+                .await
+                .partitions
+                .iter()
+                .any(|p| p.id == "p3" && p.node != "c")
+        })
+        .await;
+        let m = map_of(a).await;
+        let e = m
+            .failovers
+            .iter()
+            .find(|e| {
+                e.kind() == crate::serve::proto::FailoverKind::Partition && e.partition == "p3"
+            })
+            .expect("p3's event");
+        assert_eq!(
+            e.tail_state(),
+            crate::serve::proto::TailState::Pending,
+            "{e:?}"
+        );
+        assert!(!e.fork_token.is_empty(), "{e:?}");
+        assert_eq!(e.from, "c", "{e:?}");
+    });
+    cut(&t, 2, false);
+}
+
 /// Whether the writer at `port` reports p3 down and not failed over for a reason that
 /// starts with `why`.
 async fn blocked_for(port: u16, why: &str) -> bool {
@@ -2408,6 +2474,23 @@ fn when_the_writer_that_owns_a_partition_dies_the_next_writer_fails_it_over() {
         })
         .await;
         assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"v1".to_vec()));
+        // D336: a writer failover keeps the old owner's tail, from the fork token the
+        // copy's stamp answered, at the old file's epochs.
+        let m = map_of(b).await;
+        let e = m
+            .failovers
+            .iter()
+            .find(|e| {
+                e.kind() == crate::serve::proto::FailoverKind::Partition && e.partition == "p1"
+            })
+            .expect("p1's event");
+        assert_eq!(
+            e.tail_state(),
+            crate::serve::proto::TailState::Pending,
+            "{e:?}"
+        );
+        assert!(!e.fork_token.is_empty(), "{e:?}");
+        assert!(e.from_epoch > 0 && e.from_epoch < e.to_epoch, "{e:?}");
     });
     cut(&t, 0, false);
 }

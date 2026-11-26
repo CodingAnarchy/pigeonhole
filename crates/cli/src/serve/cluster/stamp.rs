@@ -68,6 +68,71 @@ fn intent_matches(dir: &Path, req: &StampRequest) -> bool {
     std::fs::read_to_string(promote_intent(dir, &req.partition)).is_ok_and(|s| s == intent_of(req))
 }
 
+/// A promote's fork token beside its intent (D336, #2148): the copy's primary token from
+/// before the promote, hex-encoded. A file of its own, so the intent stays what #2156 wrote
+/// and a node rolled back to 1.3.1 still matches it (cli692's (1) and (2) on Amendment 4).
+/// Written and synced with the intent, removed with it, and moved aside with the
+/// partition's files.
+pub(crate) fn promote_fork(dir: &Path, partition: &str) -> PathBuf {
+    dir.join(format!("{partition}.phdb.promoting.fork"))
+}
+
+/// Writes and syncs `token` as `partition`'s promote fork token (synced with the intent by
+/// [`write_intent`]'s directory sync, which follows it).
+fn write_fork(dir: &Path, partition: &str, token: &[u8]) -> Result<(), ApiError> {
+    use std::io::Write as _;
+    let path = promote_fork(dir, partition);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(hex(token).as_bytes())?;
+        f.sync_all()
+    };
+    write().map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))
+}
+
+/// The promote fork token beside `partition`'s intent: empty when there's none (a 1.3
+/// build's intent) or it can't be read (cli692's (3): never an error).
+fn read_fork(dir: &Path, partition: &str) -> Vec<u8> {
+    let path = promote_fork(dir, partition);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => unhex(s.trim()).unwrap_or_else(|| {
+            eprintln!(
+                "phdb serve: {} isn't hex: the fork token is unknown",
+                path.display()
+            );
+            Vec::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "phdb serve: read {}: {e}: the fork token is unknown",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// A test's fault seam (#2156): a promote's stamp on a node in each listed cluster
 /// directory stops after the copy's promote, before its identity, as a crash there would.
 #[cfg(test)]
@@ -210,12 +275,13 @@ fn install(
 impl Node {
     /// `Cluster.Stamp`: installs partition `req.partition`'s staged set, if one is complete
     /// (or finishes an interrupted install), then raises its file's epoch from `from_epoch`
-    /// to `to_epoch`. Refused while the partition is open here. The set installed, if any.
-    /// Run again once done, it answers success with nothing to do.
+    /// to `to_epoch`. Refused while the partition is open here. The set installed, if any,
+    /// and a promote's fork token (D336; empty when unknown, and for every other stamp).
+    /// Run again once done, it answers success with nothing to do but the token.
     pub(crate) async fn stamp(
         self: &Arc<Self>,
         req: StampRequest,
-    ) -> Result<Vec<PartitionFile>, ApiError> {
+    ) -> Result<(Vec<PartitionFile>, Vec<u8>), ApiError> {
         let _one = self.fences.changing.lock().await;
         let _open = self.opening.lock().await;
         let p = req.partition.clone();
@@ -234,7 +300,7 @@ impl Node {
             )));
         }
         if req.create {
-            return self.create(req).await;
+            return Ok((self.create(req).await?, Vec::new()));
         }
         if self.part_state(&p).is_some() {
             return Err(ApiError::failed_precondition(format!(
@@ -253,7 +319,8 @@ impl Node {
         }
         let dir = self.dir.clone();
         let restore = req.restore;
-        let installed = tokio::task::spawn_blocking(move || stamp_files(&dir, &req)).await??;
+        let (installed, fork) =
+            tokio::task::spawn_blocking(move || stamp_files(&dir, &req)).await??;
         // An operator's fence here was on the copy this node held before (a move away
         // fences it): a set installed now is another copy, at another epoch. It opens
         // fenced, and serves once the map gives it here. A stamp that installs nothing
@@ -268,7 +335,7 @@ impl Node {
         // Its files changed: a close's hashes of them go, and a map that gives it here
         // opens it.
         self.fences.forget_closed(&p);
-        Ok(installed)
+        Ok((installed, fork))
     }
 }
 
@@ -580,7 +647,9 @@ fn staged_any(dir: &Path, p: &str) -> bool {
 }
 
 /// [`Node::stamp`]'s work on the files, on a blocking thread.
-fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, ApiError> {
+/// The set it installed, and a promote's fork token (D336; empty when unknown or not a
+/// promote).
+fn stamp_files(dir: &Path, req: &StampRequest) -> Result<(Vec<PartitionFile>, Vec<u8>), ApiError> {
     let p = &req.partition;
     if req.promote && (req.restore || upload::ready_set(dir, p).is_some()) {
         return Err(ApiError::invalid(
@@ -660,9 +729,19 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
                 id.partition_id
             )));
         }
-        // Run again once done: nothing to do.
+        // Run again once done: nothing to do but answer a promote's fork token, from the row
+        // its identity commit wrote (D336: a promoter whose reply was lost asks again).
+        // Copy-move, relocate and restore reruns come here too, and answer none.
         if id.cluster_id == req.cluster_id && id.epoch == req.to_epoch {
-            return Ok(());
+            if !req.promote {
+                return Ok(Vec::new());
+            }
+            return Ok(identity::fork_token(&db, req.to_epoch)
+                .unwrap_or_else(|e| {
+                    eprintln!("phdb serve: partition {p}'s fork token: {e}: unknown");
+                    None
+                })
+                .unwrap_or_default());
         }
         let cluster_ok = if req.restore_from_cluster_id.is_empty() {
             id.cluster_id == req.cluster_id
@@ -713,6 +792,14 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
             // stamping it again would give P this file's history over whatever P took since
             // (simp724's M1 on #2007).
             if following {
+                // D336: the copy's primary token, the fork point, before the promote drops
+                // it, kept beside the intent (cli692's note: read in this branch).
+                let token = db
+                    .replicated_token()
+                    .map_err(|e| ApiError::internal(format!("read the copy's state: {e}")))?
+                    .map(|t| t.as_bytes().to_vec())
+                    .unwrap_or_default();
+                write_fork(dir, p, &token)?;
                 write_intent(dir, req)?;
                 db.promote()
                     .map_err(|e| ApiError::internal(format!("promote {}: {e}", main.display())))?;
@@ -746,7 +833,17 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
             partition_id: p.clone(),
             epoch: req.to_epoch,
         };
-        if req.restore_from_cluster_id.is_empty() {
+        // D336: a promote's fork token, kept beside its intent before the promote (a first
+        // run or a rerun alike), goes in with the identity, so it's durable before the
+        // intent is removed.
+        let fork = if req.promote {
+            read_fork(dir, p)
+        } else {
+            Vec::new()
+        };
+        if req.promote {
+            identity::write_promoted(&db, &id, &fork)
+        } else if req.restore_from_cluster_id.is_empty() {
             identity::write(&db, &id)
         } else {
             identity::restore(&db, &id, &req.restore_from_cluster_id)
@@ -758,21 +855,23 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
         if req.restore {
             crate::serve::ranges::mark_clip(&db).map_err(ApiError::internal)?;
         }
-        Ok(())
+        Ok(fork)
     })();
     let closed = db.close();
-    stamped?;
+    let fork = stamped?;
     closed.map_err(|e| ApiError::internal(format!("close {}: {e}", main.display())))?;
     // The identity is at the new epoch and closed: a promote's intent has done its work.
+    // Its fork token is in the file now (D336), so its side file goes too, after the intent.
     if req.promote {
-        let intent = promote_intent(dir, p);
-        match std::fs::remove_file(&intent) {
-            Ok(()) => upload::sync_dir(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("phdb serve: remove {}: {e}", intent.display()),
+        for path in [promote_intent(dir, p), promote_fork(dir, p)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => upload::sync_dir(dir),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("phdb serve: remove {}: {e}", path.display()),
+            }
         }
     }
-    Ok(installed)
+    Ok((installed, fork))
 }
 
 #[cfg(test)]
@@ -870,6 +969,131 @@ mod tests {
         (id.cluster_id, id.epoch)
     }
 
+    /// A replica copy of partition `p1` in `d`, as D328's bootstrap leaves it: a backup of a
+    /// primary at epoch 1, following it from the backup's snapshot. The primary's token.
+    fn replica_copy(d: &Path) -> Vec<u8> {
+        let src = crate::test_dir::fresh("phdb-stamp-primary-");
+        let primary = pigeonhole::Pigeonhole::open(
+            main_file(&src, "p1"),
+            pigeonhole::Options::default()
+                .create_if_missing(true)
+                .shards(1)
+                .pin_threads(false)
+                .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+        )
+        .unwrap();
+        identity::write(
+            &primary,
+            &identity::Identity {
+                cluster_id: "c1".into(),
+                partition_id: "p1".into(),
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        let snap = primary.snapshot().unwrap();
+        let token = primary.feed().from_snapshot(&snap).open().unwrap().token();
+        primary.backup_at(&snap, main_file(d, "p1")).unwrap();
+        drop(snap);
+        primary.close().unwrap();
+        let copy = pigeonhole::Pigeonhole::open(
+            main_file(d, "p1"),
+            pigeonhole::Options::default().shards(1).pin_threads(false),
+        )
+        .unwrap();
+        copy.begin_replication(&token).unwrap();
+        copy.close().unwrap();
+        token.as_bytes().to_vec()
+    }
+
+    fn promote(from: u64, to: u64) -> StampRequest {
+        StampRequest {
+            to_epoch: to,
+            promote: true,
+            replica_epoch: 1,
+            ..req(from)
+        }
+    }
+
+    fn fork_row(d: &Path, epoch: u64) -> Option<Vec<u8>> {
+        let db = pigeonhole::Pigeonhole::open(
+            main_file(d, "p1"),
+            pigeonhole::Options::default().shards(1).pin_threads(false),
+        )
+        .unwrap();
+        let row = identity::fork_token(&db, epoch).unwrap();
+        db.close().unwrap();
+        row
+    }
+
+    /// D336 Amendment 4: a promote's stamp answers the copy's primary token, its fork point,
+    /// and keeps it in the file with the identity, so the intent and its fork file go.
+    #[test]
+    fn a_promotes_stamp_answers_its_fork_token_and_keeps_it_with_the_identity() {
+        let d = dir();
+        let token = replica_copy(&d);
+        let (installed, fork) = stamp_files(&d, &promote(1, 3)).unwrap();
+        assert!(installed.is_empty());
+        assert_eq!(fork, token);
+        assert_eq!(epoch(&d), ("c1".into(), 3));
+        assert_eq!(fork_row(&d, 3), Some(token));
+        assert!(!promote_intent(&d, "p1").exists());
+        assert!(!promote_fork(&d, "p1").exists());
+    }
+
+    /// The coordinator's test for D336 Amendment 4: the stamp's reply is lost after the
+    /// identity, its fork row and the intent's removal. The promote's rerun takes the "done"
+    /// path and still answers the token.
+    #[test]
+    fn a_promotes_rerun_after_a_lost_reply_still_answers_its_fork_token() {
+        let d = dir();
+        let token = replica_copy(&d);
+        drop(stamp_files(&d, &promote(1, 3)).unwrap());
+        assert!(!promote_intent(&d, "p1").exists(), "the intent is gone");
+        let (_, fork) = stamp_files(&d, &promote(1, 3)).unwrap();
+        assert_eq!(fork, token);
+    }
+
+    /// A promote stopped between the copy's promote and its identity (#2156): the rerun
+    /// takes the token from the fork file beside the intent, the replica's state being gone.
+    #[test]
+    fn a_promote_stopped_after_its_promote_finds_its_fork_token_beside_the_intent() {
+        let d = dir();
+        let token = replica_copy(&d);
+        STOP_AFTER_PROMOTE.lock().unwrap().push(d.clone());
+        stamp_files(&d, &promote(1, 3)).unwrap_err();
+        assert!(promote_intent(&d, "p1").exists());
+        assert!(promote_fork(&d, "p1").exists());
+        let (_, fork) = stamp_files(&d, &promote(1, 3)).unwrap();
+        assert_eq!(fork, token);
+        assert_eq!(fork_row(&d, 3), Some(token));
+        assert!(!promote_fork(&d, "p1").exists());
+    }
+
+    /// cli692's (3) on D336 Amendment 4: no fork token is never an error. A file at the
+    /// promote's epoch with no fork row (a 1.3 build's promote) answers an empty one, and so
+    /// does a fork file that isn't hex.
+    #[test]
+    fn a_promote_without_a_fork_token_answers_an_empty_one() {
+        let d = dir();
+        partition(&d, "p1", "c1", 3);
+        let (_, fork) = stamp_files(&d, &promote(1, 3)).unwrap();
+        assert!(fork.is_empty());
+        std::fs::write(promote_fork(&d, "p1"), "not hex").unwrap();
+        assert!(read_fork(&d, "p1").is_empty());
+        // Every other stamp's rerun answers none.
+        let (_, fork) = stamp_files(&d, &req(2)).unwrap();
+        assert!(fork.is_empty());
+    }
+
+    #[test]
+    fn hex_round_trips() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(unhex(&hex(&bytes)), Some(bytes));
+        assert_eq!(unhex("abc"), None);
+        assert_eq!(unhex("zz"), None);
+    }
+
     fn replaced(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
@@ -912,7 +1136,7 @@ mod tests {
         std::fs::write(d.join("p1.phdb-wal-7"), b"old").unwrap();
         let main = partition(&src, "p1", "c1", 1);
         let manifest = stage(&d, "p1", &main, "c1", 1);
-        assert_eq!(stamp_files(&d, &req(1)).unwrap(), manifest);
+        assert_eq!(stamp_files(&d, &req(1)).unwrap().0, manifest);
         assert_eq!(epoch(&d), ("c1".into(), 2));
         assert!(!d.join("p1.phdb-wal-7").exists());
         let first = replaced(&d);

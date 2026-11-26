@@ -492,6 +492,36 @@ message FailoverEvent {
   // taken for this history (simp724's S2 on the D330 PR 2 plan).
   uint64 to_epoch = 12;
   FailoverState state = 13;
+  // D336 (#2148): PARTITION: the promoted copy's primary token as it was before the promote,
+  // the point where the old owner's history and the new one fork. The old owner's tail is
+  // what its file holds past it. An all-tables feed token: the primary's id and one position
+  // per stream, up to a few KiB with a large catalog. Empty when unknown (a promote by a
+  // build without D336, or a copy whose token was lost); cleared once `tail_state` leaves
+  // PENDING.
+  bytes fork_token = 14;
+  // D336: PARTITION: the old owner's tail, replayed into the new owner or not. Independent
+  // of `state` (the promote's own): every reader of the promote keys on `state` alone.
+  TailState tail_state = 15;
+  // D336: PARTITION: the old owner's file the tail is in: its history epoch (the origin
+  // the replay marks its progress under) and its identity epoch (the source checks it).
+  uint64 from_history_epoch = 16;
+  uint64 from_epoch = 17;
+}
+
+// D336 (#2148): what became of a failed-over partition's old owner's tail.
+enum TailState {
+  // An event recorded by a build without D336: treated as NONE.
+  TAIL_STATE_UNSPECIFIED = 0;
+  // Nothing to replay: the old owner was reachable and the copy had applied all it had
+  // made durable, or the fork token is unknown (the event says why).
+  TAIL_STATE_NONE = 1;
+  // The old owner may hold commits the new owner lacks: kept until replayed or discarded.
+  // While one is pending, the partition's moves and history changes are refused.
+  TAIL_STATE_PENDING = 2;
+  // Replayed into the new owner.
+  TAIL_STATE_DONE = 3;
+  // Given up on, by an operator or past the cap of 4 pending tails per partition.
+  TAIL_STATE_DISCARDED = 4;
 }
 
 enum FailoverKind {
@@ -832,6 +862,22 @@ message LocalPartition {
   // D335, on a replica copy: the position its stored token is at, which is what it
   // acknowledges. Absent on an owner, before the copy's first apply, and from an older node.
   Position replica_applied_position = 38;
+  // D336 (#2148): a promote's stamp reply only (never in `Status`): the promoted copy's
+  // primary token from before its promote, its fork point. Every stamp of a promote answers
+  // it, a rerun of a finished one too; empty when unknown (never an error). An all-tables
+  // feed token, up to a few KiB.
+  bytes fork_token = 39;
+  // D336: an old owner's kept tail of this partition, once it opens its file as a tail
+  // source (PR 3); absent otherwise.
+  TailKept tail_kept = 40;
+}
+
+// D336: an old owner's tail of a partition, as its file holds it.
+message TailKept {
+  // The bytes of the file's feed history past the fork token.
+  uint64 bytes = 1;
+  // The file's last durable seqno.
+  uint64 last_durable_seqno = 2;
 }
 
 // A share held in doubt (D329).

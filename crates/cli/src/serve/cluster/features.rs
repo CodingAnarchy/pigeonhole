@@ -20,6 +20,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     BALANCER_FEATURE,
     ADOPTED_FEATURES_FEATURE,
     REPLICA_ACKS_FEATURE,
+    TAIL_REPLAY_FEATURE,
 ];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.adopted_features` itself: a node without it (1.3)
@@ -32,6 +33,16 @@ pub(crate) const ADOPTED_FEATURES_FEATURE: &str = "adopted_features";
 /// map fields (a partition's `replica_acks`) come under the same name: a map sets them only
 /// once every node reports it.
 pub(crate) const REPLICA_ACKS_FEATURE: &str = "replica_acks";
+
+/// [`MAP_FEATURES`]' name for D336's `FailoverEvent` fields (`fork_token`, `tail_state`,
+/// `from_history_epoch`, `from_epoch`; #2148): a node without it would drop them from its
+/// copy, read as divergent, and lose an old owner's pending tail. A promote records them
+/// only once every node reports it, and otherwise leaves the tail unrecorded (NONE).
+pub(crate) const TAIL_REPLAY_FEATURE: &str = "tail_replay";
+
+/// What a map refused for want of [`TAIL_REPLAY_FEATURE`] names (D336): a promote that meets
+/// it sets its map again without the tail's fields.
+pub(crate) const TAIL_REPLAY_WHAT: &str = "an old owner's tail";
 
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,
 /// `.balancer_events`, `Partition.pinned`, `.moves_history`, `TablePlacement.pinned_ranges`,
