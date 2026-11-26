@@ -23,6 +23,8 @@ pub(super) fn test_dir() -> PathBuf {
 /// The lease the test nodes grant (D326): three of their push timeouts, the least a node
 /// takes, so a test waits out a lease in moments.
 pub(super) const TEST_LEASE: Duration = Duration::from_millis(1500);
+/// The tests' `--cluster-replica-ack-timeout-ms` (D335).
+pub(super) const TEST_REPLICA_ACK_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// An hour, in nanoseconds on a lease clock: a test node's lease that won't run out.
 pub(super) const HOUR_NS: u64 = 3_600_000_000_000;
@@ -59,6 +61,7 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             lease: TEST_LEASE,
             failover_after: TEST_LEASE * 2,
             failover_max_lag: None,
+            replica_ack_timeout: TEST_REPLICA_ACK_TIMEOUT,
             balance_window: Duration::from_secs(300),
             load_interval: Duration::from_millis(500),
             prune_interval: Duration::from_millis(500),
@@ -134,6 +137,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         partitions: [("p1", "a"), ("p2", "b"), ("p3", "c")]
             .iter()
             .map(|(id, node)| Partition {
+                replica_acks: 0,
                 moves_history: Default::default(),
                 pinned: Default::default(),
                 history_epoch: 0,
@@ -1014,6 +1018,7 @@ fn a_forward_from_a_newer_peer_that_cant_give_its_map_writes_nothing() {
             min_primary_seqno: 0,
             partition: String::new(),
             op: Some(forward_request::Op::Mutate(super::proto::MutateRequest {
+                replication: 0,
                 writes: Some(put_row("bob", "1")),
                 durability: 0,
             })),
@@ -1075,6 +1080,7 @@ fn a_large_reply_and_a_request_at_the_limit_pass_through_a_forward() {
         // 1 MiB): the forward adds its envelope.
         let limit = crate::serve::server_tests::limits().max_request_bytes;
         let request = |n: usize| super::proto::MutateRequest {
+            replication: 0,
             writes: Some(put_row("bob", &"x".repeat(n))),
             durability: 0,
         };
@@ -1161,6 +1167,7 @@ fn a_family_added_to_a_cached_table_reads_with_its_aggregate_view() {
         data(a)
             .await
             .mutate(super::proto::MutateRequest {
+                replication: 0,
                 writes: Some(super::proto::RowWrites {
                     row: Some(super::proto::RowKey {
                         table: "users".into(),
@@ -1722,6 +1729,7 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             data(entry)
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(put_row(row, value)),
                     durability: 0,
                 })
@@ -1737,6 +1745,7 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
         let e = data(c)
             .await
             .batch(super::proto::BatchRequest {
+                replication: 0,
                 rows: vec![put_row("bob", "x"), put_row("yan", "y")],
                 durability: 0,
             })
@@ -1749,6 +1758,7 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
         data(a)
             .await
             .batch(super::proto::BatchRequest {
+                replication: 0,
                 rows: vec![put_row("xavi", "4"), put_row("yan", "5")],
                 durability: 0,
             })
@@ -1812,6 +1822,7 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
         let e = data(c)
             .await
             .mutate(super::proto::MutateRequest {
+                replication: 0,
                 writes: Some(put_row("zoe", "6")),
                 durability: 0,
             })
@@ -1895,6 +1906,7 @@ fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sende
         let e = data(c)
             .await
             .mutate(super::proto::MutateRequest {
+                replication: 0,
                 writes: Some(put_row("zed", "moved")),
                 durability: 0,
             })
@@ -1910,6 +1922,7 @@ fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sende
         data(c)
             .await
             .mutate(super::proto::MutateRequest {
+                replication: 0,
                 writes: Some(put_row("alice", "1")),
                 durability: 0,
             })
@@ -2097,6 +2110,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                     let row = &read[rng.below(read.len() as u64) as usize];
                     clients[rng.below(3) as usize]
                         .mutate(super::proto::MutateRequest {
+                            replication: 0,
                             writes: Some(put_row(row, &format!("x{i}"))),
                             durability: 0,
                         })
@@ -2114,6 +2128,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                 }
                 let reply = tx[via]
                     .commit(super::proto::TxnCommitRequest {
+                        replication: 0,
                         txn_id: id.clone(),
                         rows: Vec::new(),
                     })
@@ -2149,6 +2164,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                 let row = &rows[rng.below(rows.len() as u64) as usize];
                 clients[rng.below(3) as usize]
                     .mutate(super::proto::MutateRequest {
+                        replication: 0,
                         writes: Some(put_row(row, &format!("s{i}"))),
                         durability: 0,
                     })
@@ -2184,6 +2200,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                     let row = &rows[rng.below(rows.len() as u64) as usize];
                     let value = format!("v{i}");
                     c.mutate(super::proto::MutateRequest {
+                        replication: 0,
                         writes: Some(put_row(row, &value)),
                         durability: 0,
                     })
@@ -2217,6 +2234,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                     let value = format!("b{i}");
                     let reply = c
                         .batch(super::proto::BatchRequest {
+                            replication: 0,
                             rows: picked.iter().map(|r| put_row(r, &value)).collect(),
                             durability: 0,
                         })
@@ -2309,6 +2327,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-lease-ms",
         "cluster-failover-after-ms",
         "cluster-failover-max-lag-ms",
+        "cluster-replica-ack-timeout-ms",
         "balance-window",
         "tls-key",
         "tls-cert",
@@ -2594,6 +2613,7 @@ async fn txn_write(
 
 async fn commit(port: u16, id: &str, token: Option<&str>) -> Result<u64, tonic::Status> {
     let r = super::proto::TxnCommitRequest {
+        replication: 0,
         txn_id: id.into(),
         rows: Vec::new(),
     };
@@ -2681,6 +2701,7 @@ async fn put(port: u16, row: &str, value: &str) {
     data(port)
         .await
         .mutate(super::proto::MutateRequest {
+            replication: 0,
             writes: Some(put_row(row, value)),
             durability: 0,
         })
@@ -2903,6 +2924,7 @@ fn a_session_is_its_tokens_on_every_node() {
         // The partition's node decides the scope by its own entry (cli692's R1 on #1702):
         // t0ken-d writes to p1, and is refused writing to p2.
         let write = |row: &str| super::proto::MutateRequest {
+            replication: 0,
             writes: Some(put_row(row, "d")),
             durability: 0,
         };
@@ -3174,6 +3196,7 @@ fn a_scan_of_a_partition_on_its_entry_node_charges_each_page_once() {
             data(ports[0])
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(cells_row(key, &[400], i as u64)),
                     durability: 0,
                 })
@@ -3254,6 +3277,7 @@ fn fan_out_model_within(seed: u64, inflight: usize, budgets: &[u64]) {
             data(entry)
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(w.clone()),
                     durability: 0,
                 })
@@ -3584,6 +3608,7 @@ fn a_partition_that_cant_be_reached_fails_a_fan_out_read_unless_it_may_be_skippe
             data(ports[0])
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(graph_row(r, [i as f32, 0.0, 0.0, 0.0], &out)),
                     durability: 0,
                 })
@@ -3797,6 +3822,7 @@ fn scans_whose_clients_stop_reading_dont_hold_up_another_scan_to_the_same_node()
         let mut c = data(ports[1]).await;
         for i in 0..192 {
             c.mutate(super::proto::MutateRequest {
+                replication: 0,
                 writes: Some(cells_row(format!("h{i:03}").as_bytes(), &[64 << 10], i)),
                 durability: 0,
             })
@@ -3960,6 +3986,7 @@ impl QualifierVectors {
                     data(ports[(i + j) % 3])
                         .await
                         .mutate(MutateRequest {
+                            replication: 0,
                             writes: Some(RowWrites {
                                 row: Some(RowKey {
                                     table: "users".into(),
@@ -4283,6 +4310,7 @@ fn nearest_traverse_model(seed: u64) {
             data(ports[rng.below(3) as usize])
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(graph_row(key, v, &edges)),
                     durability: 0,
                 })
@@ -4576,6 +4604,7 @@ fn split_nodes(
             .collect(),
         partitions: (0..n)
             .map(|i| Partition {
+                replica_acks: 0,
                 moves_history: Default::default(),
                 pinned: Default::default(),
                 history_epoch: 0,
@@ -4648,6 +4677,7 @@ fn a_nearest_search_over_many_partitions_merges_their_answers_as_they_arrive() {
             data(ports[i % ports.len()])
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(graph_row(key.as_bytes(), v, &[])),
                     durability: 0,
                 })
@@ -4864,6 +4894,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             data(port)
                 .await
                 .mutate(super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(w),
                     durability: 0,
                 })

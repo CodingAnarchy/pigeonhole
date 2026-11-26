@@ -1362,6 +1362,7 @@ pub(crate) async fn serve_home(
             let r = proto::TxnCommitRequest {
                 txn_id: r.txn_id,
                 rows: mine,
+                replication: r.replication,
             };
             Ok(ServiceReply::Commit(
                 home.commit_spanning(g, r, caller, budget, driver, forwarded)

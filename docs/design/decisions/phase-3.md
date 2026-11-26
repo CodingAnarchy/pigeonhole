@@ -5287,8 +5287,10 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **The bar** (Q4): in-region k = 1 p99 at most GroupSync's p99 + 1 ms, and throughput at 256 threads within 10% of GroupSync without the wait, on the AX102 (perf287).
 
 **PRs:**
-1. The ack stream: `FollowAcked`, positions, run cuts at group ends, the owner's table, `Status` and metrics. No wait yet.
-2. The wait: map fields, opt-down, timeout, lease loss, `REFUSE` and `ASYNC`.
+1. The ack stream: `FollowAcked`, positions, run cuts at group ends, the owner's table, `Status` and metrics. No wait yet. Done (#2236).
+2. The wait, in two (the coordinator, 2026-11-26):
+   - 2a: `Partition.replica_acks`, the wait, opt-down (`ReplicationMode` on the write requests and the `x-pigeonhole-replication` header, carried on a forward), the timeout, lease loss, and `REFUSE` (ICR 0146's PR 2a section). The ack count is reported on `CommitInfo.replica_acks`, one field for every write's response, not one per response. Until PR 4, a spanning transaction is answered uncovered.
+   - 2b: `ASYNC`, with the durable recorded fallback (§7), reviewed by simp724 on its own.
 3. Failover and promote: the candidate rule, two-step config changes, range moves.
 4. Spanning transactions.
 5. The guide and perf287's numbers.

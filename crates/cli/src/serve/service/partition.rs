@@ -132,6 +132,8 @@ impl Partition {
     /// then the vector indexes' rebalancers. One copy for a server's shutdown and a cluster
     /// partition's close.
     pub(crate) fn close_users(&self) {
+        // D335: writes waiting for replica acks answer `OutcomeUnknown` now.
+        self.acks.close();
         self.bulk.close();
         self.texts.close();
         self.indexes.close();

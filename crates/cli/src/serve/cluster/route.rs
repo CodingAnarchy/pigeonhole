@@ -402,6 +402,7 @@ mod tests {
     /// on b.
     fn map() -> ClusterMap {
         let part = |id: &str, node: &str, epoch| Partition {
+            replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
             history_epoch: 0,

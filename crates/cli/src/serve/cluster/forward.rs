@@ -358,6 +358,11 @@ pub(crate) fn forwarded_caller(caller: &Caller) -> Result<ForwardedCaller, ApiEr
         } else {
             prost::bytes::Bytes::copy_from_slice(caller.principal.digest())
         },
+        replication: if caller.replication_async {
+            crate::serve::proto::ReplicationMode::Async as i32
+        } else {
+            0
+        },
     })
 }
 
@@ -369,6 +374,7 @@ pub(crate) fn forwarded_caller(caller: &Caller) -> Result<ForwardedCaller, ApiEr
 /// tokens anywhere, the forward's scope and namespaces stand, and the caller is anyone.
 pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<Caller, ApiError> {
     let f = f.ok_or_else(|| ApiError::invalid("a forward names no caller"))?;
+    let replication_async = f.replication == crate::serve::proto::ReplicationMode::Async as i32;
     let scope = match f.scope.as_str() {
         "read" => Scope::Read,
         "write" => Scope::Write,
@@ -390,6 +396,7 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<C
             // The reply goes back to the forwarding node as protobuf; that node charges and
             // renders it for its own client (#1567).
             json: false,
+            replication_async,
         });
     }
     // Never the digest in the message (cli692's S1 on ticket 3).
@@ -410,6 +417,7 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<C
             ));
         }
     };
+    caller.replication_async = replication_async;
     Ok(caller)
 }
 
@@ -694,6 +702,7 @@ mod tests {
             } else {
                 digest.to_vec().into()
             },
+            replication: 0,
         })
     }
 

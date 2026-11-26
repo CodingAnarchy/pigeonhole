@@ -545,6 +545,11 @@ message Partition {
   bool pinned = 9;
   // D332: the balancer's last 8 actions on P (moves, splits, merges, its pins).
   repeated MoveHistory moves_history = 10;
+  // D335: how many of `replicas` must acknowledge a write before its owner answers it
+  // (semi-synchronous replication, ICR 0146). 0, the default, is asynchronous. At most
+  // `len(replicas)`; set only once every node keeps it (`map_features`: `replica_ack_wait`).
+  // With too few healthy replicas the owner refuses writes (`Unavailable`).
+  uint32 replica_acks = 12;
 }
 
 enum FailoverMode {
@@ -1117,6 +1122,10 @@ message ForwardedCaller {
   // The SHA-256 digest of the caller's token (D317 ticket 3), which its sessions are bound
   // to; empty on a cluster without tokens. The node it's sent to must list the same token.
   bytes token_digest = 4;
+  // D335: the caller asked not to wait for the partition's replica acks
+  // (`x-pigeonhole-replication: async`, on the node that took the call). An older forwarder
+  // leaves it DEFAULT, so such a write waits as the map says: the safe direction.
+  ReplicationMode replication = 5;
 }
 
 // A forwarded call's answer: the reply its op has on a single node. Errors travel as the

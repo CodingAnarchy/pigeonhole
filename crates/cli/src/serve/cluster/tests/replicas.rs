@@ -180,6 +180,7 @@ async fn put_after_move(port: u16, table: &str, row: &str) -> u64 {
         match data(port)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(w),
                 durability: 0,
             })
@@ -205,6 +206,7 @@ async fn put_in(port: u16, table: &str, row: &str) -> u64 {
     data(port)
         .await
         .mutate(crate::serve::proto::MutateRequest {
+            replication: 0,
             writes: Some(w),
             durability: 0,
         })
@@ -979,6 +981,7 @@ fn a_planned_promotion_from_a_fenced_owner_counts_the_loss_exactly() {
         data(ports[1])
             .await
             .mutate(MutateRequest {
+                replication: 0,
                 writes: Some(w),
                 durability: Durability::Buffered as i32,
             })
@@ -2085,4 +2088,273 @@ fn a_replica_copy_of_an_owner_without_acknowledgements_follows_as_before() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|d| *d != dirs[2]);
+}
+
+/// Sets `p`'s `replica_acks` to `k` through the writer at `a` (D335 PR 2), retried while a
+/// node that just started is still taking its peers' maps. `InvalidArgument` is the map's
+/// refusal, answered at once.
+async fn set_acks(a: u16, p: &str, k: u32) -> Result<(), tonic::Status> {
+    let mut last = None;
+    for _ in 0..100 {
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let expected = m.map_version;
+        m.map_version += 1;
+        for q in m.partitions.iter_mut().filter(|q| q.id == p) {
+            q.replica_acks = k;
+        }
+        match client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if e.code() == tonic::Code::InvalidArgument => return Err(e),
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(last.unwrap())
+}
+
+/// A write of row `row` in table `r` through node `port`, with the request's `replication`
+/// and `durability`, and `x-pigeonhole-replication` set to `header` if any: its commit.
+async fn write_acked(
+    port: u16,
+    row: &str,
+    replication: crate::serve::proto::ReplicationMode,
+    durability: crate::serve::proto::Durability,
+    header: Option<&str>,
+) -> Result<crate::serve::proto::CommitInfo, tonic::Status> {
+    let mut w = put_row(row, "v");
+    w.row.as_mut().unwrap().table = "r".into();
+    let mut req = tonic::Request::new(crate::serve::proto::MutateRequest {
+        writes: Some(w),
+        durability: durability as i32,
+        replication: replication as i32,
+    });
+    if let Some(h) = header {
+        req.metadata_mut()
+            .insert(crate::serve::acks::REPLICATION_HEADER, h.parse().unwrap());
+    }
+    data(port)
+        .await
+        .mutate(req)
+        .await
+        .map(|r| r.into_inner().commit.unwrap())
+}
+
+/// The API error code a status carries.
+fn code_of(s: &tonic::Status) -> String {
+    crate::serve::errors::ApiError::from_status(s).map_or_else(|| format!("{s:?}"), |e| e.code)
+}
+
+#[test]
+fn a_write_on_a_partition_with_replica_acks_answers_once_its_replica_acknowledged_it() {
+    use crate::serve::proto::{Durability, ReplicationMode};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        // More acknowledgements than p3 has replicas: the map is refused.
+        let e = set_acks(ports[0], "p3", 2).await.unwrap_err();
+        assert!(e.message().contains("replica count, 1"), "{e:?}");
+        set_acks(ports[0], "p3", 1).await.unwrap();
+        // Through b, which forwards it to c: answered once a acknowledged it, so c's
+        // frontier is already past it. `None` is raised to `GroupSync`.
+        let c = write_acked(
+            ports[1],
+            "k2",
+            ReplicationMode::Default,
+            Durability::None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.replica_acks, 1, "{c:?}");
+        assert_eq!(c.durability, Durability::GroupSync as i32, "{c:?}");
+        let owner = owned_row(ports[2], "p3").await.unwrap();
+        assert!(
+            owner.acked_position.unwrap().seqno >= c.seqno,
+            "{owner:?} {c:?}"
+        );
+        assert_eq!(owner.healthy_replicas, 1, "{owner:?}");
+        // Opted down, by the request's field or by the header through b's forward: answered
+        // without the wait, its durability as asked.
+        let c = write_acked(
+            ports[1],
+            "k3",
+            ReplicationMode::Async,
+            Durability::None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (c.replica_acks, c.durability),
+            (0, Durability::None as i32),
+            "{c:?}"
+        );
+        let c = write_acked(
+            ports[1],
+            "k4",
+            ReplicationMode::Default,
+            Durability::Unspecified,
+            Some("ASYNC"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.replica_acks, 0, "{c:?}");
+        let e = write_acked(
+            ports[1],
+            "k5",
+            ReplicationMode::Default,
+            Durability::Unspecified,
+            Some("sometimes"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        // A transaction's commit waits too, before its outcome is recorded; one that opted
+        // down doesn't.
+        for (row, replication, want) in [
+            ("t1", ReplicationMode::Default, 1),
+            ("t2", ReplicationMode::Async, 0),
+        ] {
+            let id = txns(ports[1])
+                .await
+                .begin(crate::serve::proto::BeginRequest {
+                    durability: 0,
+                    route: Some(crate::serve::proto::RoutingKey {
+                        key: Some(crate::serve::proto::routing_key::Key::Row(
+                            crate::serve::proto::RowKey {
+                                table: "r".into(),
+                                row: row.as_bytes().to_vec().into(),
+                            },
+                        )),
+                    }),
+                    spans_partitions: false,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .txn_id;
+            let mut w = put_row(row, "v");
+            w.row.as_mut().unwrap().table = "r".into();
+            let c = txns(ports[1])
+                .await
+                .commit(crate::serve::proto::TxnCommitRequest {
+                    txn_id: id,
+                    rows: vec![w],
+                    replication: replication as i32,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .commit
+                .unwrap();
+            assert_eq!(c.replica_acks, want, "{row}: {c:?}");
+        }
+        // A map install that doesn't touch p3's replicas leaves a's stream counted (A1):
+        // the next write is acknowledged without a's follow starting again.
+        set_acks(ports[0], "p3", 1).await.unwrap();
+        let c = write_acked(
+            ports[2],
+            "k6",
+            ReplicationMode::Default,
+            Durability::Unspecified,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.replica_acks, 1, "{c:?}");
+        let text = metrics_at(ports[2]).await;
+        for counter in [
+            "pigeonhole_cluster_replica_ack_timeouts_total{partition=\"p3\"} 0",
+            "pigeonhole_cluster_replica_ack_refused_total{partition=\"p3\"} 0",
+        ] {
+            assert!(text.contains(counter), "{counter}: {text}");
+        }
+    });
+}
+
+#[test]
+fn a_write_whose_replica_stops_acknowledging_answers_unknown_and_later_ones_are_refused() {
+    use crate::serve::proto::{Durability, ReplicationMode};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    let write = async |row: &str| {
+        write_acked(
+            ports[2],
+            row,
+            ReplicationMode::Default,
+            Durability::Unspecified,
+            None,
+        )
+        .await
+    };
+    let hold = |on: bool| {
+        let mut held = super::super::HOLD_ACKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|d| *d != dirs[2]);
+        if on {
+            held.push(dirs[2].clone());
+        }
+    };
+    rt.block_on(async {
+        set_acks(ports[0], "p3", 1).await.unwrap();
+        assert_eq!(write("k2").await.unwrap().replica_acks, 1);
+        // c stops counting a's acknowledgements: a write waits for the timeout, then
+        // answers `OutcomeUnknown` (it's committed on c).
+        hold(true);
+        let started = std::time::Instant::now();
+        let e = write("k3").await.unwrap_err();
+        assert_eq!(code_of(&e), "OutcomeUnknown", "{e:?}");
+        assert!(
+            started.elapsed() >= super::TEST_REPLICA_ACK_TIMEOUT,
+            "{e:?}"
+        );
+        // That write stays uncovered: once it has waited past the stall window with no
+        // acknowledgement, a is unhealthy and c refuses writes (REFUSE), retry-safe.
+        eventually_why(FOLLOW, "c to refuse writes on p3", async || {
+            match write("k4").await {
+                Err(e) if code_of(&e) == "Unavailable" => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+        let owner = owned_row(ports[2], "p3").await.unwrap();
+        assert_eq!(owner.healthy_replicas, 0, "{owner:?}");
+        let text = metrics_at(ports[2]).await;
+        assert!(
+            text.contains("pigeonhole_cluster_replica_ack_timeouts_total{partition=\"p3\"} "),
+            "{text}"
+        );
+        assert!(
+            !text.contains("pigeonhole_cluster_replica_ack_refused_total{partition=\"p3\"} 0"),
+            "{text}"
+        );
+        // a's acknowledgements count again: the held one covers the unknown write, a is
+        // healthy, and writes are acknowledged.
+        hold(false);
+        eventually_why(
+            FOLLOW,
+            "c to take writes on p3 again",
+            async || match write("k5").await {
+                Ok(c) if c.replica_acks == 1 => Ok(()),
+                other => Err(format!("{other:?}")),
+            },
+        )
+        .await;
+    });
+    hold(false);
 }

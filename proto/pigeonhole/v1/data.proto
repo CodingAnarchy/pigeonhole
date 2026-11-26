@@ -143,6 +143,8 @@ message ScanPage {
 message MutateRequest {
   RowWrites writes = 1;
   Durability durability = 2;
+  // D335: ASYNC answers without waiting for the partition's replica acks.
+  ReplicationMode replication = 3;
 }
 
 message MutateResponse {
@@ -153,6 +155,8 @@ message CheckAndMutateRequest {
   RowWrites writes = 1;
   Condition condition = 2;
   Durability durability = 3;
+  // D335: ASYNC answers without waiting for the partition's replica acks.
+  ReplicationMode replication = 4;
 }
 
 message CheckAndMutateResponse {
@@ -165,6 +169,8 @@ message CheckAndMutateResponse {
 message BatchRequest {
   repeated RowWrites rows = 1;
   Durability durability = 2;
+  // D335: ASYNC answers without waiting for the partition's replica acks.
+  ReplicationMode replication = 3;
 }
 
 message MutateReturningResponse {

@@ -42,10 +42,20 @@ struct Authed(auth::Caller);
 /// The caller of a gRPC request: the one [`prepay`] identified, taken from the request's
 /// extensions, or (a route not behind `prepay`) from its token now.
 fn caller_of<T>(shared: &Shared, req: &mut Request<T>) -> Result<auth::Caller, ApiError> {
-    match req.extensions_mut().remove::<Authed>() {
-        Some(Authed(caller)) => Ok(caller),
-        None => shared.caller(auth_header(req)),
+    let mut caller = match req.extensions_mut().remove::<Authed>() {
+        Some(Authed(caller)) => caller,
+        None => shared.caller(auth_header(req))?,
+    };
+    // D335: a write that asked not to wait for its partition's replica acks. Only a cluster
+    // node reads the header: a single node's calls keep their cost.
+    if shared.router.is_cluster() {
+        caller.replication_async = super::acks::replication_async(
+            req.metadata()
+                .get(super::acks::REPLICATION_HEADER)
+                .map(|v| v.as_bytes()),
+        )?;
     }
+    Ok(caller)
 }
 
 /// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
@@ -1032,6 +1042,9 @@ impl proto::replication_server::Replication for ReplicationGrpc {
             }
         };
         let attached = acks.attach(&start.node);
+        #[cfg(test)]
+        let reader = tokio::spawn(read_acks(inbound, attached, cluster.node.dir().to_owned()));
+        #[cfg(not(test))]
         let reader = tokio::spawn(read_acks(inbound, attached));
         Ok(Response::new(Box::pin(Acked {
             batches: GrpcStream(batches),
@@ -1045,12 +1058,49 @@ impl proto::replication_server::Replication for ReplicationGrpc {
 async fn read_acks(
     mut inbound: tonic::Streaming<proto::FollowMessage>,
     attached: super::acks::Attached,
+    #[cfg(test)] dir: std::path::PathBuf,
 ) {
     use proto::follow_message::Kind;
-    while let Ok(Some(m)) = inbound.message().await {
+    // The test's hold: the latest acknowledgement held back while the owner is listed.
+    #[cfg(test)]
+    let mut held: Option<super::acks::Pos> = None;
+    #[cfg(test)]
+    let holding = || {
+        super::cluster::HOLD_ACKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|d| dir.starts_with(d))
+    };
+    loop {
+        #[cfg(test)]
+        if let Some(p) = held
+            && !holding()
+        {
+            attached.ack(p);
+            held = None;
+        }
+        #[cfg(test)]
+        let m = tokio::select! {
+            m = inbound.message() => m,
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)), if held.is_some() => {
+                continue;
+            }
+        };
+        #[cfg(not(test))]
+        let m = inbound.message().await;
+        let Ok(Some(m)) = m else {
+            return;
+        };
         match m.kind {
             Some(Kind::Ack(proto::Ack { position: Some(p) })) => {
-                attached.ack(super::acks::Pos::from(&p))
+                let p = super::acks::Pos::from(&p);
+                #[cfg(test)]
+                if holding() {
+                    held = held.max(Some(p));
+                    continue;
+                }
+                attached.ack(p)
             }
             _ => return,
         }

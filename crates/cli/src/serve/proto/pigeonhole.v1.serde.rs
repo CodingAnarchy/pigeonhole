@@ -2242,6 +2242,9 @@ impl serde::Serialize for BatchRequest {
         if self.durability != 0 {
             len += 1;
         }
+        if self.replication != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.BatchRequest", len)?;
         if !self.rows.is_empty() {
             struct_ser.serialize_field("rows", &self.rows)?;
@@ -2250,6 +2253,11 @@ impl serde::Serialize for BatchRequest {
             let v = Durability::try_from(self.durability)
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.durability)))?;
             struct_ser.serialize_field("durability", &v)?;
+        }
+        if self.replication != 0 {
+            let v = ReplicationMode::try_from(self.replication)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replication)))?;
+            struct_ser.serialize_field("replication", &v)?;
         }
         struct_ser.end()
     }
@@ -2263,12 +2271,14 @@ impl<'de> serde::Deserialize<'de> for BatchRequest {
         const FIELDS: &[&str] = &[
             "rows",
             "durability",
+            "replication",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Rows,
             Durability,
+            Replication,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -2292,6 +2302,7 @@ impl<'de> serde::Deserialize<'de> for BatchRequest {
                         match value {
                             "rows" => Ok(GeneratedField::Rows),
                             "durability" => Ok(GeneratedField::Durability),
+                            "replication" => Ok(GeneratedField::Replication),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -2313,6 +2324,7 @@ impl<'de> serde::Deserialize<'de> for BatchRequest {
             {
                 let mut rows__ = None;
                 let mut durability__ = None;
+                let mut replication__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Rows => {
@@ -2327,11 +2339,18 @@ impl<'de> serde::Deserialize<'de> for BatchRequest {
                             }
                             durability__ = Some(map_.next_value::<Durability>()? as i32);
                         }
+                        GeneratedField::Replication => {
+                            if replication__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replication"));
+                            }
+                            replication__ = Some(map_.next_value::<ReplicationMode>()? as i32);
+                        }
                     }
                 }
                 Ok(BatchRequest {
                     rows: rows__.unwrap_or_default(),
                     durability: durability__.unwrap_or_default(),
+                    replication: replication__.unwrap_or_default(),
                 })
             }
         }
@@ -3965,6 +3984,9 @@ impl serde::Serialize for CheckAndMutateRequest {
         if self.durability != 0 {
             len += 1;
         }
+        if self.replication != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.CheckAndMutateRequest", len)?;
         if let Some(v) = self.writes.as_ref() {
             struct_ser.serialize_field("writes", v)?;
@@ -3976,6 +3998,11 @@ impl serde::Serialize for CheckAndMutateRequest {
             let v = Durability::try_from(self.durability)
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.durability)))?;
             struct_ser.serialize_field("durability", &v)?;
+        }
+        if self.replication != 0 {
+            let v = ReplicationMode::try_from(self.replication)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replication)))?;
+            struct_ser.serialize_field("replication", &v)?;
         }
         struct_ser.end()
     }
@@ -3990,6 +4017,7 @@ impl<'de> serde::Deserialize<'de> for CheckAndMutateRequest {
             "writes",
             "condition",
             "durability",
+            "replication",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -3997,6 +4025,7 @@ impl<'de> serde::Deserialize<'de> for CheckAndMutateRequest {
             Writes,
             Condition,
             Durability,
+            Replication,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -4021,6 +4050,7 @@ impl<'de> serde::Deserialize<'de> for CheckAndMutateRequest {
                             "writes" => Ok(GeneratedField::Writes),
                             "condition" => Ok(GeneratedField::Condition),
                             "durability" => Ok(GeneratedField::Durability),
+                            "replication" => Ok(GeneratedField::Replication),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -4043,6 +4073,7 @@ impl<'de> serde::Deserialize<'de> for CheckAndMutateRequest {
                 let mut writes__ = None;
                 let mut condition__ = None;
                 let mut durability__ = None;
+                let mut replication__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Writes => {
@@ -4063,12 +4094,19 @@ impl<'de> serde::Deserialize<'de> for CheckAndMutateRequest {
                             }
                             durability__ = Some(map_.next_value::<Durability>()? as i32);
                         }
+                        GeneratedField::Replication => {
+                            if replication__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replication"));
+                            }
+                            replication__ = Some(map_.next_value::<ReplicationMode>()? as i32);
+                        }
                     }
                 }
                 Ok(CheckAndMutateRequest {
                     writes: writes__,
                     condition: condition__,
                     durability: durability__.unwrap_or_default(),
+                    replication: replication__.unwrap_or_default(),
                 })
             }
         }
@@ -4688,6 +4726,9 @@ impl serde::Serialize for CommitInfo {
         if self.durability != 0 {
             len += 1;
         }
+        if self.replica_acks != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.CommitInfo", len)?;
         if self.seqno != 0 {
             #[allow(clippy::needless_borrow)]
@@ -4698,6 +4739,9 @@ impl serde::Serialize for CommitInfo {
             let v = Durability::try_from(self.durability)
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.durability)))?;
             struct_ser.serialize_field("durability", &v)?;
+        }
+        if self.replica_acks != 0 {
+            struct_ser.serialize_field("replica_acks", &self.replica_acks)?;
         }
         struct_ser.end()
     }
@@ -4711,12 +4755,15 @@ impl<'de> serde::Deserialize<'de> for CommitInfo {
         const FIELDS: &[&str] = &[
             "seqno",
             "durability",
+            "replica_acks",
+            "replicaAcks",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Seqno,
             Durability,
+            ReplicaAcks,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -4740,6 +4787,7 @@ impl<'de> serde::Deserialize<'de> for CommitInfo {
                         match value {
                             "seqno" => Ok(GeneratedField::Seqno),
                             "durability" => Ok(GeneratedField::Durability),
+                            "replicaAcks" | "replica_acks" => Ok(GeneratedField::ReplicaAcks),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -4761,6 +4809,7 @@ impl<'de> serde::Deserialize<'de> for CommitInfo {
             {
                 let mut seqno__ = None;
                 let mut durability__ = None;
+                let mut replica_acks__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Seqno => {
@@ -4777,11 +4826,20 @@ impl<'de> serde::Deserialize<'de> for CommitInfo {
                             }
                             durability__ = Some(map_.next_value::<Durability>()? as i32);
                         }
+                        GeneratedField::ReplicaAcks => {
+                            if replica_acks__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaAcks"));
+                            }
+                            replica_acks__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(CommitInfo {
                     seqno: seqno__.unwrap_or_default(),
                     durability: durability__.unwrap_or_default(),
+                    replica_acks: replica_acks__.unwrap_or_default(),
                 })
             }
         }
@@ -10923,6 +10981,9 @@ impl serde::Serialize for ForwardedCaller {
         if !self.token_digest.is_empty() {
             len += 1;
         }
+        if self.replication != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForwardedCaller", len)?;
         if !self.scope.is_empty() {
             struct_ser.serialize_field("scope", &self.scope)?;
@@ -10937,6 +10998,11 @@ impl serde::Serialize for ForwardedCaller {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("token_digest", pbjson::private::base64::encode(&self.token_digest).as_str())?;
+        }
+        if self.replication != 0 {
+            let v = ReplicationMode::try_from(self.replication)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replication)))?;
+            struct_ser.serialize_field("replication", &v)?;
         }
         struct_ser.end()
     }
@@ -10954,6 +11020,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
             "allNamespaces",
             "token_digest",
             "tokenDigest",
+            "replication",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -10962,6 +11029,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
             Namespaces,
             AllNamespaces,
             TokenDigest,
+            Replication,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10987,6 +11055,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                             "namespaces" => Ok(GeneratedField::Namespaces),
                             "allNamespaces" | "all_namespaces" => Ok(GeneratedField::AllNamespaces),
                             "tokenDigest" | "token_digest" => Ok(GeneratedField::TokenDigest),
+                            "replication" => Ok(GeneratedField::Replication),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -11010,6 +11079,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                 let mut namespaces__ = None;
                 let mut all_namespaces__ = None;
                 let mut token_digest__ = None;
+                let mut replication__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Scope => {
@@ -11038,6 +11108,12 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Replication => {
+                            if replication__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replication"));
+                            }
+                            replication__ = Some(map_.next_value::<ReplicationMode>()? as i32);
+                        }
                     }
                 }
                 Ok(ForwardedCaller {
@@ -11045,6 +11121,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                     namespaces: namespaces__.unwrap_or_default(),
                     all_namespaces: all_namespaces__.unwrap_or_default(),
                     token_digest: token_digest__.unwrap_or_default(),
+                    replication: replication__.unwrap_or_default(),
                 })
             }
         }
@@ -17643,6 +17720,9 @@ impl serde::Serialize for MutateRequest {
         if self.durability != 0 {
             len += 1;
         }
+        if self.replication != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MutateRequest", len)?;
         if let Some(v) = self.writes.as_ref() {
             struct_ser.serialize_field("writes", v)?;
@@ -17651,6 +17731,11 @@ impl serde::Serialize for MutateRequest {
             let v = Durability::try_from(self.durability)
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.durability)))?;
             struct_ser.serialize_field("durability", &v)?;
+        }
+        if self.replication != 0 {
+            let v = ReplicationMode::try_from(self.replication)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replication)))?;
+            struct_ser.serialize_field("replication", &v)?;
         }
         struct_ser.end()
     }
@@ -17664,12 +17749,14 @@ impl<'de> serde::Deserialize<'de> for MutateRequest {
         const FIELDS: &[&str] = &[
             "writes",
             "durability",
+            "replication",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Writes,
             Durability,
+            Replication,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17693,6 +17780,7 @@ impl<'de> serde::Deserialize<'de> for MutateRequest {
                         match value {
                             "writes" => Ok(GeneratedField::Writes),
                             "durability" => Ok(GeneratedField::Durability),
+                            "replication" => Ok(GeneratedField::Replication),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17714,6 +17802,7 @@ impl<'de> serde::Deserialize<'de> for MutateRequest {
             {
                 let mut writes__ = None;
                 let mut durability__ = None;
+                let mut replication__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Writes => {
@@ -17728,11 +17817,18 @@ impl<'de> serde::Deserialize<'de> for MutateRequest {
                             }
                             durability__ = Some(map_.next_value::<Durability>()? as i32);
                         }
+                        GeneratedField::Replication => {
+                            if replication__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replication"));
+                            }
+                            replication__ = Some(map_.next_value::<ReplicationMode>()? as i32);
+                        }
                     }
                 }
                 Ok(MutateRequest {
                     writes: writes__,
                     durability: durability__.unwrap_or_default(),
+                    replication: replication__.unwrap_or_default(),
                 })
             }
         }
@@ -19760,6 +19856,9 @@ impl serde::Serialize for Partition {
         if !self.moves_history.is_empty() {
             len += 1;
         }
+        if self.replica_acks != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.Partition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -19801,6 +19900,9 @@ impl serde::Serialize for Partition {
         if !self.moves_history.is_empty() {
             struct_ser.serialize_field("moves_history", &self.moves_history)?;
         }
+        if self.replica_acks != 0 {
+            struct_ser.serialize_field("replica_acks", &self.replica_acks)?;
+        }
         struct_ser.end()
     }
 }
@@ -19825,6 +19927,8 @@ impl<'de> serde::Deserialize<'de> for Partition {
             "pinned",
             "moves_history",
             "movesHistory",
+            "replica_acks",
+            "replicaAcks",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -19839,6 +19943,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
             FailoverCount,
             Pinned,
             MovesHistory,
+            ReplicaAcks,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -19870,6 +19975,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                             "failoverCount" | "failover_count" => Ok(GeneratedField::FailoverCount),
                             "pinned" => Ok(GeneratedField::Pinned),
                             "movesHistory" | "moves_history" => Ok(GeneratedField::MovesHistory),
+                            "replicaAcks" | "replica_acks" => Ok(GeneratedField::ReplicaAcks),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -19899,6 +20005,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                 let mut failover_count__ = None;
                 let mut pinned__ = None;
                 let mut moves_history__ = None;
+                let mut replica_acks__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -19969,6 +20076,14 @@ impl<'de> serde::Deserialize<'de> for Partition {
                             }
                             moves_history__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ReplicaAcks => {
+                            if replica_acks__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaAcks"));
+                            }
+                            replica_acks__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(Partition {
@@ -19982,6 +20097,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                     failover_count: failover_count__.unwrap_or_default(),
                     pinned: pinned__.unwrap_or_default(),
                     moves_history: moves_history__.unwrap_or_default(),
+                    replica_acks: replica_acks__.unwrap_or_default(),
                 })
             }
         }
@@ -26273,6 +26389,77 @@ impl<'de> serde::Deserialize<'de> for ReplicationBatch {
         deserializer.deserialize_struct("pigeonhole.v1.ReplicationBatch", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for ReplicationMode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Default => "REPLICATION_MODE_DEFAULT",
+            Self::Async => "REPLICATION_MODE_ASYNC",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for ReplicationMode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "REPLICATION_MODE_DEFAULT",
+            "REPLICATION_MODE_ASYNC",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = ReplicationMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "REPLICATION_MODE_DEFAULT" => Ok(ReplicationMode::Default),
+                    "REPLICATION_MODE_ASYNC" => Ok(ReplicationMode::Async),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
+    }
+}
 impl serde::Serialize for ResolveTxn {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -32526,12 +32713,20 @@ impl serde::Serialize for TxnCommitRequest {
         if !self.rows.is_empty() {
             len += 1;
         }
+        if self.replication != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TxnCommitRequest", len)?;
         if !self.txn_id.is_empty() {
             struct_ser.serialize_field("txn_id", &self.txn_id)?;
         }
         if !self.rows.is_empty() {
             struct_ser.serialize_field("rows", &self.rows)?;
+        }
+        if self.replication != 0 {
+            let v = ReplicationMode::try_from(self.replication)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replication)))?;
+            struct_ser.serialize_field("replication", &v)?;
         }
         struct_ser.end()
     }
@@ -32546,12 +32741,14 @@ impl<'de> serde::Deserialize<'de> for TxnCommitRequest {
             "txn_id",
             "txnId",
             "rows",
+            "replication",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             TxnId,
             Rows,
+            Replication,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -32575,6 +32772,7 @@ impl<'de> serde::Deserialize<'de> for TxnCommitRequest {
                         match value {
                             "txnId" | "txn_id" => Ok(GeneratedField::TxnId),
                             "rows" => Ok(GeneratedField::Rows),
+                            "replication" => Ok(GeneratedField::Replication),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -32596,6 +32794,7 @@ impl<'de> serde::Deserialize<'de> for TxnCommitRequest {
             {
                 let mut txn_id__ = None;
                 let mut rows__ = None;
+                let mut replication__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::TxnId => {
@@ -32610,11 +32809,18 @@ impl<'de> serde::Deserialize<'de> for TxnCommitRequest {
                             }
                             rows__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Replication => {
+                            if replication__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replication"));
+                            }
+                            replication__ = Some(map_.next_value::<ReplicationMode>()? as i32);
+                        }
                     }
                 }
                 Ok(TxnCommitRequest {
                     txn_id: txn_id__.unwrap_or_default(),
                     rows: rows__.unwrap_or_default(),
+                    replication: replication__.unwrap_or_default(),
                 })
             }
         }

@@ -500,6 +500,7 @@ mod tests {
             }],
             partitions: vec![
                 Partition {
+                    replica_acks: 0,
                     moves_history: Default::default(),
                     pinned: Default::default(),
                     history_epoch: 0,
@@ -512,6 +513,7 @@ mod tests {
                     failover_count: 0,
                 },
                 Partition {
+                    replica_acks: 0,
                     moves_history: Default::default(),
                     pinned: Default::default(),
                     history_epoch: 0,
@@ -565,6 +567,7 @@ mod tests {
         assert!(moved(&a, &map(9, 2, &["m"])).is_some_and(|w| w.contains("epoch")));
         let mut added = map(9, 1, &["m"]);
         added.partitions.push(Partition {
+            replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
             history_epoch: 0,

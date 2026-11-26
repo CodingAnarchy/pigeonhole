@@ -28,6 +28,24 @@ impl Service {
             }
             _ => (None, None),
         };
+        // D335: a write on a partition whose map sets `replica_acks` waits for that many
+        // replicas, unless it opted down (the request's `replication`, or the header). It's
+        // refused at admission while too few are healthy (REFUSE), and its durability is
+        // raised to `GroupSync` (the feed ships only what's durable on the owner). The
+        // map's k decides, never whether a stream is attached now (simp724 on #2236). A
+        // transaction's `Commit` waits where it's answered (`commit`), before its outcome
+        // is recorded.
+        let mut op = op;
+        let waits = match (&held, &self.gate, &self.part) {
+            (Some(_), Some(gate), Some(part))
+                if part.acks.k() > 0 && !caller.replication_async && !op.replication_async() =>
+            {
+                part.acks.admit(gate.partition())?;
+                op.raise_durability();
+                true
+            }
+            _ => false,
+        };
         // D331: a range a move fences, moved away or doesn't serve here yet. One load while
         // no move names the partition. A transaction's `Commit` is checked where it's
         // answered, its rows as writes, with its snapshot (`commit`).
@@ -85,16 +103,45 @@ impl Service {
             }
             _ => self.answer(op, caller, budget).await,
         };
+        // D335: the wait, after the commit and before D326's check: until k replicas
+        // acknowledged the commit's own position, the timeout, or the lease's end.
+        if waits && let (Some(gate), Some(part)) = (&self.gate, &self.part) {
+            let seqno = match reply.as_ref().map(committed_seqno) {
+                Ok(Committed::At(s)) => Some(s),
+                // A write whose reply names no seqno (a text, vector or memory write, a
+                // schema change): the node's visible seqno after it returned, at or past
+                // its own, so it may wait longer, never less.
+                Ok(Committed::Unknown) => Some(part.db.visible_seqno()),
+                Ok(Committed::Nothing) | Err(_) => None,
+            };
+            if let Some(seqno) = seqno {
+                match part
+                    .acks
+                    .wait(crate::serve::acks::Pos::commit(seqno), gate)
+                    .await
+                {
+                    Ok(n) => {
+                        if let Ok(r) = &mut reply {
+                            set_replica_acks(r, n);
+                        }
+                    }
+                    Err(e) => reply = Err(e),
+                }
+            }
+        }
         if reply.is_ok() {
             if let Some(h) = &held
                 && let Err(e) = h.committed()
             {
                 reply = Err(e);
             } else if held.is_some()
-                && let Some(part) = &self.part
+                && let (Some(part), Ok(r)) = (&self.part, &reply)
             {
-                // D335: timed until a replica acknowledges it (one load with no stream).
-                part.acks.committed(|| part.db.visible_seqno());
+                // D335: timed until the frontier covers it (one load with no stream).
+                part.acks.committed(|| match committed_seqno(r) {
+                    Committed::At(s) => s,
+                    _ => part.db.visible_seqno(),
+                });
             } else if let Some(gate) = read
                 && let Err(e) = gate.serving()
             {
@@ -641,5 +688,37 @@ impl Service {
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }
         }
+    }
+}
+
+/// What a write's reply says it committed (D335): the seqno its `CommitInfo` names, none
+/// to name (a conditional write that didn't apply), or a write whose reply carries none.
+enum Committed {
+    At(u64),
+    Nothing,
+    Unknown,
+}
+
+fn committed_seqno(reply: &ServiceReply) -> Committed {
+    let commit = match reply {
+        ServiceReply::Mutate(r) => r.commit.as_ref(),
+        ServiceReply::MutateReturning(r) => r.commit.as_ref(),
+        ServiceReply::CheckAndMutate(r) if !r.applied => return Committed::Nothing,
+        ServiceReply::CheckAndMutate(r) => r.commit.as_ref(),
+        _ => return Committed::Unknown,
+    };
+    commit.map_or(Committed::Unknown, |c| Committed::At(c.seqno))
+}
+
+/// Sets the reply's `CommitInfo.replica_acks` to `n`, the replicas that acknowledged it.
+fn set_replica_acks(reply: &mut ServiceReply, n: u32) {
+    let commit = match reply {
+        ServiceReply::Mutate(r) => r.commit.as_mut(),
+        ServiceReply::MutateReturning(r) => r.commit.as_mut(),
+        ServiceReply::CheckAndMutate(r) => r.commit.as_mut(),
+        _ => None,
+    };
+    if let Some(c) = commit {
+        c.replica_acks = n;
     }
 }

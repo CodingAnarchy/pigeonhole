@@ -19,6 +19,7 @@ pub(super) async fn commit_parts(
     rows: Vec<super::super::proto::RowWrites>,
 ) -> Result<super::super::proto::TxnCommitResponse, tonic::Status> {
     let r = super::super::proto::TxnCommitRequest {
+        replication: 0,
         txn_id: id.into(),
         rows,
     };
@@ -354,6 +355,7 @@ fn a_spanning_transaction_is_its_tokens_and_a_client_cant_call_the_branch_arms()
             assert_eq!(code(&e), "PermissionDenied", "{e}");
         }
         let r = super::super::proto::TxnCommitRequest {
+            replication: 0,
             txn_id: id.clone(),
             rows: Vec::new(),
         };
@@ -771,6 +773,7 @@ fn a_spanning_transactions_outcome_is_its_tokens_alone_while_its_session_lasts()
         assert_eq!(o.state(), St::InProgress, "{o:?}");
         // The other token's asks changed nothing: the owner commits both partitions.
         let r = super::super::proto::TxnCommitRequest {
+            replication: 0,
             txn_id: id.clone(),
             rows: Vec::new(),
         };
@@ -1115,6 +1118,7 @@ fn a_token_cluster_settles_a_share_across_nodes(lose: bool) {
                     .await
                     .commit(with(
                         TxnCommitRequest {
+                            replication: 0,
                             txn_id: id,
                             rows: Vec::new(),
                         },

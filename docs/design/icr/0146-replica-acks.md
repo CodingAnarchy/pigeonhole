@@ -1,6 +1,6 @@
 # 0146: replica acknowledgements (D335)
 
-**Status:** Approved (coordinator, 2026-11-26; D335, #2149; numbers in `.coord/numbers.md`). PR 1's part is below; D335's later PRs amend this request with theirs.
+**Status:** Approved (coordinator, 2026-11-26; D335, #2149; numbers in `.coord/numbers.md`). PR 1's part is below, then [PR 2a's](#pr-2a-the-wait); D335's later PRs amend this request with theirs.
 
 ## Change
 
@@ -16,7 +16,7 @@ The network API (`pigeonhole.v1`), additive:
   - `reserved 35` (#2150's unused `allocated_bytes`);
   - `Position acked_position = 36`, `uint32 healthy_replicas = 37` (on an owner);
   - `Position replica_applied_position = 38` (on a replica copy).
-- **The map feature string `replica_acks`** in `NodeStatus.map_features`: the node serves `FollowAcked`. D335's map fields (PR 2) come under the same string.
+- **The map feature string `replica_acks`** in `NodeStatus.map_features`: the node serves `FollowAcked`. PR 2a's map field has its own string, `replica_ack_wait`.
 - **`/metrics`, per partition on its owner:**
   - `pigeonhole_cluster_replica_ack_wait_seconds{partition}`, a histogram from a write's commit to its acknowledgement. In PR 1 it's measured to the first replica's; from PR 2, to the `k`-th.
   - `pigeonhole_cluster_replica_acked_seqno{partition,replica}`, a gauge: each counted replica's last acknowledgement.
@@ -39,7 +39,7 @@ The network API (`pigeonhole.v1`), additive:
   - A cluster replica copy opens `FollowAcked` on every follow, and `Follow` when its owner answers `Unimplemented` (an older build). Nothing is remembered, so an owner upgraded at the same address takes acknowledgements from its next follow on.
   - With acknowledgements, it also cuts a run where the owner's sync group ends (a batch whose last event reaches the batch's `primary_seqno`), so each group is applied and acknowledged on its own.
   - A single node's `--replica-of` replica keeps `Follow`.
-- **No write waits yet:** D335 PR 2 adds the map's `replica_acks` and the wait.
+- **No write waits in PR 1.** [PR 2a](#pr-2a-the-wait) adds the map's `replica_acks` and the wait.
 
 ## Callers
 
@@ -51,4 +51,80 @@ The network API (`pigeonhole.v1`), additive:
   - `status.rs`;
   - `features.rs`'s `REPLICA_ACKS_FEATURE`;
   - the `/metrics` render.
+- No crate outside `pigeonhole-cli` changes.
+
+## PR 2a: the wait
+
+### Change
+
+The network API (`pigeonhole.v1`), additive:
+
+- **`cluster.proto`:**
+  - `Partition.replica_acks = 12` (`uint32`): k, how many of the partition's replicas acknowledge a write before its owner answers it. 0, the default, is asynchronous.
+  - `ForwardedCaller.replication = 5` (`ReplicationMode`): the caller's header, carried to the owner by a node that forwards the call.
+- **`common.proto`:**
+  - `enum ReplicationMode { REPLICATION_MODE_DEFAULT = 0; REPLICATION_MODE_ASYNC = 1; }`.
+  - `CommitInfo.replica_acks = 3` (`uint32`): how many replicas acknowledged the commit before it was answered. It's at least k for a covered commit, and 0 for an asynchronous one.
+- **`data.proto` and `transactions.proto`:** `ReplicationMode replication` on `MutateRequest` (3, so `Mutate` and `MutateReturning`), `BatchRequest` (3), `TxnCommitRequest` (3) and `CheckAndMutateRequest` (4).
+- **The header `x-pigeonhole-replication`:** `async` or `default`, in any case. It's read on HTTP and as gRPC metadata, on a cluster node only. Another value is `InvalidArgument`.
+- **The flag `phdb serve --cluster-replica-ack-timeout-ms`:** default 5000, at least 1.
+- **The map feature string `replica_ack_wait`** in `NodeStatus.map_features`: the node keeps `Partition.replica_acks`.
+- **`/metrics`, per partition on its owner, each `{partition}`.** These are shown for a partition at k ≥ 1, or one that has counted something:
+  - `pigeonhole_cluster_replica_ack_timeouts_total` (counter);
+  - `pigeonhole_cluster_replica_ack_lease_lost_total` (counter);
+  - `pigeonhole_cluster_replica_ack_short_seconds_total` (counter);
+  - `pigeonhole_cluster_replica_ack_refused_total` (counter).
+  
+  `pigeonhole_cluster_replica_ack_wait_seconds` now runs to the k-th acknowledgement (the first at k = 0).
+- **`Status`:**
+  - `LocalPartition.acked_position` is the k-th highest acknowledgement of the map's replicas (the highest at k = 0).
+  - `healthy_replicas` follows §7 (below).
+
+### Semantics
+
+- **The map:**
+  - k is at most `len(replicas)`, or the map is refused (`InvalidArgument`).
+  - A map sets k > 0 only once every node reports `replica_ack_wait`, the first such map, a first map included (`FailedPrecondition` naming the nodes).
+  - The owner takes k and the replicas at each partition's open and at every map install, both under the node's install lock.
+- **Who waits:**
+  - The map's k decides, never whether a replica stream is attached at that instant.
+  - A write waits unless it opted down, by the request's `replication: REPLICATION_MODE_ASYNC` or the header.
+  - An older forwarder leaves `ForwardedCaller.replication` at `DEFAULT`, so a header it took is dropped and the write waits as the map says: the safe direction.
+  - A write that waits has `DURABILITY_NONE` or `DURABILITY_BUFFERED` raised to `GROUP_SYNC` on `Mutate`, `MutateReturning`, `CheckAndMutate`, `Batch`, and a transaction begun with them. The server's default is left alone. `CommitInfo.durability` reports what was applied.
+- **The wait:**
+  - It comes after the engine's commit and before D326's after-commit lease check.
+  - It lasts until k of the map's replicas acknowledged the commit's own position (`(seqno, 0)`, the seqno its `CommitInfo` names). A reply that names no seqno waits for the node's visible seqno read after the commit. That's at or past its own, so it may wait longer, never less.
+  - **At the timeout,** `OutcomeUnknown` ("not acknowledged within"). The write is committed on the owner and may be covered later.
+  - **When the partition's lease ends first,** `OutcomeUnknown` at once: a lapse wakes it, and a lease that runs out wakes it at its end.
+  - **When the partition closes here,** `OutcomeUnknown`.
+- **Too few healthy replicas (REFUSE):**
+  - A write that would wait is refused at admission with `Unavailable` while fewer than k of the map's replicas are healthy. It's retry-safe: nothing was written.
+  - **Healthy:** a counted replica, unless the oldest uncovered write began waiting at least 2 s ago (twice the follow's heartbeat) for a position past the replica's last acknowledgement, and the replica acknowledged nothing new in that time.
+  - A write that timed out stays uncovered until the frontier passes it, so a replica that stopped acknowledging reads unhealthy though no write waits any more.
+  - An idle partition's replicas stay healthy on their stream alone.
+  - `ASYNC` (acknowledging uncovered while short) is D335 PR 2b.
+- **Who counts:**
+  - Only the map's replicas of the partition.
+  - An install that drops a node from `replicas` uncounts its stream (feed1248's A1). Its later acknowledgements are ignored until it follows again.
+  - An install that changes the partition's `history_epoch` uncounts every stream.
+  - Any other install leaves the counted streams and the waiting writes alone.
+  - A stream that attaches while its node isn't listed yet is kept, and counts once the map lists it.
+- **The write paths that wait:**
+  - every call `Service::call` admits as a write on a cluster partition: `Data`'s `Mutate`, `MutateReturning`, `CheckAndMutate` (when it applied) and `Batch`; `Text.Put` and `Text.Delete`; `Vectors.Insert`, `Vectors.Delete` and `Vectors.BulkLoad` (once, after its last chunk); and a `Memory` write where it reaches its partition through `Service::call`;
+  - a single-partition transaction's `Commit`, before its outcome is recorded, so a repeated `Commit` or `Transactions.Outcome` never reads it as answered sooner.
+- **The write paths that don't wait:**
+  - A spanning transaction (D329), until D335 PR 4: the home's commit, `BranchDecide`'s shares and the resolver's decisions are answered uncovered (`replica_acks` 0). Coverage needs PR 4's replicated prepares, and no ack wait goes on a decide (simp724's S4).
+  - Work no client waits on: range-move copies, catch-ups, drops and prunes (feed-silent), text index rebuilds and packs, vector rebalances, and a memory store's background loops.
+
+### Callers
+
+- `pigeonhole-cli` (`serve`):
+  - `acks.rs`, the wait, the admission check and the counters;
+  - `service/dispatch.rs`, `service/txn.rs` and `service/ops.rs`, the write paths;
+  - `gate.rs`'s lease-ended `Notify`;
+  - `grpc.rs` and `http.rs`, the header;
+  - `cluster/forward.rs`, `ForwardedCaller`;
+  - `cluster/install.rs`, `open.rs` and `start.rs`, the configuration at install and open;
+  - `cluster/map.rs`'s validation and `features.rs`'s `REPLICA_ACK_WAIT_FEATURE`;
+  - `config.rs`'s flag.
 - No crate outside `pigeonhole-cli` changes.
