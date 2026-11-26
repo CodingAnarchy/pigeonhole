@@ -260,11 +260,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      # Line tables only on Windows (#1961): backtraces keep file and line, and the
-      # linker writes much smaller PDBs for the test binaries. Set before rust-cache,
-      # whose key covers CARGO_* variables.
-      - name: line-tables-only debug info (Windows)
-        if: runner.os == 'Windows'
+      # Line tables only (#1961): backtraces keep file and line, and the linker writes much
+      # smaller debug info for the test binaries (PDBs on Windows). macOS too since its
+      # build took 31.5 of main's 48 min and a slow runner's 48.6 got #2209 cancelled at 60
+      # (2026-11-26). Set before rust-cache, whose key covers CARGO_* variables.
+      - name: line-tables-only debug info (Windows, macOS)
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         shell: bash
         run: |
           echo CARGO_PROFILE_DEV_DEBUG=line-tables-only >> "$GITHUB_ENV"
