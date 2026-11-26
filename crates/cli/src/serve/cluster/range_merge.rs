@@ -212,8 +212,10 @@ async fn plan(
 }
 
 /// D336: no move into a partition with an old owner's tail pending (the map would refuse the
-/// merge's first move; ai1249 on #2239): `Busy`, as the plan's own, so the balancer sets the
-/// merge aside rather than retry it at every pass.
+/// merge's first move; ai1249 on #2239): `Busy`, as the plan's own, before anything moves.
+/// The balancer never picks such a merge: `balance::decide` takes a partition with a pending
+/// tail for no split, move or merge, and names it in its reason, so this is
+/// `phdb cluster merge`'s answer.
 fn into_takes_moves(m: &ClusterMap, into: &str) -> Result<(), Failure> {
     match super::map::pending_tail(m, into) {
         None => Ok(()),
