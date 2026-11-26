@@ -523,7 +523,7 @@ impl State {
 type Cell<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], u64);
 
 /// The engine kind of a change.
-fn logged_kind(kind: ChangeKind) -> Kind {
+pub(crate) fn logged_kind(kind: ChangeKind) -> Kind {
     match kind {
         ChangeKind::Put => Kind::Put,
         ChangeKind::Merge => Kind::Merge,
@@ -884,6 +884,7 @@ impl Pigeonhole {
             db: self,
             batch: WriteBatch::new(),
             error: None,
+            xid: None,
         }
     }
 
@@ -1115,6 +1116,8 @@ pub struct LoggedBatch<'a> {
     db: &'a Pigeonhole,
     batch: WriteBatch,
     error: Option<Error>,
+    /// The commit's tag (D336), if [`tag_xid`](Self::tag_xid) set one.
+    xid: Option<Vec<u8>>,
 }
 
 impl LoggedBatch<'_> {
@@ -1161,6 +1164,18 @@ impl LoggedBatch<'_> {
         self
     }
 
+    /// Tags the commit with `xid` (D336, ICR 0147): an old owner's tail commit replayed into
+    /// a partition's new owner carries its origin, which its change-feed events deliver
+    /// ([`feed::Commit::xid`](crate::feed::Commit::xid)). The tag is a spanning commit's
+    /// (D329 2b, [`Transaction::tag_xid`](crate::Transaction::tag_xid)): 1–255 bytes, checked
+    /// at commit. Hidden: not part of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-tail-replay")]
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) -> &mut Self {
+        self.xid = Some(xid.to_vec());
+        self
+    }
+
     /// The changes added so far.
     pub fn len(&self) -> usize {
         self.batch.len()
@@ -1176,7 +1191,10 @@ impl LoggedBatch<'_> {
         if let Some(e) = self.error {
             return Err(e);
         }
-        let info = self.db.engine().commit_logged(self.batch, None)?;
+        let info = self
+            .db
+            .engine()
+            .commit_logged_with(self.batch, None, self.xid.as_deref())?;
         Ok(crate::CommitInfo::from_engine(info))
     }
 }

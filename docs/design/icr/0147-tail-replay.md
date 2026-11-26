@@ -1,0 +1,88 @@
+# 0147: what a partition's new owner replays an old owner's tail with
+
+**Status:** Proposed (D336 PR 1, #2148; numbers: coordinator, 2026-11-26).
+
+## Change
+
+`pigeonhole-engine` (hidden, outside the stable API) and `pigeonhole`, behind the new hidden feature `__unstable-tail-replay`. That feature turns on `__unstable-replication` and `__unstable-txn-prepare`, and `phdb serve` turns it on. All of it is additive.
+
+```rust
+// pigeonhole-engine
+impl WriteBatch {
+    /// One change exactly as a primary logged it, beside the batch's ordinary writes.
+    pub fn push_logged_beside(&mut self, table: TableId, family: FamilyId, kind: Kind,
+        row: &[u8], qualifier: &[u8], ts: Timestamp, stored: &[u8]) -> Result<()>;
+}
+impl Engine {
+    /// `commit_logged`, tagged with `xid`.
+    pub fn commit_logged_with(&self, batch: WriteBatch, durability: Option<Durability>,
+        xid: Option<&[u8]>) -> Result<CommitInfo>;
+}
+impl Txn {
+    /// The row at the snapshot as stored: every version and delete marker, in logged form.
+    pub fn read_row_logged(&mut self, table: TableId, row: &[u8]) -> Result<Vec<CopiedCell>>;
+}
+
+// pigeonhole, #[cfg(feature = "__unstable-tail-replay")], #[doc(hidden)]
+impl LoggedBatch<'_> {
+    pub fn tag_xid(&mut self, xid: &[u8]) -> &mut Self;
+}
+impl Transaction {
+    pub fn push_logged(&mut self, table: &Table, row: &[u8], family: &str, kind: ChangeKind,
+        qualifier: &[u8], ts: u64, stored: &[u8]) -> &mut Self;
+    pub fn read_row_logged(&mut self, table: &Table, row: &[u8])
+        -> Result<Vec<replication::CopiedCell>>;
+}
+```
+
+## Why
+
+D336 (#2148) replays an old owner's unreplicated tail into the partition's new owner after a failover or promote.
+- A plain tail commit is one logged batch, tagged with its origin (`LoggedBatch::tag_xid`). The xid names the origin's history epoch and seqno, behind a version byte, so the new owner's feed delivers the origin and a later replay of the same commit skips it.
+- A tail commit that wrote a text or vector index, or a D311 memory store, is replayed as **one transaction** (D336 Amendment 3):
+  - the index's own writes go through the index's paths (`*_in`);
+  - the plain changes go in exactly as logged (`Transaction::push_logged`);
+  - the transaction reads the source row raw (`Transaction::read_row_logged`) to decide whether anything newer is there.
+
+## Semantics
+
+**`push_logged_beside` / `Transaction::push_logged` (simp724 on D336 PR 1):**
+- **The batch stays an ordinary one.** `WriteBatch::push_logged` marks a whole batch logged, so `route` would skip the counter prepare, the HLL and bloom conversions and the row-delete expansion for every mutation in it. These changes are kept in a second section instead.
+  - `logged()` still means "a logged section and no ordinary one".
+  - A mixed batch takes the ordinary path, so a replica refuses it as it refuses any own write.
+  - `commit_logged` and `apply_replicated` refuse it (`InvalidArgument`: not a logged batch).
+  - A batch that `push_logged` marked, with changes beside it as well, is refused at commit (`InvalidArgument`).
+  - `check_and_mutate` refuses a batch with changes beside it (`InvalidArgument`; simp724's P1 on #2235). Its check that the batch touches only the checked row reads the ordinary part, so it would not see them.
+- **Order inside the commit:**
+  - `route` rewrites the ordinary part first: row deletes expanded, counter writes prepared, the fixed counter timestamp, conversions.
+  - It then appends these changes unchanged, after a logged batch's checks: each family in its table, a merge's operator known, the table's tablets present. Their shards are added to the commit's.
+  - So where an ordinary write and one of these write one cell at one timestamp, this one wins (D34's last mutation). That includes a `delete_row`'s family delete at the commit's timestamp, which a logged cell at that exact timestamp survives.
+  - Below `route`, the builder is all stored form. Shards, WAL replay, cross-shard shares and the feed see no difference.
+- **The timestamp floor isn't raised** to these changes' timestamps, as for `commit_logged`: the caller decides. D336 §5 doesn't raise it, on purpose (the owner's decision): a replayed cell is a write with an explicit timestamp. So an ordinary write in the same transaction, or a later one, without a timestamp takes the clock. It can sort below a logged change's timestamp, and the logged change then wins whatever their order.
+- **Admission** charges these changes' bytes too (`batch_bytes`). A batch of them alone picks its admission shard by its first one.
+- **The caller's row checks count these rows as written.** `phdb serve`'s replay must pass them through:
+  - the D331 range gate (`touches`, the move's fence, `check_keys`);
+  - D329's read holds on written rows;
+  - the write gate the replay runs under (D326).
+  
+  D336 PR 3 does this. The engine has no row check of its own to bypass: it routes these rows to their shards like any write.
+- **Validation:** a transaction's validation is by its read set, so these changes conflict as any write does with another transaction's reads.
+
+**`read_row_logged`:**
+- The row at the transaction's snapshot as a range move's copy reads it (`Engine::copy_range` over `[row, row\0)`): every version and delete marker a reader there could need, in logged form, a counter or aggregate family's operands folded into their base.
+- It records a read of every family of the table (as `get_row` with no families). A commit to the row after the snapshot, a delete marker included, then fails the transaction with `Conflict`, and the replay decides again on a rerun.
+- **Its limit:** what compaction already dropped below every live snapshot isn't there, as for `copy_range`. A delete marker compacted away with the versions it covered no longer hides anything older, so a tail put below it is visible again, as any write at that timestamp would be.
+
+**`commit_logged_with` / `LoggedBatch::tag_xid`:**
+- The tag is a spanning commit's trailer (D329 2b), written only by the routing step that writes `Transaction::tag_xid`'s (`tag_routed`). That step sets `incompat` bit 2 first.
+- So there's no new format or feature bit (the coordinator's condition). The replay's version byte is inside the tag's bytes.
+- 1–255 bytes, checked when the commit is routed. `None` is `commit_logged`.
+
+## Not in this ICR
+
+- **`promoted_from`** (D336 §3) is dropped (Amendment 4). The fork token lives in the promote intent's sibling file, in a `__phdb_cluster` row written with the identity, and in the map. It's cli-only, with no format change.
+- **The tail source's open** needs no engine change. The source takes no writes, so retention trims nothing between its open and the retention hold (`hold_feed_retention`, ICR 0141) the cluster layer takes right after it. D336 PR 3 takes it.
+
+## Callers
+
+`phdb serve`'s tail replay (D336 PR 3). Tests: `crates/pigeonhole/tests/tail_replay.rs` and `crates/engine/tests/it/logged_beside.rs`. The `delete_row` tie (a logged cell at exactly the commit's timestamp) has no test, because a test can't pin the commit's timestamp.

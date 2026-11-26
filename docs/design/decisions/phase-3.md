@@ -5104,6 +5104,42 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
    - A new writer aborts an earlier writer's pre-commit `bal-` move (simp724's M1), and an idle pass changes no map (M2).
 4. The guide: serve.md's "The cluster balancer" (the policy, the bounds, the limits, `balancer status`, and why a merge stays under half the max). D331 PR 5 and PR 6 update its splits and merges as they land.
 
+<a id="d336"></a>
+## D336 — Replay an old owner's unreplicated tail into a partition's new owner (feed1248, design; owner, 2026-11-25; reviewed by simp724, cli692 and ai1249; cli, engine, #2148, ICR 0117, ICR 0147) · D311, D326, D328, D329, D330, D331
+
+**Problem (#2148).** A failover or promote (D328 PR 3, D330) makes a replica the owner at what it applied. The commits the old owner made after that point are lost to the partition, even when the old node comes back with them in its file.
+
+**Decision (the owner's answers, 2026-11-25).** The design is `.coord/feed1248-design-2148.md`, with Amendments 1–4: simp724's, cli692's and ai1249's reviews, the owner's Q2, and the fork token without an engine record. In short:
+- **The fork point:** the promote keeps the replica's primary token. It's in the promote intent's sibling file before `promote()`, in a `__phdb_cluster` row (`fork/<to_epoch>`, family `id`) written with the identity, then in the map (`FailoverEvent.fork_token`), so a rerun of a stopped promote still finds it. *(PR 2)*
+- **The pending record is the failover event:** `tail_state` (NONE, PENDING, DONE, DISCARDED), `from_history_epoch` and `from_epoch`. At most 4 PENDING tails per partition, the oldest discarded. While one is pending, P's moves and history changes are refused (Q4). *(PR 2)*
+- **The source is the old owner's file only,** opened on request as a tail source: no lease, no client call, a feed retention hold taken right after the open. `Cluster.ReadTail` streams its all-tables feed from the fork token. A pruned start reports the tail lost and replays nothing. *(PR 3)*
+- **The apply:** one task per partition, under P's write gate.
+  - Each old commit becomes one new commit, with the mark `replay/<from_history_epoch>` in the same commit, so a crash or a lease loss resumes without applying twice.
+  - Origins carry through a later hop (marks per origin history).
+  - Cells keep their timestamps, so a newer write wins. The timestamp floor isn't raised to the tail's.
+  - *(PR 3)*
+- **Indexes and stores (Q2):**
+  - A text or vector index's source write is replayed through the index's own paths in one transaction, and only if nothing newer is there.
+  - A D311 memory store's commit is applied whole or refused.
+  - Index-only maintenance commits are skipped.
+  - *(PR 3; the engine calls are in PR 1)*
+- **The feed:** replayed commits are tagged with their origin (`FeedEvent.replayed`). *(PR 3)*
+- **Who starts it:** `phdb cluster replay-tail` (`--dry-run`, `--discard`), or automatically when `replay_tails` is on (off by default, Q1). The old node rejoins once its tail is DONE or DISCARDED (`failover_rejoin`, Q3). *(PR 4)*
+
+**PRs:**
+1. **The engine and library calls, behind `__unstable-tail-replay` (ICR 0147). Done in this entry's PR:**
+   - a logged commit tagged with its origin;
+   - changes as logged beside a transaction's ordinary writes;
+   - a transaction's raw row read with delete markers.
+2. The fork token, the event's tail state and the guards (proto numbers assigned: `FailoverEvent` 14–17, `TailState`, `LocalPartition` 39–40, map feature `tail_replay`).
+3. The source, the replay, `replay-tail` and the feed's origin.
+4. Automatic replay and rejoin, metrics and the guide.
+
+**Rejected.**
+- *Replaying from a second replica that applied past the fork:* its feed is in its own numbering, and it can't name an origin per commit.
+- *Raising the new owner's timestamp floor to the tail's:* every later write would move forward by the old owner's clock skew.
+- *An engine `promoted_from` record:* a new reserved table would need a `ro_compat` bit (Amendment 4).
+
 <a id="d334"></a>
 ## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
 
