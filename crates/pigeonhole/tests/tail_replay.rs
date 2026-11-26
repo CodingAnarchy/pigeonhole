@@ -142,3 +142,103 @@ fn a_transaction_of_logged_changes_alone_commits() {
     drop(t);
     db.close().unwrap();
 }
+
+/// simp724 on #2235: in one transaction, an HLL input is converted to its state as an
+/// ordinary write and a counter increment prepared, while a logged change beside them is
+/// written untouched: its stored value as given.
+#[test]
+fn ordinary_writes_are_converted_and_logged_ones_are_not() {
+    use pigeonhole::Aggregation;
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("h.phdb"), Options::default().shards(2)).unwrap();
+    let t = db
+        .table("h")
+        .unwrap()
+        .family("f", Family::default())
+        .family("n", Family::counter())
+        .family("u", Family::aggregate(Aggregation::Hll))
+        .create_if_missing()
+        .unwrap();
+    let mut txn = db.transaction().unwrap();
+    for i in 0..100 {
+        txn.aggregate(&t, b"p", "u", b"all", i);
+    }
+    txn.incr(&t, b"p", "n", b"c", 4).push_logged(
+        &t,
+        b"p",
+        "f",
+        ChangeKind::Put,
+        b"raw",
+        33,
+        &[0x00, 1, 2, 3],
+    );
+    txn.commit().unwrap();
+    let n = t
+        .get(b"p", "u", b"all")
+        .unwrap()
+        .unwrap()
+        .hll_estimate()
+        .unwrap();
+    assert!((95..=105).contains(&n), "{n}");
+    assert_eq!(t.get(b"p", "n", b"c").unwrap().unwrap().as_i64(), Some(4));
+    let raw = t.get(b"p", "f", b"raw").unwrap().unwrap();
+    assert_eq!((raw.value(), raw.timestamp()), (&[1u8, 2, 3][..], 33));
+    drop(t);
+    db.close().unwrap();
+}
+
+/// simp724 on #2235: a transaction across two tables, which a two-shard database places on
+/// its two shards, the logged change in the other table: both commit, as one.
+#[test]
+fn a_logged_change_on_another_shard_commits_with_the_transaction() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let (db, t) = open(&dir);
+    let u = db
+        .table("u")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut txn = db.transaction().unwrap();
+    txn.put(&t, b"a", "f", b"q", b"ordinary").push_logged(
+        &u,
+        b"b",
+        "f",
+        ChangeKind::Put,
+        b"q",
+        11,
+        &[0x00, b'l'],
+    );
+    txn.commit().unwrap();
+    assert_eq!(
+        t.get(b"a", "f", b"q").unwrap().unwrap().value(),
+        b"ordinary"
+    );
+    let l = u.get(b"b", "f", b"q").unwrap().unwrap();
+    assert_eq!((l.value(), l.timestamp()), (&b"l"[..], 11));
+    drop((t, u));
+    db.close().unwrap();
+}
+
+/// A replica refuses a transaction with logged changes, as it refuses any own write.
+#[test]
+fn a_replica_refuses_logged_changes_in_a_transaction() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let (primary, _t) = open(&dir);
+    let snap = primary.snapshot().unwrap();
+    let token = primary.feed().from_snapshot(&snap).open().unwrap().token();
+    let copy = dir.join("copy.phdb");
+    primary.backup_at(&snap, &copy).unwrap();
+    drop(snap);
+    let replica = Pigeonhole::open(&copy, Options::default().shards(2)).unwrap();
+    replica.begin_replication(&token).unwrap();
+    let rt = replica.table("t").unwrap().open().unwrap();
+    let mut txn = replica.transaction().unwrap();
+    txn.push_logged(&rt, b"r", "f", ChangeKind::Put, b"q", 5, &[0x00, b'v']);
+    let e = txn.commit().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::ReadOnly, "{e}");
+    drop(rt);
+    replica.close().unwrap();
+    drop(_t);
+    primary.close().unwrap();
+}

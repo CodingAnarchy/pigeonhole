@@ -5560,10 +5560,14 @@ impl Inner {
             Some((t, r)) => route(t, r),
             None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
                 Some(m) => route(m.table, m.row),
-                None => batch
-                    .row_deletes
-                    .first()
-                    .and_then(|d| route(d.table, &d.row)),
+                None => match batch.row_deletes.first() {
+                    Some(d) => route(d.table, &d.row),
+                    // D336: a batch of changes pushed as logged alone (simp724 on #2235).
+                    None => batch.logged_beside.as_ref().and_then(|b| {
+                        let m = b.batch().iter().next()?.ok()?;
+                        route(m.table, m.row)
+                    }),
+                },
             },
         };
         routed.map_or(0, |(_, s)| usize::from(s.0))
@@ -6950,6 +6954,13 @@ impl Inner {
             return Err(Error::ReadOnly);
         }
         self.check_writable()?;
+        // D336: changes pushed as logged beside a batch go only through a transaction or a
+        // plain commit, whose routing appends them (simp724's P1 on #2235).
+        if batch.logged_beside.is_some() {
+            return Err(Error::InvalidArgument(
+                "check_and_mutate takes no changes pushed as logged".to_owned(),
+            ));
+        }
         for rd in &batch.row_deletes {
             if rd.table != table || rd.row != row {
                 return Err(Error::InvalidArgument(

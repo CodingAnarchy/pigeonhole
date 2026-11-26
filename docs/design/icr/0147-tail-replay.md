@@ -52,13 +52,14 @@ D336 (#2148) replays an old owner's unreplicated tail into the partition's new o
   - A mixed batch takes the ordinary path, so a replica refuses it as it refuses any own write.
   - `commit_logged` and `apply_replicated` refuse it (`InvalidArgument`: not a logged batch).
   - A batch that `push_logged` marked, with changes beside it as well, is refused at commit (`InvalidArgument`).
+  - `check_and_mutate` refuses a batch with changes beside it (`InvalidArgument`; simp724's P1 on #2235). Its check that the batch touches only the checked row reads the ordinary part, so it would not see them.
 - **Order inside the commit:**
   - `route` rewrites the ordinary part first: row deletes expanded, counter writes prepared, the fixed counter timestamp, conversions.
   - It then appends these changes unchanged, after a logged batch's checks: each family in its table, a merge's operator known, the table's tablets present. Their shards are added to the commit's.
   - So where an ordinary write and one of these write one cell at one timestamp, this one wins (D34's last mutation). That includes a `delete_row`'s family delete at the commit's timestamp, which a logged cell at that exact timestamp survives.
   - Below `route`, the builder is all stored form. Shards, WAL replay, cross-shard shares and the feed see no difference.
 - **The timestamp floor isn't raised** to these changes' timestamps, as for `commit_logged`: the caller decides. D336 §5 doesn't raise it, on purpose (the owner's decision): a replayed cell is a write with an explicit timestamp. So an ordinary write in the same transaction, or a later one, without a timestamp takes the clock. It can sort below a logged change's timestamp, and the logged change then wins whatever their order.
-- **Admission** charges these changes' bytes too (`batch_bytes`).
+- **Admission** charges these changes' bytes too (`batch_bytes`). A batch of them alone picks its admission shard by its first one.
 - **The caller's row checks count these rows as written.** `phdb serve`'s replay must pass them through:
   - the D331 range gate (`touches`, the move's fence, `check_keys`);
   - D329's read holds on written rows;
@@ -84,4 +85,4 @@ D336 (#2148) replays an old owner's unreplicated tail into the partition's new o
 
 ## Callers
 
-`phdb serve`'s tail replay (D336 PR 3). Tests: `crates/pigeonhole/tests/tail_replay.rs`.
+`phdb serve`'s tail replay (D336 PR 3). Tests: `crates/pigeonhole/tests/tail_replay.rs` and `crates/engine/tests/it/logged_beside.rs`. The `delete_row` tie (a logged cell at exactly the commit's timestamp) has no test, because a test can't pin the commit's timestamp.
