@@ -102,11 +102,12 @@ impl Service {
             }
             _ => self.answer(op, caller, budget).await,
         };
-        // D335: the wait, after the commit and before D326's check. Boxed, so its state
-        // doesn't widen every call's future (the serve callgrind shapes, D193): only a
-        // write that waits pays for it.
+        // D335: the wait, after the commit and before D326's check. Boxed, and the reply
+        // moved into it and back, so nothing of this call lives across its await: a reply
+        // held there would take a slot of its own in every call's future (+304 bytes, the
+        // serve callgrind shapes, D193). Only a write that waits pays for it.
         if waits {
-            Box::pin(self.wait_for_acks(&mut reply)).await;
+            reply = Box::pin(self.wait_for_acks(reply)).await;
         }
         if reply.is_ok() {
             if let Some(h) = &held
@@ -672,11 +673,14 @@ impl Service {
 
 impl Service {
     /// D335: waits until k replicas acknowledged `reply`'s commit (its own position), the
-    /// timeout, or the lease's end, and sets its `CommitInfo.replica_acks`; an
-    /// `OutcomeUnknown` replaces the reply when the wait ends without them.
-    async fn wait_for_acks(&self, reply: &mut Result<ServiceReply, ApiError>) {
+    /// timeout, or the lease's end, and answers it with its `CommitInfo.replica_acks` set;
+    /// or `OutcomeUnknown`, when the wait ends without them.
+    async fn wait_for_acks(
+        &self,
+        mut reply: Result<ServiceReply, ApiError>,
+    ) -> Result<ServiceReply, ApiError> {
         let (Some(gate), Some(part)) = (&self.gate, &self.part) else {
-            return;
+            return reply;
         };
         let seqno = match reply.as_ref().map(committed_seqno) {
             Ok(Committed::At(s)) => s,
@@ -684,7 +688,7 @@ impl Service {
             // change): the node's visible seqno after it returned, at or past its own, so
             // it may wait longer, never less.
             Ok(Committed::Unknown) => part.db.visible_seqno(),
-            Ok(Committed::Nothing) | Err(_) => return,
+            Ok(Committed::Nothing) | Err(_) => return reply,
         };
         match part
             .acks
@@ -692,11 +696,12 @@ impl Service {
             .await
         {
             Ok(n) => {
-                if let Ok(r) = reply {
+                if let Ok(r) = &mut reply {
                     set_replica_acks(r, n);
                 }
+                reply
             }
-            Err(e) => *reply = Err(e),
+            Err(e) => Err(e),
         }
     }
 }
