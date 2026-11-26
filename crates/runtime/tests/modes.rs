@@ -158,6 +158,15 @@ impl<H: ShardHandler> Harness<H> {
         }
     }
 
+    /// The CPUs the shard drivers are pinned to: empty when none is, and for the
+    /// application's own threads, which this harness doesn't pin.
+    fn driver_cpus(&self) -> Vec<usize> {
+        match self {
+            Harness::Engine(rt) | Harness::Churn { rt, .. } => rt.pinned_driver_cpus().to_vec(),
+            Harness::App { .. } => Vec::new(),
+        }
+    }
+
     /// Stops the runtime after it handles everything queued; inspects each handler.
     fn finish<R>(self, f: impl Fn(&mut H) -> R) -> Vec<R> {
         match self {
@@ -747,10 +756,19 @@ fn sleeping_task_fires_on_time_real(mode: Mode) {
     h.submitter(0).submit(Msg::Spawn(Box::new(task))).unwrap();
     // A plain thread sleeping to the same deadline: how late this machine wakes a parked
     // thread right now. A loaded runner can wake any thread hundreds of milliseconds late
-    // (main's macOS CI: 263 ms), which is not the shard's lateness.
+    // (main's macOS CI: 263 ms), which is not the shard's lateness. It sits on the driver's
+    // CPU (one driver here, since there is one shard; with more, the reference would share
+    // only some of their CPUs), so it waits for that CPU as the driver does: on Windows a
+    // pinned thread waits out a busy unpinned one's scheduler quantum (100-200 ms) on its
+    // CPU, which an unpinned reference never sees (#2224).
+    let cpus = h.driver_cpus();
     let reference = {
         let vfs = Arc::clone(&vfs);
         thread::spawn(move || {
+            if !cpus.is_empty() {
+                pigeonhole_io::sys::confine_current_thread_to(&cpus)
+                    .expect("confine the reference thread to the drivers' CPUs");
+            }
             loop {
                 let now = vfs.monotonic_nanos();
                 if now >= at {
