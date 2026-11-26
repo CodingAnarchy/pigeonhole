@@ -329,6 +329,7 @@ fn opened_off_the_others_cores_alone() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        replica_acks: 0,
         id: id.into(),
         node: "a".into(),
         epoch: 1,
@@ -442,6 +443,7 @@ fn opened_off_the_others_cores_alone() {
                 let _ = data(port)
                     .await
                     .mutate(crate::serve::proto::MutateRequest {
+                        replication: 0,
                         writes: Some(put_row(&format!("a{i}"), "1")),
                         durability: 0,
                     })
