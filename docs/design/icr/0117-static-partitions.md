@@ -1121,7 +1121,7 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
 - On every map the writer sets (not a forced one), it first resets `adopted_features` to the current map's, before any gate runs (cli692's B1): an operator's map can neither drop nor add one, nor pass a gate by listing one. A first map starts empty, and a forced map gets exactly the forcing node's current set (B2).
 - It then asks every node of the new map for `Status` in one round of fresh asks (never the 30 s cache: cli692).
 - If every node answered, and every node reports `adopted_features` itself, it adds each feature of this build's `MAP_FEATURES` that every node reports. A peer with no answer within the last 5 s skips the round (simp724's S1), so a failover's map sets don't wait on the down owner.
-- **The writer's duty** (cli692's Q1): after each lease round, the writer checks the same way, and when something is adoptable, it sets its current map one version on, which adopts it. A cluster with no map change after its upgrade has the features before its first failover.
+- **The writer's duty** (cli692's Q1): with `ClusterMap.failover` on, after each lease round the writer checks the same way, and when something is adoptable, it sets its current map one version on, which adopts it. A cluster with no map change after its upgrade then has the features before its first failover. Without failover, nothing raises a map version in the background: the next map set adopts.
 - A node that doesn't answer adopts nothing that round.
 - Once this build's features are all adopted, there's no round at all. Adoption of the features that exist today is lazy: the first all-answering set records them.
 - **Nothing removes one.**

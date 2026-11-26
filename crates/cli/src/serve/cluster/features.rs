@@ -250,15 +250,16 @@ impl Node {
         )))
     }
 
-    /// The writer's duty (cli692's Q1 on #2237): once every node runs a build with features
-    /// the cluster hasn't adopted (after an upgrade), it adopts them by setting its map
-    /// again, so a cluster with no map change since its upgrade still has them at its first
-    /// failover. Nothing while this node isn't the writer or a node is down.
+    /// The writer's duty (cli692's Q1 on #2237): with automatic failover on, once every node
+    /// runs a build with features the cluster hasn't adopted (after an upgrade), it adopts
+    /// them by setting its map again, so a cluster with no map change since its upgrade has
+    /// them at its first failover. Without failover, only a map set adopts (no map version is
+    /// raised in the background). Nothing while this node isn't the writer or a node is down.
     pub(crate) async fn maybe_adopt_features(self: &Arc<Self>) {
         let Ok(current) = self.get_map() else {
             return;
         };
-        if super::schema::writer(&current) != self.id {
+        if !current.failover || super::schema::writer(&current) != self.id {
             return;
         }
         let mut probe = current.clone();
