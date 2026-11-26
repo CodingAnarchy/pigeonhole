@@ -1616,11 +1616,14 @@ async fn confirm_unacked(
     // Every row at once, all within one request timeout, so a branch node that's down costs
     // the resolver's pass one timeout, not one per row (audit120's S1 on #2164).
     let mut set = tokio::task::JoinSet::new();
+    // Every row's branches, so rows the timeout cuts short count as unanswered.
+    let (mut asked, mut late) = (0, rows.len());
     for (xid, waiting) in rows {
+        asked += waiting.len();
         let d = cluster.sweep_driver(service, home, &xid);
         set.spawn(async move {
             let (acked, refused) = d.confirm(&waiting).await;
-            (xid, waiting.len(), acked, refused)
+            (xid, acked, refused)
         });
     }
     let mut answers = Vec::new();
@@ -1633,10 +1636,12 @@ async fn confirm_unacked(
     })
     .await;
     set.abort_all();
-    let (mut asked, mut unanswered, mut first) = (0, 0, None);
-    for (xid, n, acked, refused) in answers {
-        asked += n;
-        unanswered += n - acked.len();
+    // A row still running at the timeout: all of its branches unanswered.
+    let mut unanswered: usize = asked;
+    let mut first = None;
+    for (xid, acked, refused) in answers {
+        late -= 1;
+        unanswered -= acked.len();
         if let Some((p, e)) = refused {
             first.get_or_insert(format!("partition {p} for {xid}: {}", e.message));
         }
@@ -1649,14 +1654,37 @@ async fn confirm_unacked(
             );
         }
     }
-    // One line a sweep for a home whose rows stay (audit120's nit on #2164).
-    if let Some(first) = first {
-        eprintln!(
-            "phdb serve: {home}'s decision sweep: {unanswered} of {asked} branches that never \
-             acked a commit didn't answer its decide again, so those records stay (first: \
-             {first})"
-        );
+    if let Some(line) = sweep_line(home, asked, unanswered, first, late, timeout) {
+        eprintln!("{line}");
     }
+}
+
+/// The decision sweep's one line for `home` (audit120's nit on #2164): `unanswered` of the
+/// `asked` branches didn't ack, with the first refusal, and `late` records whose asks still
+/// ran at the `timeout` limit (their branches all counted unanswered). `None` when every
+/// branch acked.
+fn sweep_line(
+    home: &str,
+    asked: usize,
+    unanswered: usize,
+    first: Option<String>,
+    late: usize,
+    timeout: Duration,
+) -> Option<String> {
+    if unanswered == 0 {
+        return None;
+    }
+    let late_why = format!("{late} records' asks still ran at the {timeout:?} limit");
+    let why = match (first, late) {
+        (Some(first), 0) => format!("first: {first}"),
+        (Some(first), _) => format!("first: {first}; {late_why}"),
+        (None, 0) => "no branch said why".to_owned(),
+        (None, _) => late_why,
+    };
+    Some(format!(
+        "phdb serve: {home}'s decision sweep: {unanswered} of {asked} branches that never \
+         acked a commit didn't answer its decide again, so those records stay ({why})"
+    ))
 }
 
 /// How often the resolver sweeps the decision records under `--txn-outcome-retention`
@@ -1875,9 +1903,30 @@ pub(crate) fn start_resolver(
 
 #[cfg(test)]
 mod tests {
+
+    /// audit120's nit on #2164: rows the timeout cut short count as unanswered and are said
+    /// even when no answered row was refused; nothing is said when every branch acked.
+    #[test]
+    fn the_sweeps_line_counts_rows_the_timeout_cut_short() {
+        let t = Duration::from_secs(5);
+        assert_eq!(sweep_line("p1", 3, 0, None, 0, t), None);
+        let line = sweep_line("p1", 3, 2, None, 1, t).unwrap();
+        assert!(line.contains("2 of 3 branches"), "{line}");
+        assert!(
+            line.contains("1 records' asks still ran at the 5s limit"),
+            "{line}"
+        );
+        let line = sweep_line("p1", 3, 1, Some("partition p2 for x: no".into()), 0, t).unwrap();
+        assert!(line.ends_with("(first: partition p2 for x: no)"), "{line}");
+        let line = sweep_line("p1", 4, 3, Some("partition p2 for x: no".into()), 1, t).unwrap();
+        assert!(
+            line.contains("first: partition p2 for x: no; 1 records'"),
+            "{line}"
+        );
+    }
     use super::{
-        ApiError, Ask, MAX_ACKS, Spanning, ask_homes, collectable, keep_ack, proto, unacked,
-        with_acks,
+        ApiError, Ask, MAX_ACKS, Spanning, ask_homes, collectable, keep_ack, proto, sweep_line,
+        unacked, with_acks,
     };
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
