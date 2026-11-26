@@ -1,0 +1,2 @@
+### Changed
+- **A cluster map records the features every node has adopted** (`adopted_features`, shown by `phdb cluster get-map`). The map's writer adds a feature once every node reports it together, and nothing removes one. A change that needs a feature on every node then goes in while a node is down: a failover's, while the old owner is. Rolling a node back below the adopted features is unsupported: such a node refuses to start from its map, and refuses maps sent to it, naming what its build lacks. A map adding a node is refused unless that node has every adopted feature.

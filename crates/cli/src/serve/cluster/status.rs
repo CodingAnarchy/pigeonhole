@@ -366,55 +366,72 @@ impl Node {
             divergent,
             grace_remaining_ms: millis(self.grants.grace_remaining()),
             lease_ms: millis(self.grants.lease()),
-            map_features: MAP_FEATURES
-                .iter()
-                .filter(|&&f| {
-                    #[cfg(test)]
-                    if f == NEAREST_QUALIFIERS_FEATURE && old_nearest(&self.dir, OldNearest::Status)
-                    {
-                        return false;
-                    }
-                    #[cfg(test)]
-                    if f == INDEXES_FEATURE
-                        && OLD_INDEXES
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .iter()
-                            .any(|d| self.dir.starts_with(d))
-                    {
-                        return false;
-                    }
-                    #[cfg(test)]
-                    if f == INDEX_BULK_LOAD_FEATURE
-                        && OLD_BULK_LOAD
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .iter()
-                            .any(|d| self.dir.starts_with(d))
-                    {
-                        return false;
-                    }
-                    #[cfg(test)]
-                    if f == LEASES_FEATURE && fence::pre_lease(&self.dir) {
-                        return false;
-                    }
-                    #[cfg(test)]
-                    if f == MEMORY_TOOL_FIELDS_FEATURE
-                        && OLD_MEMORY
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .iter()
-                            .any(|d| self.dir.starts_with(d))
-                    {
-                        return false;
-                    }
-                    let _ = f;
-                    true
-                })
-                .map(|&f| f.to_owned())
-                .collect(),
+            map_features: build_features(&self.dir),
         }
     }
+}
+
+/// The map fields and request features this build keeps ([`MAP_FEATURES`]), as `Status`
+/// reports them (`NodeStatus.map_features`), and as a map's `adopted_features` is checked
+/// against when this node takes a map or starts from its own (D336's adopted features). A
+/// test's older-build seams leave out what they name.
+pub(crate) fn build_features(dir: &std::path::Path) -> Vec<String> {
+    let _ = dir;
+    MAP_FEATURES
+        .iter()
+        .filter(|&&f| {
+            #[cfg(test)]
+            if OLD_FEATURE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|(d, g)| *g == f && dir.starts_with(d))
+            {
+                return false;
+            }
+            #[cfg(test)]
+            if f == NEAREST_QUALIFIERS_FEATURE && old_nearest(dir, OldNearest::Status) {
+                return false;
+            }
+            #[cfg(test)]
+            if f == INDEXES_FEATURE
+                && OLD_INDEXES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|d| dir.starts_with(d))
+            {
+                return false;
+            }
+            #[cfg(test)]
+            if f == INDEX_BULK_LOAD_FEATURE
+                && OLD_BULK_LOAD
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|d| dir.starts_with(d))
+            {
+                return false;
+            }
+            #[cfg(test)]
+            if f == LEASES_FEATURE && fence::pre_lease(dir) {
+                return false;
+            }
+            #[cfg(test)]
+            if f == MEMORY_TOOL_FIELDS_FEATURE
+                && OLD_MEMORY
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|d| dir.starts_with(d))
+            {
+                return false;
+            }
+            let _ = f;
+            true
+        })
+        .map(|&f| f.to_owned())
+        .collect()
 }
 
 /// The bytes partition `db`'s file holds here, for the balancer (D332) and a move's plan:

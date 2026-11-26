@@ -4242,6 +4242,9 @@ impl serde::Serialize for ClusterMap {
         if !self.balancer_events.is_empty() {
             len += 1;
         }
+        if !self.adopted_features.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ClusterMap", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -4300,6 +4303,9 @@ impl serde::Serialize for ClusterMap {
         if !self.balancer_events.is_empty() {
             struct_ser.serialize_field("balancer_events", &self.balancer_events)?;
         }
+        if !self.adopted_features.is_empty() {
+            struct_ser.serialize_field("adopted_features", &self.adopted_features)?;
+        }
         struct_ser.end()
     }
 }
@@ -4333,6 +4339,8 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             "balance",
             "balancer_events",
             "balancerEvents",
+            "adopted_features",
+            "adoptedFeatures",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -4354,6 +4362,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             Balancer,
             Balance,
             BalancerEvents,
+            AdoptedFeatures,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -4392,6 +4401,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             "balancer" => Ok(GeneratedField::Balancer),
                             "balance" => Ok(GeneratedField::Balance),
                             "balancerEvents" | "balancer_events" => Ok(GeneratedField::BalancerEvents),
+                            "adoptedFeatures" | "adopted_features" => Ok(GeneratedField::AdoptedFeatures),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -4428,6 +4438,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                 let mut balancer__ = None;
                 let mut balance__ = None;
                 let mut balancer_events__ = None;
+                let mut adopted_features__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -4536,6 +4547,12 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             }
                             balancer_events__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::AdoptedFeatures => {
+                            if adopted_features__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("adoptedFeatures"));
+                            }
+                            adopted_features__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ClusterMap {
@@ -4556,6 +4573,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                     balancer: balancer__.unwrap_or_default(),
                     balance: balance__,
                     balancer_events: balancer_events__.unwrap_or_default(),
+                    adopted_features: adopted_features__.unwrap_or_default(),
                 })
             }
         }

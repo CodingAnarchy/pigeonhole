@@ -117,6 +117,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         balance: Default::default(),
         balancer: Default::default(),
         balancer_events: Default::default(),
+        adopted_features: Vec::new(),
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
@@ -300,6 +301,177 @@ fn bounded(limit: Duration, test: impl FnOnce() + Send + 'static) {
             panic!("the test didn't finish within {limit:?}")
         }
     }
+}
+
+/// The adopted features (ClusterMap.adopted_features): a map set while every node answers
+/// adopts every feature the nodes all report, a later set keeps them though the operator's
+/// map leaves them out, and nothing removes one.
+#[test]
+fn a_map_set_while_every_node_answers_adopts_their_features() {
+    let t = Three::start(["", "", ""]);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        let set = async |m: ClusterMap| {
+            client(a)
+                .await
+                .set_map(SetMapRequest {
+                    expected_map_version: m.map_version - 1,
+                    map: Some(m),
+                    copies: Vec::new(),
+                    force: false,
+                })
+                .await
+                .unwrap();
+        };
+        let get = async || {
+            client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        // The writer's duty may adopt them first, after a lease round (cli692's Q1): either
+        // way, a set while every node answers leaves them all adopted.
+        let mut m = get().await;
+        m.map_version += 1;
+        set(m).await;
+        let adopted = get().await.adopted_features;
+        let mut want: Vec<String> = super::MAP_FEATURES.iter().map(|f| f.to_string()).collect();
+        want.sort();
+        assert_eq!(adopted, want);
+        // An operator's map that leaves them out keeps them.
+        let mut m = get().await;
+        m.map_version += 1;
+        m.adopted_features.clear();
+        set(m).await;
+        assert_eq!(get().await.adopted_features, want);
+    });
+}
+
+/// cli692's B1 on #2237: an operator's map that lists a feature as adopted passes no gate
+/// with it. The gates read the current map's adopted features, so a node without the feature
+/// still refuses the change.
+#[test]
+fn a_submitted_maps_adopted_features_pass_no_gate() {
+    let t = Three::start(["", "", ""]);
+    // c runs a build without `writer_terms` from the start.
+    super::OLD_FEATURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((t.dirs[2].clone(), super::WRITER_TERMS_FEATURE));
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.failover = true;
+        m.adopted_features = vec![super::WRITER_TERMS_FEATURE.to_owned()];
+        let e = client(a)
+            .await
+            .set_map(SetMapRequest {
+                expected_map_version: m.map_version - 1,
+                map: Some(m),
+                copies: Vec::new(),
+                force: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e}");
+        assert!(e.message().contains('c'), "{e}");
+    });
+    super::OLD_FEATURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(d, _)| *d != t.dirs[2]);
+}
+
+/// simp724 on #2237: a map that adds a node whose build lacks an adopted feature is refused,
+/// naming the node and the feature.
+#[test]
+fn a_node_below_the_adopted_features_isnt_added() {
+    let t = Three::start(["", "", ""]);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        let get = async || {
+            client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let set = async |m: ClusterMap| {
+            client(a)
+                .await
+                .set_map(SetMapRequest {
+                    expected_map_version: m.map_version - 1,
+                    map: Some(m),
+                    copies: Vec::new(),
+                    force: false,
+                })
+                .await
+        };
+        // Every feature adopted while all three answer, then c leaves the map.
+        let mut m = get().await;
+        m.map_version += 1;
+        set(m).await.unwrap();
+        let with_c = get().await;
+        assert!(
+            with_c
+                .adopted_features
+                .iter()
+                .any(|f| f == super::BALANCER_FEATURE),
+            "{with_c:?}"
+        );
+        let mut without = with_c.clone();
+        without.map_version += 1;
+        without.nodes.retain(|n| n.id != "c");
+        set(without).await.unwrap();
+        // c now runs a build without `balancer`, and a map adds it back.
+        super::OLD_FEATURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((t.dirs[2].clone(), super::BALANCER_FEATURE));
+        let mut back = get().await;
+        back.map_version += 1;
+        back.nodes = with_c.nodes.clone();
+        let e = set(back).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e}");
+        assert!(
+            e.message().contains("c (lacks") && e.message().contains("balancer"),
+            "{e}"
+        );
+    });
+    super::OLD_FEATURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(d, _)| *d != t.dirs[2]);
+}
+
+/// cli692 on the ruling: a node whose build lacks a feature its stored map adopted refuses
+/// to start from that map (a rollback below the cluster's features), before it serves.
+#[test]
+fn a_node_below_its_maps_adopted_features_refuses_to_start() {
+    let dir = test_dir();
+    let mut m = the_map(1, &[1, 2, 3]);
+    m.adopted_features = vec![super::MEMORY_TOOL_FIELDS_FEATURE.to_owned()];
+    super::start::own_map_adopted(&dir, &m).unwrap();
+    super::OLD_MEMORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dir.clone());
+    let e = super::start::own_map_adopted(&dir, &m).unwrap_err();
+    assert!(
+        e.contains("lacks") && e.contains("memory_tool_fields"),
+        "{e}"
+    );
+    // So does taking such a map.
+    assert!(!super::map::lacked_adopted(&m, &super::status::build_features(&dir)).is_empty());
 }
 
 #[test]
@@ -2452,6 +2624,8 @@ struct Three {
     ports: [u16; 3],
     stops: Vec<tokio::sync::oneshot::Sender<()>>,
     dbs: Vec<pigeonhole::Pigeonhole>,
+    /// Each node's cluster directory, for the tests' fault seams.
+    dirs: Vec<PathBuf>,
 }
 
 impl Three {
@@ -2474,6 +2648,7 @@ impl Three {
         map.partitions.retain(|p| p.id != "p3");
         let mut stops = Vec::new();
         let mut dbs = Vec::new();
+        let mut dirs = Vec::new();
         for ((l, (id, local)), tokens) in listeners
             .into_iter()
             .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
@@ -2484,12 +2659,14 @@ impl Three {
             let (stop, db) = data_node_limits(&rt, &dir, id, local, l, tokens, limits);
             stops.push(stop);
             dbs.extend(db);
+            dirs.push(dir);
         }
         Self {
             rt,
             ports,
             stops,
             dbs,
+            dirs,
         }
     }
 }
@@ -4560,6 +4737,7 @@ fn split_nodes(
         balance: Default::default(),
         balancer: Default::default(),
         balancer_events: Default::default(),
+        adopted_features: Vec::new(),
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),

@@ -66,6 +66,12 @@ pub(crate) static OLD_FOLLOW: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static OLD_INDEXES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// A fault seam (tests): nodes acting as a build without the named map feature (the
+/// adopted features' tests, #2237), by cluster directory: their `Status` leaves it out, and
+/// they refuse a map that adopted it.
+#[cfg(test)]
+pub(crate) static OLD_FEATURE: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
+
 /// A hold seam (tests): nodes whose `Status` doesn't answer while their cluster directory
 /// is listed, as a stalled peer's wouldn't.
 #[cfg(test)]

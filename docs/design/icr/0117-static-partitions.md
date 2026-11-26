@@ -1113,3 +1113,28 @@ A moved-away row outlives the move record. Each node prunes its own partitions' 
 **The source's table.** Once the last moved-away row of a table moved off whole goes, the schema reconcile drops the table there at the next map install.
 
 **A forced map** placing a pruned range back on its old source serves it empty, not `Returned` (the coordinator's ruling on Q1). The guide says to check the move's status before forcing a range back.
+
+## The cluster's adopted features (1.4.0, before D336 PR 2; the coordinator's ruling)
+**`ClusterMap.adopted_features = 18`** (repeated string; coordinator-assigned): the cluster's feature high-water mark, in the shape of CockroachDB's finalized cluster version. It has a map feature of its own, `adopted_features`.
+
+**Adopting:**
+- On every map the writer sets (not a forced one), it first resets `adopted_features` to the current map's, before any gate runs (cli692's B1): an operator's map can neither drop nor add one, nor pass a gate by listing one. A first map starts empty, and a forced map gets exactly the forcing node's current set (B2).
+- It then asks every node of the new map for `Status` in one round of fresh asks (never the 30 s cache: cli692).
+- If every node answered, and every node reports `adopted_features` itself, it adds each feature of this build's `MAP_FEATURES` that every node reports. A peer with no answer within the last 5 s skips the round (simp724's S1), so a failover's map sets don't wait on the down owner.
+- **The writer's duty** (cli692's Q1): with `ClusterMap.failover` on, after each lease round the writer checks the same way, and when something is adoptable, it sets its current map one version on, which adopts it. A cluster with no map change after its upgrade then has the features before its first failover. Without failover, nothing raises a map version in the background, so **a cluster without failover adopts features only when a map is set while every node answers** (any map the writer sets: `set-map`, a schema change, a move, a promote). Until then every gate asks every node, as before. The guide says so, with the remedy: set any map once every node is upgraded.
+- A node that doesn't answer adopts nothing that round.
+- Once this build's features are all adopted, there's no round at all. Adoption of the features that exist today is lazy: the first all-answering set records them.
+- **Nothing removes one.**
+
+**Using:**
+- `every_node_keeps(map, X, …)` passes without asking when `X` is in `map.adopted_features`; otherwise it asks every node, as before.
+- Every call site goes through it, so the rule applies to each: `install.rs`'s gates for `memory`, `replicas`, `indexes`, `range_moves`, `move_aborting`, `balancer` and `writer_terms`, on a change and on a first map. D336 PR 2 adds `tail_replay`.
+- Request features that are checked per call (`nearest_qualifiers`, `memory_tool_fields`, `index_bulk_load`, `leases`) don't use `every_node_keeps` and are unchanged.
+
+**Refusals:**
+- A node whose build lacks a feature in `adopted_features` refuses the map with `FailedPrecondition`:
+  - at start, from the map it stored itself (`start::own_map_adopted`), before it serves (cli692);
+  - when it takes a map, whatever its source (`Node::install`).
+- A map that adds a node to the map's nodes is refused unless that node reports every adopted feature, in one round of fresh asks, naming each node and what it lacks.
+- The guide says rolling a node back below the adopted features is unsupported.
+- A 1.3 build doesn't know the field: nothing is adopted while one runs, since adoption needs every node to report `adopted_features`.

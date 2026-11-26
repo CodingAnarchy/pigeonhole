@@ -945,6 +945,25 @@ pub(crate) const FAILOVER_EVENTS: usize = 16;
 /// PR 2 plan's F7); the count stays exact.
 pub(crate) const IN_DOUBT_BYTES: usize = 4096;
 
+/// The features `map` adopted that `build` (a node's [`super::status::build_features`])
+/// lacks: a node with any refuses the map, at start or when it takes one.
+pub(crate) fn lacked_adopted(map: &ClusterMap, build: &[String]) -> Vec<String> {
+    map.adopted_features
+        .iter()
+        .filter(|f| !build.contains(f))
+        .cloned()
+        .collect()
+}
+
+/// The refusal for a node whose build lacks `lacked`, features the cluster adopted.
+pub(crate) fn below_adopted(lacked: &[String]) -> String {
+    format!(
+        "this node's build lacks {lacked:?}, which the cluster adopted \
+         (ClusterMap.adopted_features): every node of the cluster has run a build with them, \
+         and running one below them is unsupported. Start this node on a build that has them"
+    )
+}
+
 /// Whether `m` uses any of D330's failover fields: what needs `writer_terms` on every node.
 pub(crate) fn uses_failover(m: &ClusterMap) -> bool {
     m.failover
@@ -1660,6 +1679,7 @@ mod tests {
             balance: Default::default(),
             balancer: Default::default(),
             balancer_events: Default::default(),
+            adopted_features: Vec::new(),
             cluster_id: "c1".into(),
             map_version: 1,
             previous_nodes: Vec::new(),
