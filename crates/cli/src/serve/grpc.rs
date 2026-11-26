@@ -42,20 +42,21 @@ struct Authed(auth::Caller);
 /// The caller of a gRPC request: the one [`prepay`] identified, taken from the request's
 /// extensions, or (a route not behind `prepay`) from its token now.
 fn caller_of<T>(shared: &Shared, req: &mut Request<T>) -> Result<auth::Caller, ApiError> {
-    let mut caller = match req.extensions_mut().remove::<Authed>() {
-        Some(Authed(caller)) => caller,
-        None => shared.caller(auth_header(req))?,
-    };
-    // D335: a write that asked not to wait for its partition's replica acks. Only a cluster
-    // node reads the header: a single node's calls keep their cost.
-    if shared.router.is_cluster() {
-        caller.replication_async = super::acks::replication_async(
-            req.metadata()
-                .get(super::acks::REPLICATION_HEADER)
-                .map(|v| v.as_bytes()),
-        )?;
+    match req.extensions_mut().remove::<Authed>() {
+        Some(Authed(caller)) => Ok(caller),
+        None => shared.caller(auth_header(req)),
     }
-    Ok(caller)
+}
+
+/// D335: whether a cluster node's call asked not to wait for its partition's replica acks
+/// (`x-pigeonhole-replication`). Read only on the cluster paths, never in [`caller_of`]: a
+/// single node's calls keep their cost (the serve callgrind shapes, D193).
+fn replication_async<T>(req: &Request<T>) -> Result<bool, ApiError> {
+    super::acks::replication_async(
+        req.metadata()
+            .get(super::acks::REPLICATION_HEADER)
+            .map(|v| v.as_bytes()),
+    )
 }
 
 /// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
@@ -533,7 +534,8 @@ async fn call_served<T>(
     mut req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<(ServiceReply, Option<super::replica::Served>), Status> {
-    let caller = caller_of(shared, &mut req)?;
+    let mut caller = caller_of(shared, &mut req)?;
+    caller.replication_async = replication_async(&req)?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -1189,7 +1191,11 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
         mut req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
     ) -> Result<Response<proto::Empty>, Status> {
         let shared = &self.0;
-        let caller = caller_of(shared, &mut req)?;
+        let mut caller = caller_of(shared, &mut req)?;
+        // D335: a bulk load opted down by the header (a cluster node's only).
+        if shared.router.is_cluster() {
+            caller.replication_async = replication_async(&req)?;
+        }
         let first_budget = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
         let meter = req.extensions().get::<Meter>().cloned().unwrap_or_default();
         let limits = shared.limits;
