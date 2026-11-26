@@ -6,7 +6,7 @@ impl Service {
     /// with the primary's URL in the error.
     pub(crate) async fn call(
         &self,
-        op: ServiceOp,
+        mut op: ServiceOp,
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
@@ -35,7 +35,6 @@ impl Service {
         // map's k decides, never whether a stream is attached now (simp724 on #2236). A
         // transaction's `Commit` waits where it's answered (`commit`), before its outcome
         // is recorded.
-        let mut op = op;
         let waits = match (&held, &self.gate, &self.part) {
             (Some(_), Some(gate), Some(part))
                 if part.acks.k() > 0 && !caller.replication_async && !op.replication_async() =>
@@ -103,31 +102,11 @@ impl Service {
             }
             _ => self.answer(op, caller, budget).await,
         };
-        // D335: the wait, after the commit and before D326's check: until k replicas
-        // acknowledged the commit's own position, the timeout, or the lease's end.
-        if waits && let (Some(gate), Some(part)) = (&self.gate, &self.part) {
-            let seqno = match reply.as_ref().map(committed_seqno) {
-                Ok(Committed::At(s)) => Some(s),
-                // A write whose reply names no seqno (a text, vector or memory write, a
-                // schema change): the node's visible seqno after it returned, at or past
-                // its own, so it may wait longer, never less.
-                Ok(Committed::Unknown) => Some(part.db.visible_seqno()),
-                Ok(Committed::Nothing) | Err(_) => None,
-            };
-            if let Some(seqno) = seqno {
-                match part
-                    .acks
-                    .wait(crate::serve::acks::Pos::commit(seqno), gate)
-                    .await
-                {
-                    Ok(n) => {
-                        if let Ok(r) = &mut reply {
-                            set_replica_acks(r, n);
-                        }
-                    }
-                    Err(e) => reply = Err(e),
-                }
-            }
+        // D335: the wait, after the commit and before D326's check. Boxed, so its state
+        // doesn't widen every call's future (the serve callgrind shapes, D193): only a
+        // write that waits pays for it.
+        if waits {
+            Box::pin(self.wait_for_acks(&mut reply)).await;
         }
         if reply.is_ok() {
             if let Some(h) = &held
@@ -687,6 +666,37 @@ impl Service {
                     .release(&r.snapshot_id, caller.principal)
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }
+        }
+    }
+}
+
+impl Service {
+    /// D335: waits until k replicas acknowledged `reply`'s commit (its own position), the
+    /// timeout, or the lease's end, and sets its `CommitInfo.replica_acks`; an
+    /// `OutcomeUnknown` replaces the reply when the wait ends without them.
+    async fn wait_for_acks(&self, reply: &mut Result<ServiceReply, ApiError>) {
+        let (Some(gate), Some(part)) = (&self.gate, &self.part) else {
+            return;
+        };
+        let seqno = match reply.as_ref().map(committed_seqno) {
+            Ok(Committed::At(s)) => s,
+            // A write whose reply names no seqno (a text, vector or memory write, a schema
+            // change): the node's visible seqno after it returned, at or past its own, so
+            // it may wait longer, never less.
+            Ok(Committed::Unknown) => part.db.visible_seqno(),
+            Ok(Committed::Nothing) | Err(_) => return,
+        };
+        match part
+            .acks
+            .wait(crate::serve::acks::Pos::commit(seqno), gate)
+            .await
+        {
+            Ok(n) => {
+                if let Ok(r) = reply {
+                    set_replica_acks(r, n);
+                }
+            }
+            Err(e) => *reply = Err(e),
         }
     }
 }
