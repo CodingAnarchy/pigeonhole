@@ -54,6 +54,8 @@ serve = [
     "dep:pigeonhole-otel",
     # D317 ticket 2: a forward's refused stream or GOAWAY is retry-safe, told by its h2 reason.
     "dep:h2",
+    # #2212: so is a forward hyper cancelled before it was sent, told by its error's kind.
+    "dep:hyper",
     # `--replica-of` (#1436): the replica side of replication, hidden in the library.
     "pigeonhole/__unstable-replication",
     # D329: a cluster transaction's branches prepare and are decided by the home partition.
@@ -112,6 +114,9 @@ arc-swap = { version = "1", optional = true }
 pigeonhole-io = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 h2 = { version = "0.4", optional = true }
+# `serve` (#2212): a forward's hyper error, cancelled before it was sent. Already in the tree
+# through tonic and hyper-util.
+hyper = { version = "1", optional = true }
 # `serve`: a charged reply's body, which holds its share of --inflight-bytes until written (#1567).
 http-body = { version = "1", optional = true }
 
@@ -144,6 +149,9 @@ tonic = { version = "0.14", default-features = false, features = ["codegen", "ch
 ureq = { version = "3.5", default-features = false, features = ["json"] }
 # `serve`'s test of a gRPC client that never opens its window to its reply (#1567).
 h2 = "0.4"
+# `serve`'s test of a forward hyper cancelled before it was sent (#2212): an HTTP/2 client
+# connection, as tonic's channel makes.
+hyper = { version = "1", features = ["client", "http2"] }
 # `serve`'s idle-limit tests on a paused clock, so a slow runner can't fire a deadline (#1531).
 tokio = { version = "1", features = ["test-util"] }
 # The cluster tests hold a stopped node's port for its restart, bound but not listening

@@ -104,6 +104,30 @@ fn bootstraps_in(dir: &Path) -> usize {
         .count()
 }
 
+/// How long a new replica copy may take to reach Following after its bootstrap (#2219's
+/// Windows CI: 5 s wasn't enough on a loaded runner). A dial to a port that isn't listening
+/// yet takes about 2 s on Windows' runners, and a follow that fails pauses before its next
+/// try, doubling up to the follower's MAX_BACKOFF (10 s).
+const FOLLOW: Duration = Duration::from_secs(30);
+
+/// A replica copy's row as a wait's reason: its state, owner, progress and last error.
+fn copy_why(lp: Option<&LocalPartition>) -> String {
+    lp.map_or_else(
+        || "no copy row".to_owned(),
+        |lp| {
+            format!(
+                "{:?} of {:?}, applied {} of {}, lag {} ms, error {:?}",
+                lp.replica_state(),
+                lp.replica_of,
+                lp.replica_applied_seqno,
+                lp.replica_primary_seqno,
+                lp.replica_lag_ms,
+                lp.error
+            )
+        },
+    )
+}
+
 /// Three nodes in fresh directories, with `r` on p3 (c's), a row in it, and a's replica
 /// copy of p3 following c past that row: the directories, ports and stop handles.
 fn following(
@@ -120,12 +144,16 @@ fn following(
         table_on_p3(ports[0]).await;
         let first = put_in(ports[1], "r", "k1").await;
         set_replicas(ports[0], "p3", &["a"]).await;
-        eventually("a's replica of p3 to follow c", async || {
-            copy_of(ports[0], "p3").await.is_some_and(|lp| {
+        eventually_why(FOLLOW, "a's replica of p3 to follow c", async || {
+            let lp = copy_of(ports[0], "p3").await;
+            if lp.as_ref().is_some_and(|lp| {
                 lp.replica_state() == ReplicaState::Following
                     && lp.replica_of == "c"
                     && lp.replica_applied_seqno >= first
-            })
+            }) {
+                return Ok(());
+            }
+            Err(format!("past {first}: {}", copy_why(lp.as_ref())))
         })
         .await;
     });
@@ -373,10 +401,14 @@ fn a_cut_off_owners_follow_stream_ends_with_its_lease() {
     let c_at = format!("127.0.0.1:{}", ports[2]);
     rt.block_on(async {
         set_replicas(ports[0], "p3", &["a"]).await;
-        eventually("a's replica of p3 to follow c", async || {
-            copy_of(ports[0], "p3").await.is_some_and(|lp| {
+        eventually_why(FOLLOW, "a's replica of p3 to follow c", async || {
+            let lp = copy_of(ports[0], "p3").await;
+            if lp.as_ref().is_some_and(|lp| {
                 lp.replica_state() == ReplicaState::Following && lp.replica_lag_ms < 1000
-            })
+            }) {
+                return Ok(());
+            }
+            Err(copy_why(lp.as_ref()))
         })
         .await;
         super::super::cut_node(&dirs[2], &c_at, &dirs, true);
@@ -404,10 +436,14 @@ fn a_planned_promotion_from_an_owner_fenced_without_its_lease_counts_a_lower_bou
     let c_at = format!("127.0.0.1:{}", ports[2]);
     rt.block_on(async {
         set_replicas(ports[0], "p3", &["a"]).await;
-        eventually("a's replica of p3 to follow c", async || {
-            copy_of(ports[0], "p3").await.is_some_and(|lp| {
+        eventually_why(FOLLOW, "a's replica of p3 to follow c", async || {
+            let lp = copy_of(ports[0], "p3").await;
+            if lp.as_ref().is_some_and(|lp| {
                 lp.replica_state() == ReplicaState::Following && lp.replica_lag_ms < 1000
-            })
+            }) {
+                return Ok(());
+            }
+            Err(copy_why(lp.as_ref()))
         })
         .await;
         super::super::cut_node(&dirs[2], &c_at, &dirs, true);

@@ -632,26 +632,36 @@ fn a_chunk_too_large_for_one_commit_is_cut_smaller_and_the_pack_goes_on() {
 #[test]
 fn a_term_whose_postings_fit_only_one_a_commit_packs_one_a_chunk() {
     let vfs = SimVfs::new(2183);
-    let db = Pigeonhole::open(
-        "/db/text.phdb",
-        Options::default()
-            .vfs(vfs as Arc<_>)
-            .shards(1)
-            .memtable_budget(2 << 20),
-    )
-    .expect("open");
+    let open = |budget: u64| {
+        Pigeonhole::open(
+            "/db/text.phdb",
+            Options::default()
+                .vfs(Arc::clone(&vfs) as Arc<_>)
+                .shards(1)
+                .memtable_budget(budget),
+        )
+        .expect("open")
+    };
+    // 40 documents of "x" 400,000 times, then "omega": each x posting carries about 400 KB
+    // of positions (one-byte deltas), so at a 2 MiB budget a chunk of 8 is refused
+    // (`BatchTooLarge`) and one fits. (At 150,000 a chunk of 8 still fits: checked by
+    // cutting the floor to 8, which this test then fails.) Written at the default budget:
+    // in a 2 MiB arena each document's write waits for a flush, and the simulator's frozen
+    // clock can refuse such a wait as `Busy` on a slow runner (#2209's macOS job; 1 in 72
+    // locally under load). Only the pack needs the small budget.
+    let db = open(64 << 20);
     let (_, plain) = pair(&db, "plain", IndexOptions::new());
     let (_, packed) = pair(&db, "packed", IndexOptions::new());
-    // 40 documents of "x" 400,000 times, then "omega": each x posting carries about 400 KB
-    // of positions (one-byte deltas), so a chunk of 8 is refused (`BatchTooLarge`) and one
-    // fits, as its document's write did. (At 150,000 a chunk of 8 still fits: checked by
-    // cutting the floor to 8, which this test then fails.)
     let body = format!("{}omega", "x ".repeat(400_000));
     for i in 0..40 {
         let doc = format!("d{i:04}").into_bytes();
         plain.put(&doc, &body).unwrap();
         packed.put(&doc, &body).unwrap();
     }
+    db.close().unwrap();
+    let db = open(2 << 20);
+    let plain = Index::open(&db, "plain_text").unwrap();
+    let packed = Index::open(&db, "packed_text").unwrap();
     let stats = packed
         .pack()
         .expect("the pack gets down to one posting a chunk");
