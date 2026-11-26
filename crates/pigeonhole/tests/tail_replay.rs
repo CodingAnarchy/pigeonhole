@@ -199,6 +199,12 @@ fn a_logged_change_on_another_shard_commits_with_the_transaction() {
         .family("f", Family::default())
         .create_if_missing()
         .unwrap();
+    // A table's first tablet lands on shard `id % shards` (simp724: the #2144/#2145 trap).
+    assert_ne!(
+        t.shard_of(b"a"),
+        u.shard_of(b"b"),
+        "the two tables share a shard: create them in another order"
+    );
     let mut txn = db.transaction().unwrap();
     txn.put(&t, b"a", "f", b"q", b"ordinary").push_logged(
         &u,
