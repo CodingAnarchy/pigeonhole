@@ -262,6 +262,29 @@ impl Node {
         if !current.failover || super::schema::writer(&current) != self.id {
             return;
         }
+        // A peer that answered lately without a feature not yet adopted (a mixed-version
+        // window): no fan-out each lease period until its answer ages out (simp724's S2).
+        let missing: Vec<String> = super::status::build_features(&self.dir)
+            .into_iter()
+            .filter(|f| !current.adopted_features.contains(f))
+            .collect();
+        let lacking_lately = {
+            let known = self
+                .peer_features
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            current.nodes.iter().filter(|n| n.id != self.id).any(|n| {
+                known.get(&n.id).is_some_and(|(at, fs)| {
+                    at.elapsed() < PEER_FEATURES_TTL
+                        && fs
+                            .as_ref()
+                            .is_some_and(|fs| missing.iter().all(|f| !fs.contains(f)))
+                })
+            })
+        };
+        if lacking_lately {
+            return;
+        }
         let mut probe = current.clone();
         if !self.adopt_features(&mut probe).await {
             return;
