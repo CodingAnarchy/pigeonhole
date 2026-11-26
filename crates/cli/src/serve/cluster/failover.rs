@@ -516,6 +516,11 @@ pub(crate) fn qualify(
             ));
             continue;
         }
+        // #2154: a range move into P past its commit point needs a copy that holds the range.
+        if let Err(no) = super::promote::target_copy_holds(map, &p.id, lp) {
+            why.push(format!("{r}: {no}"));
+            continue;
+        }
         let stale_by = lp.replica_lag_ms.saturating_sub(since_renewal);
         if stale_by > millis(nanos(HEARTBEAT)) {
             why.push(format!(
@@ -1134,10 +1139,13 @@ mod tests {
         assert!(f.survey_due("p1", 0, 7));
     }
 
-    /// D331: a partition a range move holds from its hand-over on is blocked from failover,
-    /// with the move named; before the hand-over it isn't held by the move.
+    /// D331, with #2154's ruling: a range move at its hand-over (HANDING_OVER) blocks failover
+    /// of both its partitions, with the move named. Before it the move aborts on the epoch
+    /// change instead, and past the commit point it doesn't block the partition as a whole:
+    /// the source may go, and the target only to a copy holding the range, which the
+    /// candidate loop checks (`promote::target_copy_holds`).
     #[test]
-    fn a_range_move_from_its_hand_over_blocks_failover_of_its_source_and_target() {
+    fn a_range_move_at_its_hand_over_blocks_failover_of_its_source_and_target() {
         use proto::{MoveKind, MovePhase, RangeMove};
         let d = down("p1", None);
         let at = |phase: MovePhase, from: &str, to: &str| {
@@ -1158,25 +1166,26 @@ mod tests {
         };
         let none = HashMap::new();
         for (from, to) in [("p1", "p2"), ("p2", "p1")] {
-            for phase in [
-                MovePhase::HandingOver,
-                MovePhase::HandedOver,
-                MovePhase::Cleaning,
-            ] {
-                let why = qualify(&at(phase, from, to), &d.p, None, &none, 0, None).unwrap_err();
-                assert!(why.contains("range move mv1"), "{phase:?}: {why}");
-            }
             let why = qualify(
-                &at(MovePhase::Copying, from, to),
+                &at(MovePhase::HandingOver, from, to),
                 &d.p,
                 None,
                 &none,
                 0,
                 None,
             )
-            .err()
-            .unwrap_or_default();
-            assert!(!why.contains("range move"), "{why}");
+            .unwrap_err();
+            assert!(why.contains("range move mv1"), "{why}");
+            for phase in [
+                MovePhase::Copying,
+                MovePhase::HandedOver,
+                MovePhase::Cleaning,
+            ] {
+                let why = qualify(&at(phase, from, to), &d.p, None, &none, 0, None)
+                    .err()
+                    .unwrap_or_default();
+                assert!(!why.contains("at its hand-over"), "{phase:?}: {why}");
+            }
         }
     }
 

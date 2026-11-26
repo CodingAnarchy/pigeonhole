@@ -402,7 +402,7 @@ fn shrink_moves_the_manifest_a_passing_view_kept_in_place() {
 fn shrink_ends_while_a_view_pins_it_for_the_whole_call() {
     // perf287 on #2199: a view that outlives the call (a long-lived iterator's, say) looks
     // like a passing one to the extra-round check. The call still ends, Ok, within its
-    // rounds and the extra ones (a reclaim frees nothing while the view lives, so none is
+    // usual rounds (a reclaim frees nothing while the view lives, so no extra one is
     // added), and a later call, once the view is gone, shrinks the file.
     let vfs = SimVfs::new(21992);
     let rig = Rig::open(&vfs);
@@ -413,7 +413,8 @@ fn shrink_ends_while_a_view_pins_it_for_the_whole_call() {
     count_rounds(db, &rounds);
     db.shrink().unwrap();
     let n = rounds.load(Ordering::Relaxed);
-    assert!((1..=12).contains(&n), "{n} rounds");
+    // A reclaim frees nothing while the view lives, so no extra round runs.
+    assert!((1..=8).contains(&n), "{n} rounds");
     assert!(file_len(&vfs) <= before);
     drop(view);
     db.shrink().unwrap();

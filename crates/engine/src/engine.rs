@@ -1944,7 +1944,16 @@ impl Engine {
                     presize.push((wal.spares(), opts.retain_segments));
                 }
                 let _ = shared.metrics[i].wal.set(wal.counters());
-                note_feed_marks(&shared, i, &wal);
+                // A feed's start on a stream holding a share in doubt begins at or before
+                // it (#2189).
+                let held = in_doubt.iter().any(|(s, ..)| *s == stream).then(|| {
+                    catalog
+                        .checkpoints
+                        .get(&stream)
+                        .copied()
+                        .unwrap_or_default()
+                });
+                note_feed_marks(&shared, i, &wal, held);
                 states[i].set_wal(Box::new(wal));
                 have_wal[i] = true;
             }
@@ -2012,7 +2021,7 @@ impl Engine {
                         presize.push((wal.spares(), opts.retain_segments));
                     }
                     let _ = shared.metrics[i].wal.set(wal.counters());
-                    note_feed_marks(&shared, i, &wal);
+                    note_feed_marks(&shared, i, &wal, None);
                     states[i].set_wal(Box::new(wal));
                     states[i].set_recovery_state(
                         catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect(),
@@ -2044,7 +2053,7 @@ impl Engine {
                 presize.push((wal.spares(), wal_opts.retain_segments));
             }
             let _ = shared.metrics[stream.0 as usize].wal.set(wal.counters());
-            note_feed_marks(&shared, stream.0 as usize, &wal);
+            note_feed_marks(&shared, stream.0 as usize, &wal, None);
             states[stream.0 as usize].set_wal(Box::new(wal));
         }
         // Before any shard takes a write (D157 amendment, ICR 0130).
@@ -5085,14 +5094,25 @@ fn preallocate_wal(streams: &[(SpareSegments, u32)], pin_bytes: u64) -> Result<(
     })
 }
 
-/// Registers a stream's feed marks with the change feed (D310), when it is on.
-fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
+/// Registers a stream's feed marks with the change feed (D310), when it is on. `in_doubt`:
+/// the checkpoint the stream recovered from, when it holds a share in doubt (D329).
+fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream, in_doubt: Option<Lsn>) {
     if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {
         // The start of the stream's first segment of this open: every record before it has
         // a key below the allocator's start (the reader's start bound, D310 PR 3). For a new
         // stream that is the start of its only segment, so nothing counts as dropped.
+        //
+        // Not with a share in doubt from an earlier session (#2189): its PREPARE is before
+        // that segment, and its key, its Decision's apply seqno, will be above the start. A
+        // start past it would hold no share when the Decision comes, and expire as a gap.
+        // From the checkpoint the stream recovered from instead: every record before it was
+        // applied in an earlier session, so its key is below the start too, and the share is
+        // after it (the checkpoint never passes a record still needed, simp724 on #2189). The
+        // share is logged on its shard again, so no checkpoint of this open passes it either
+        // until it's decided, as in the session that prepared it.
         let key = shared.shm.next_seqno().saturating_sub(1);
-        feed.note_checkpoint(stream, Lsn::new(marks.head(), 0), key);
+        let at = in_doubt.unwrap_or(Lsn::new(marks.head(), 0));
+        feed.note_checkpoint(stream, at, key);
         // Published in shared memory too, for change feeds in any process (layout version
         // 8, D310 PR 4). Before the shard runs, so the first publication races no store.
         marks.set_mirror(Box::new(ShmMarks {

@@ -143,6 +143,14 @@ impl Node {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         gate.ranges()
             .load_rows(ranges::read_moved(db)?, ranges::read_serving(db)?);
+        // #2153 (simp724's P1 and Q1 on #2214): past every cell a move copied into this
+        // file, before anything here serves: a target opening after its move left the map
+        // (it never settled the move), or a promoted copy of one that did (the floor isn't
+        // replicated, the `newest/<id>` rows are, with the cells).
+        super::range_follow::raise_floor(
+            db,
+            super::range_follow::newest_of_all(db).map_err(|e| e.message)?,
+        )?;
         let raised = match self.get_map() {
             Ok(map) => {
                 // D331 PR 5: its drop rows (an abort's reconcile, a cleanup) before it serves.
@@ -406,6 +414,12 @@ impl Node {
                 final_seqno: m.final_seqno,
                 token: token.unwrap_or_default(),
             };
+            // D331, #2153: past every timestamp the move wrote here, before the gate opens
+            // the range, so a default-stamped write it takes there sorts after them all,
+            // whatever the two nodes' clocks. Durable before the serving row; a crash
+            // between the two raises it again (a raise to a floor already past is a no-op).
+            let newest = super::range_follow::newest_ts(db, &m.id).map_err(|e| e.message)?;
+            super::range_follow::raise_floor(db, newest)?;
             ranges::write_serving(db, &row)?;
             gate.ranges().add_serving(row);
         }

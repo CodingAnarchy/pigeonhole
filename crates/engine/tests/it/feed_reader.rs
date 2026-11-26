@@ -620,6 +620,160 @@ fn an_external_share_in_doubt_keeps_an_idle_feed_idle() {
     db.close().unwrap();
 }
 
+/// #2189: opens a database, prepares external round `x1` with a single before and after
+/// it, and reopens it `reopens` times with the round in doubt: after a clean close, or after
+/// a power loss (`power`; the round and the singles are `GroupSync`, so they survive it).
+/// The round's shares are on both tables' shards, or with `one` only on `a`'s, so the other
+/// stream holds no share in doubt. The database, its tables, and the single after the
+/// prepare.
+fn in_doubt_across(
+    vfs: &Arc<SimVfs>,
+    reopens: usize,
+    power: bool,
+    one: bool,
+) -> (Arc<Engine>, Arc<TableInfo>, Arc<TableInfo>, Seqno) {
+    let mut db = open(vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    let before = single(&db, &a, b"before", Durability::GroupSync);
+    let mut txn = db.begin().unwrap();
+    for t in if one { vec![&a] } else { vec![&a, &b] } {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    let after = single(&db, &b, b"after", Durability::GroupSync);
+    assert!(after > before);
+    for _ in 0..reopens {
+        if power {
+            vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+            drop(db);
+        } else {
+            db.close().unwrap();
+        }
+        db = open(vfs, Some(feed(1 << 20)));
+    }
+    (db, a, b, after)
+}
+
+/// #2189: a feed that starts while an external round is in doubt gets the round's commit,
+/// whole, when it's decided: in the session that prepared it, and after one or two reopens,
+/// clean or after a power loss (the share's PREPARE is then in an earlier session's
+/// segments, before the start's stream position unless the start begins at or before it).
+/// For each fresh start, with the round on both streams or on one (each stream's start is
+/// chosen on its own).
+#[test]
+fn a_fresh_start_with_a_share_in_doubt_gets_its_commit_across_reopens() {
+    for reopens in 0..=2 {
+        for power in [false, true] {
+            if power && reopens == 0 {
+                continue;
+            }
+            for one in [false, true] {
+                for kind in ["now", "snapshot", "after"] {
+                    let case = format!(
+                        "{kind} after {reopens} reopen(s), power {power}, one stream {one}"
+                    );
+                    let vfs = SimVfs::new(3207);
+                    let (db, a, b, after) = in_doubt_across(&vfs, reopens, power, one);
+                    let start = match kind {
+                        "now" => FeedStart::Now,
+                        "snapshot" => FeedStart::Snapshot(db.snapshot().unwrap()),
+                        _ => FeedStart::After(after),
+                    };
+                    let mut r = db.feed(spec(&[&a, &b], start)).unwrap();
+                    let decided = db.decide(b"x1", true).unwrap().expect("in doubt");
+                    let c = match r.wait(WAIT).unwrap() {
+                        Next::Commit(c) => c,
+                        other => panic!("{case}: {other:?}"),
+                    };
+                    assert_eq!(c.seqno, decided.seqno, "{case}");
+                    let shares = if one { 1 } else { 2 };
+                    assert_eq!(rows(c), vec![b"held".to_vec(); shares], "{case}");
+                    // Nothing else: the singles are at or below every start's bound.
+                    assert!(
+                        matches!(r.try_next().unwrap(), Next::Pending),
+                        "{case}: more"
+                    );
+                    drop(r);
+                    db.close().unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// #2189: a token taken at a fresh start after a reopen, with an external round in doubt,
+/// resumes before the share: a reader resuming it after the decide (and after another
+/// reopen) gets the commit.
+#[test]
+fn a_token_from_a_fresh_start_after_a_reopen_resumes_before_a_share_in_doubt() {
+    let vfs = SimVfs::new(3208);
+    let (db, a, b, _) = in_doubt_across(&vfs, 1, false, false);
+    let token = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap().token();
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt");
+    for reopen in [false, true] {
+        let db = if reopen {
+            db.close().unwrap();
+            open(&vfs, Some(feed(1 << 20)))
+        } else {
+            Arc::clone(&db)
+        };
+        let mut r = db
+            .feed(spec(&[&a, &b], FeedStart::Token(token.clone())))
+            .unwrap();
+        assert_eq!(next(&mut r).seqno, decided.seqno, "reopen {reopen}");
+        drop(r);
+        if reopen {
+            db.close().unwrap();
+        }
+    }
+}
+
+/// #2189: a share in doubt from a session that didn't feed (the feed turned on across the
+/// reopen) is outside the feed's history: its commit still expires a fresh start, as a gap
+/// a session that didn't feed wrote, never a commit missing its share.
+#[test]
+fn a_share_in_doubt_from_a_session_without_the_feed_expires_a_fresh_start() {
+    let vfs = SimVfs::new(3209);
+    let db = open(&vfs, None);
+    let (a, b) = tables(&db);
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    db.decide(b"x1", true).unwrap().expect("in doubt");
+    match r.wait(WAIT).unwrap() {
+        Next::Expired(e) => assert!(
+            format!("{e:?}").contains("a session that did not feed these tables"),
+            "{e:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
 /// Every commit a feed delivers until nothing more comes within a short wait.
 fn drain_seqnos(r: &mut FeedReader) -> Vec<Seqno> {
     let mut got = Vec::new();
@@ -693,6 +847,111 @@ fn oldest_after_reopens_starts_at_the_oldest_session_kept() {
     let later = single(&db, &a, b"a4", Durability::GroupSync);
     assert_eq!(next(&mut r).seqno, later);
     drop(r);
+    db.close().unwrap();
+}
+
+/// #2190: an `Oldest` start never begins in an earlier session that opened with an
+/// external share in doubt. Here the share is prepared while the feed is off (so its
+/// session isn't in the history), decided in the next session, and a single follows it
+/// there; a third session subscribes from the oldest. Starting in the second session would
+/// pass the share over, and its Decision, read in a session before the current one, would
+/// look like a round recovery dropped: the commit passed over silently, the single after
+/// it delivered. The start is later instead, and nothing is skipped.
+#[test]
+fn oldest_never_starts_in_a_session_that_opened_with_a_share_in_doubt() {
+    let vfs = SimVfs::new(3210);
+    let db = open(&vfs, None);
+    let (a, b) = tables(&db);
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let early = single(&db, &a, b"early", Durability::GroupSync);
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    let late = single(&db, &a, b"late", Durability::GroupSync);
+    assert!(early < decided && decided < late);
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let got = drain_seqnos(&mut r);
+    assert!(
+        !got.contains(&late) || got.contains(&decided),
+        "the commit was passed over: {got:?} (decided {decided})"
+    );
+    assert!(
+        got.iter().all(|&s| s > late),
+        "a later start, past the second session: {got:?}"
+    );
+    let now = single(&db, &b, b"now", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, now);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// #2196: a feed that expired on a gap (here a round whose share was logged with the feed
+/// off, outside its history) keeps its position before the round: a token taken from it
+/// after the expiry resumes into the same gap and expires again, as one taken before does,
+/// in the same session and after a reopen. Never the next commit as if nothing was missing.
+#[test]
+fn a_token_taken_after_a_gap_expiry_never_resumes_past_the_gap() {
+    let vfs = SimVfs::new(3211);
+    let db = open(&vfs, None);
+    let (a, b) = tables(&db);
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    db.close().unwrap();
+    let mut db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let before = r.token();
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    assert!(matches!(r.wait(WAIT).unwrap(), Next::Expired(_)));
+    let after = r.token();
+    drop(r);
+    single(&db, &a, b"later", Durability::GroupSync);
+    for reopen in [false, true] {
+        if reopen {
+            db.close().unwrap();
+            db = open(&vfs, Some(feed(1 << 20)));
+        }
+        for (name, token) in [("before", &before), ("after", &after)] {
+            let mut t = db
+                .feed(spec(&[&a, &b], FeedStart::Token(token.clone())))
+                .unwrap();
+            match t.wait(WAIT).unwrap() {
+                Next::Expired(e) => assert!(
+                    format!("{e:?}").contains(&format!("before seqno {decided}")),
+                    "token taken {name} the expiry, reopen {reopen}: {e:?}"
+                ),
+                other => panic!("token taken {name} the expiry, reopen {reopen}: {other:?}"),
+            }
+        }
+    }
     db.close().unwrap();
 }
 

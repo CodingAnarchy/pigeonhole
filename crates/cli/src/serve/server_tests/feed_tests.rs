@@ -191,7 +191,14 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
 
 /// A client that takes nothing: its buffer fills, then the stream ends with
 /// `DeadlineExceeded` after `--stream-idle-ms`. The events it buffered come first, in order.
-fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Vec<u64>, Vec<u64>) {
+/// Returns the commits it held, every commit written, and how many events it held in all:
+/// besides commits, a quiet moment between two writes may buffer a progress event, which
+/// takes a place too (#2211).
+fn stalled_feed(
+    client_events: usize,
+    client_bytes: usize,
+    writes: usize,
+) -> (Vec<u64>, Vec<u64>, usize) {
     let mut l = limits();
     l.stream_idle = Duration::from_millis(300);
     l.feed_client_events = client_events;
@@ -202,10 +209,19 @@ fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Ve
         .map(|i| write_row(&s, format!("r{i:04}").as_bytes()))
         .collect();
     std::thread::sleep(Duration::from_millis(900));
-    let mut got = Vec::new();
+    let (mut got, mut events) = (Vec::new(), 0);
     loop {
         match next_event(&s, &mut stalled, Duration::from_secs(5)) {
-            Some(Ok(e)) => got.extend(commit_of(&e).map(|(n, _)| n)),
+            Some(Ok(e)) => {
+                events += 1;
+                match commit_of(&e) {
+                    Some((n, _)) => got.push(n),
+                    None => assert!(
+                        matches!(e.event, Some(proto::feed_event::Event::Progress(_))),
+                        "{e:?}"
+                    ),
+                }
+            }
             Some(Err(e)) => {
                 assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
                 assert!(e.message.contains("--stream-idle-ms"), "{e:?}");
@@ -222,18 +238,20 @@ fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Ve
         text.contains("pigeonhole_serve_feed_idle_drops_total 1\n"),
         "{text}"
     );
-    (got, written)
+    (got, written, events)
 }
 
 #[test]
 fn a_feed_client_that_takes_nothing_fills_its_buffer_then_times_out() {
     // The buffer's bound is its bytes, each event charged at least 64 (#1737's F3-0): its
     // places may each hold a batch. 8 KiB holds at most 128 events, so 200 writes overflow
-    // it however the client's reads batch them, and the 64 places hold at least 64.
-    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, 8 << 10, 200);
+    // it however the client's reads batch them, and the 64 places hold at least 64. Those
+    // are events, not only commits: a progress event in a quiet moment takes a place too
+    // (#2211, a slow runner's 60 commits).
+    let (got, written, events) = stalled_feed(super::feed::CLIENT_EVENTS, 8 << 10, 200);
     assert!(
-        (super::feed::CLIENT_EVENTS..=128).contains(&got.len()),
-        "{} events buffered",
+        (super::feed::CLIENT_EVENTS..=128).contains(&events),
+        "{events} events buffered, {} of them commits",
         got.len()
     );
     assert_eq!(got, written[..got.len()], "the full buffer, in order");
@@ -242,7 +260,7 @@ fn a_feed_client_that_takes_nothing_fills_its_buffer_then_times_out() {
 #[test]
 fn a_feed_clients_buffer_is_bounded_by_bytes_too() {
     // About 100 bytes an event: a 1 KiB buffer holds far fewer than 64 of them.
-    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, 1024, 100);
+    let (got, written, _) = stalled_feed(super::feed::CLIENT_EVENTS, 1024, 100);
     assert!(
         !got.is_empty() && got.len() < 16,
         "{} events buffered",

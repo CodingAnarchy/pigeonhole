@@ -152,6 +152,12 @@ impl Drops {
                     .iter()
                     .any(|t| t.name == table && map::inside(t, &start, end.as_deref(), partition));
             if finished {
+                // #2153 (audit120's and simp724's P1 on #2214): a target that never took
+                // the move's CLEANING map never raised its floor in the settle; it does
+                // before its progress rows go, and before the gate opens the range (the
+                // settle after this, on this map, opens it).
+                let newest = super::range_follow::newest_ts(db, &id).map_err(|e| e.message)?;
+                super::range_follow::raise_floor(db, newest)?;
                 super::range_follow::prune(db, &id).map_err(|e| e.message)?;
                 continue;
             }

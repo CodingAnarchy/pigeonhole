@@ -615,8 +615,12 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
             said = phase;
             stop_at(args, phase)?;
         }
-        let (s_lp, s) = wait.ask(side(args, &m, &r.from, id)).await??;
-        let (t_lp, t) = wait.ask(side(args, &m, &r.to, id)).await??;
+        // Past the commit point a side whose node doesn't answer is no answer, not a stop
+        // (#2154, the coordinator's ruling): HANDED_OVER takes `never_both`'s majority path
+        // without S, and CLEANING doesn't need T. Before it, the move still needs both.
+        let past = map::committed(phase);
+        let (s_lp, s) = answered(wait.ask(side(args, &m, &r.from, id)).await?, past)?;
+        let (t_lp, t) = answered(wait.ask(side(args, &m, &r.to, id)).await?, past)?;
         if map::before_commit(phase)
             && let Some(why) = abort_reason(&m, &r, s.as_ref(), t.as_ref())
         {
@@ -734,7 +738,12 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
                     remove(args, id).await?;
                     return Ok(());
                 }
-                wait.tick("the source drops its copy").await?;
+                wait.tick(if s_lp.is_some() {
+                    "the source drops its copy"
+                } else {
+                    "the source's node doesn't answer: its copy is dropped once it's back"
+                })
+                .await?;
             }
             MovePhase::Aborting => {
                 abort_record(args, &r, timeout).await?;
@@ -746,6 +755,16 @@ async fn drive(args: &NodeArgs, id: &str, timeout: Option<Duration>) -> Result<(
                 )));
             }
         }
+    }
+}
+
+/// A side's answer in [`drive`]: past the commit point (`past`), a node that doesn't answer
+/// counts as no line and no status, and the phase goes on with the nodes that answer.
+type Side = (Option<LocalPartition>, Option<MoveStatus>);
+fn answered(r: Result<Side, Failure>, past: bool) -> Result<Side, Failure> {
+    match r {
+        Err(_) if past => Ok((None, None)),
+        r => r,
     }
 }
 
