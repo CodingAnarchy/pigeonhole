@@ -398,6 +398,11 @@ impl Node {
                 self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
                     .await?;
             }
+            // And the first use of D336's failover event fields.
+            if !map::uses_tail_replay(&current) && map::uses_tail_replay(&map) {
+                self.every_node_keeps(&map, TAIL_REPLAY_FEATURE, TAIL_REPLAY_WHAT)
+                    .await?;
+            }
             if !uses_replica_acks(&current) && uses_replica_acks(&map) {
                 self.every_node_keeps(&map, REPLICA_ACK_WAIT_FEATURE, "a partition's replica_acks")
                     .await?;
@@ -445,6 +450,10 @@ impl Node {
             }
             if map::uses_balancer(&map) {
                 self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
+                    .await?;
+            }
+            if map::uses_tail_replay(&map) {
+                self.every_node_keeps(&map, TAIL_REPLAY_FEATURE, TAIL_REPLAY_WHAT)
                     .await?;
             }
             if uses_replica_acks(&map) {

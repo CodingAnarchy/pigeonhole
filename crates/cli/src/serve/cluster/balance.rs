@@ -35,7 +35,8 @@
 //! action (simp724).
 //!
 //! **Never a candidate** (simp724's S1, ai1249's (4)): a pinned partition; one in any range
-//! move's record, as source or target; one with in-doubt shares; for a split or merge, a
+//! move's record, as source or target; one with in-doubt shares; one with an old owner's tail
+//! pending (D336, named in the pass's reason); for a split or merge, a
 //! table in a co-location group or one an index follows. A partition holding a pinned range
 //! (`TablePlacement.pinned_ranges`) never moves or merges, and never splits inside the pin
 //! (ai1249's M2 on #2103). A split key lies strictly inside one of P's own ranges in the map,
@@ -133,6 +134,9 @@ pub(crate) struct PartView {
     pub(crate) history: Vec<(Kind, u64)>,
     /// It's in a range move's record, or has in-doubt shares: never a candidate (S1).
     pub(crate) busy: bool,
+    /// D336: an old owner's tail of it is pending: no move, split or merge names it until the
+    /// tail is replayed or discarded, and the pass says so.
+    pub(crate) tail_pending: bool,
     /// A table here is in a co-location group, or followed by an index: never split or
     /// merged (ai1249's (4)).
     pub(crate) whole_only: bool,
@@ -587,7 +591,7 @@ pub(crate) fn decide(
     let count = stats.len() as f64;
     let mean_load = stats.iter().map(|s| s.1).sum::<f64>() / count;
     let mean_size = stats.iter().map(|s| s.2).sum::<f64>() / count;
-    let eligible = |p: &PartView| !p.pinned && !p.busy && is_fresh(&p.node);
+    let eligible = |p: &PartView| !p.pinned && !p.busy && !p.tail_pending && is_fresh(&p.node);
     // The coldest fresh node by the measure, other than `not`, holding none of `avoid`.
     let coldest = |counters: &Counters, by_load: bool, not: &str, avoid: &[String]| {
         stats
@@ -602,6 +606,16 @@ pub(crate) fn decide(
             .map(|(n, _, _)| n.id.clone())
     };
     let mut skip: Option<String> = None;
+    // D336 (ai1249 on #2239): a partition with an old owner's tail pending is no source or
+    // target of anything (`eligible`), and the pass names it, as a merge into it would be
+    // refused at its first move.
+    if let Some(p) = parts.iter().find(|p| p.tail_pending) {
+        skip = Some(format!(
+            "{} has an old owner's tail pending: no split, move or merge names it until the \
+             tail is replayed or discarded",
+            p.id
+        ));
+    }
 
     // 1. Splits.
     for p in parts.iter().filter(|p| eligible(p)) {
@@ -940,6 +954,39 @@ mod tests {
             partition_min_bytes: 0,
             ..Bounds::default()
         }
+    }
+
+    /// D336 (ai1249 on #2239): a small, cold partition next to one with an old owner's tail
+    /// pending isn't merged into it, nor is the tail's partition merged, moved or split; the
+    /// pass says why.
+    #[test]
+    fn a_partition_with_a_pending_tail_is_no_merge_or_move_end() {
+        let nodes = [node("a"), node("b")];
+        let b = Bounds::default();
+        let mut small = part("p1", "a", 0.001, 1 << 20);
+        small.neighbours = vec!["p2".into()];
+        // One on each node, equally loaded: no node is over its bound.
+        let mut held = part("p2", "b", 0.001, 1 << 20);
+        held.neighbours = vec!["p1".into()];
+        held.tail_pending = true;
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(
+            &nodes,
+            &[small.clone(), held.clone()],
+            &b,
+            &mut c,
+            &mut t,
+            10,
+        );
+        let Decision::Skip(why) = d else {
+            panic!("{d:?}");
+        };
+        assert!(why.contains("p2 has an old owner's tail pending"), "{why}");
+        // Once it isn't pending, the merge goes ahead.
+        held.tail_pending = false;
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &[small, held], &b, &mut c, &mut t, 10);
+        assert!(matches!(d, Decision::Act(Action::Merge { .. }, _)), "{d:?}");
     }
 
     #[test]

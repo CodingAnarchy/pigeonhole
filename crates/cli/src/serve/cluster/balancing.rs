@@ -286,6 +286,9 @@ pub(crate) fn views(
                     .filter_map(|h| kind_of(h.kind()).map(|k| (k, h.at_ms)))
                     .collect(),
                 busy: map.moves.iter().any(|m| m.from == p.id || m.to == p.id) || in_doubt(&p.id),
+                // D336 (ai1249 on #2239): no move, split or merge names it while its old
+                // owner's tail is pending; `decide` says so.
+                tail_pending: super::map::pending_tail(map, &p.id).is_some(),
                 whole_only,
                 tablets: Vec::new(),
                 neighbours,
@@ -1651,6 +1654,49 @@ mod tests {
     /// #2158 item 1: a node that answered, but without numbers for a partition the map
     /// places on it (closed, opening, or missing from its Status), isn't fresh, and says
     /// why. A fenced partition is still measured.
+    /// D336 (ai1249 on #2239): the balancer's view marks a partition with an old owner's tail
+    /// pending; another isn't.
+    #[test]
+    fn a_partition_with_a_pending_tail_is_marked_for_the_balancer() {
+        use super::proto::{FailoverEvent, NodeStatus, Partition, TailState};
+        use std::collections::HashMap;
+        let part = |id: &str| Partition {
+            id: id.into(),
+            node: "a".into(),
+            epoch: 2,
+            ..Default::default()
+        };
+        let mut e = FailoverEvent {
+            partition: "p2".into(),
+            from: "b".into(),
+            to: "a".into(),
+            to_epoch: 2,
+            fork_token: b"fork".to_vec().into(),
+            ..Default::default()
+        };
+        e.set_tail_state(TailState::Pending);
+        let map = ClusterMap {
+            nodes: vec![super::proto::Node {
+                id: "a".into(),
+                ..Default::default()
+            }],
+            partitions: vec![part("p1"), part("p2")],
+            failovers: vec![e],
+            ..Default::default()
+        };
+        let statuses: HashMap<String, NodeStatus> = HashMap::new();
+        let (_, parts) = super::views(&map, &statuses, |_| false);
+        let tail = |id: &str| {
+            parts
+                .iter()
+                .find(|p| p.id == id)
+                .expect("a partition")
+                .tail_pending
+        };
+        assert!(tail("p2"));
+        assert!(!tail("p1"));
+    }
+
     #[test]
     fn a_node_is_fresh_only_with_numbers_for_every_partition_placed_on_it() {
         use super::proto::{LocalPartition, LocalPartitionState as S, NodeStatus};
