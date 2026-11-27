@@ -974,6 +974,17 @@ pub(crate) fn below_adopted(lacked: &[String]) -> String {
     )
 }
 
+/// Whether `m` uses any of D336's failover event fields (#2148): what needs `tail_replay` on
+/// every node.
+pub(crate) fn uses_tail_replay(m: &ClusterMap) -> bool {
+    m.failovers.iter().any(|e| {
+        !e.fork_token.is_empty()
+            || e.tail_state() != crate::serve::proto::TailState::Unspecified
+            || e.from_history_epoch != 0
+            || e.from_epoch != 0
+    })
+}
+
 /// Whether `m` uses any of D330's failover fields: what needs `writer_terms` on every node.
 pub(crate) fn uses_failover(m: &ClusterMap) -> bool {
     m.failover
@@ -1068,6 +1079,14 @@ fn validate_pending_failovers(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         let same = |n: &crate::serve::proto::FailoverEvent| {
             let mut a = n.clone();
             a.state = e.state;
+            // D336: the map that finishes a promote records its old owner's tail in its
+            // event (the fork token and the old file's epochs), so those may be set then.
+            if n.state() == S::Done {
+                a.fork_token = e.fork_token.clone();
+                a.tail_state = e.tail_state;
+                a.from_history_epoch = e.from_history_epoch;
+                a.from_epoch = e.from_epoch;
+            }
             a == *e
         };
         let ok = match now {
@@ -1280,6 +1299,8 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         used.extend(i.partitions.iter().map(String::as_str));
     }
     validate_move_steps(old, new)?;
+    validate_tail_holds(old, new)?;
+    validate_tail_events(old, new)?;
     let new_partitions: HashMap<&str, _> =
         new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
     for p in &old.partitions {
@@ -1317,6 +1338,137 @@ fn pending_promote<'m>(
 /// before HANDED_OVER (an abort) or from CLEANING (done), never in HANDED_OVER. The step to
 /// HANDED_OVER names this map as the hand-over and raises the source's epoch (by one, or past a promote's floor: [`super::promote::next_epoch`]), on
 /// the same node (S1).
+/// D336 (#2148), the owner's Q4: a partition with an old owner's tail PENDING keeps its
+/// node, history and ranges until the tail is replayed or discarded (simp724's P1 on #2239:
+/// the replay writes P's rows where they are now). Its epoch is raised only by a promote's
+/// own map (the event that map finishes is its); a relocate, a restore, and the hand-over
+/// of a range move naming P (as its source or its target) are refused. No move naming P
+/// starts either ([`validate_move_steps`]).
+fn validate_tail_holds(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    use crate::serve::proto::{FailoverKind as K, FailoverState as St};
+    for o in &old.partitions {
+        let Some(e) = pending_tail(old, &o.id) else {
+            continue;
+        };
+        let refused = |what: &str| {
+            format!(
+                "partition {:?} has an old owner's tail pending (node {:?}'s, from its failover \
+                 to node {:?} at epoch {}): {what} until the tail is replayed or discarded",
+                o.id, e.from, e.to, e.to_epoch
+            )
+        };
+        // A hand-over naming P moves rows into or out of it under the replay.
+        if new.moves.iter().any(|m| {
+            !node_move(m)
+                && (m.from == o.id || m.to == o.id)
+                && phase(m) == MovePhase::HandedOver
+                && old
+                    .moves
+                    .iter()
+                    .any(|q| q.id == m.id && phase(q) == MovePhase::HandingOver)
+        }) {
+            return Err(refused("no range move naming it hands over"));
+        }
+        let Some(n) = new.partitions.iter().find(|p| p.id == o.id) else {
+            continue;
+        };
+        if n.epoch == o.epoch && n.node == o.node {
+            continue;
+        }
+        let promote = new.failovers.iter().any(|f| {
+            f.kind() == K::Partition
+                && f.partition == o.id
+                && f.to == n.node
+                && f.to_epoch == n.epoch
+                && f.state() == St::Done
+                && old.failovers.iter().any(|g| {
+                    g.partition == f.partition
+                        && g.to == f.to
+                        && g.to_epoch == f.to_epoch
+                        && g.state() == St::Pending
+                })
+        });
+        if !promote {
+            return Err(refused("it keeps its node and history"));
+        }
+    }
+    Ok(())
+}
+
+/// D336 (cli692's S1 on #2239): an old owner's recorded tail is the map writer's, as its term
+/// is, so no map loses or rewrites one. Matched by partition, node and `to_epoch`:
+/// - a PENDING tail's event stays, with its fork token and the old file's epochs; its state
+///   only leaves PENDING, for DONE or DISCARDED (a replay, a discard or the cap of 4), when
+///   its token may be cleared;
+/// - a tail out of PENDING never changes again (its event may go, past the ring);
+/// - a new event carries no tail: only the map that finishes a pending promote records one
+///   ([`validate_failover_fields`]' finishing map).
+fn validate_tail_events(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    use crate::serve::proto::TailState as T;
+    let key = |e: &crate::serve::proto::FailoverEvent| {
+        (e.kind, e.partition.clone(), e.to.clone(), e.to_epoch)
+    };
+    let tailless = |e: &crate::serve::proto::FailoverEvent| {
+        e.tail_state() == T::Unspecified
+            && e.fork_token.is_empty()
+            && e.from_history_epoch == 0
+            && e.from_epoch == 0
+    };
+    for e in &old.failovers {
+        let now = new.failovers.iter().find(|n| key(n) == key(e));
+        let ok = match (e.tail_state(), now) {
+            (T::Unspecified, _) => true,
+            (T::Pending, None) => false,
+            (T::Pending, Some(n)) => {
+                n.from_history_epoch == e.from_history_epoch
+                    && n.from_epoch == e.from_epoch
+                    && match n.tail_state() {
+                        T::Pending => n.fork_token == e.fork_token,
+                        T::Done | T::Discarded => {
+                            n.fork_token.is_empty() || n.fork_token == e.fork_token
+                        }
+                        _ => false,
+                    }
+            }
+            (_, None) => true,
+            (_, Some(n)) => {
+                n.tail_state == e.tail_state
+                    && n.fork_token == e.fork_token
+                    && n.from_history_epoch == e.from_history_epoch
+                    && n.from_epoch == e.from_epoch
+            }
+        };
+        if !ok {
+            return Err(format!(
+                "the map drops or rewrites partition {:?}'s old owner's tail (its failover to \
+                 node {:?} at epoch {}): a tail is the map's writer's to keep; it only leaves \
+                 PENDING, by a replay or a discard",
+                e.partition, e.to, e.to_epoch
+            ));
+        }
+    }
+    for n in &new.failovers {
+        if !tailless(n) && !old.failovers.iter().any(|e| key(e) == key(n)) {
+            return Err(format!(
+                "a new failover event of partition {:?} carries an old owner's tail: only the \
+                 map that finishes a pending promote records one",
+                n.partition
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The oldest failover event of `partition` in `m` whose old owner's tail is PENDING (D336).
+pub(crate) fn pending_tail<'a>(
+    m: &'a ClusterMap,
+    partition: &str,
+) -> Option<&'a crate::serve::proto::FailoverEvent> {
+    m.failovers.iter().find(|e| {
+        e.partition == partition && e.tail_state() == crate::serve::proto::TailState::Pending
+    })
+}
+
 fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
     let before: HashMap<&str, &RangeMove> = old.moves.iter().map(|m| (m.id.as_str(), m)).collect();
     let after: HashSet<&str> = new.moves.iter().map(|m| m.id.as_str()).collect();
@@ -1346,6 +1498,16 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
                         "move {id:?} can't start while partition {p:?} has a pending promote \
                          (to node {:?} at epoch {}): finish or abandon it first",
                         e.to, e.to_epoch
+                    ));
+                }
+                // Nor while an old owner's tail of it is pending (D336, the owner's Q4): the
+                // replay writes P's rows where the map has them now.
+                if let Some(e) = pending_tail(new, p) {
+                    return Err(format!(
+                        "move {id:?} can't start while partition {p:?} has an old owner's tail \
+                         pending (node {:?}'s, from its failover to node {:?} at epoch {}): \
+                         replay it or discard it first",
+                        e.from, e.to, e.to_epoch
                     ));
                 }
             }
@@ -2556,6 +2718,138 @@ mod tests {
     }
 
     /// A pending promote of `p` to `to` at `to_epoch` (D330 PR 2).
+    /// A finished promote of `p` to `to` at `to_epoch` whose old owner's tail is PENDING
+    /// (D336).
+    fn tail(p: &str, to: &str, to_epoch: u64) -> crate::serve::proto::FailoverEvent {
+        let mut e = pending(p, to, to_epoch);
+        e.set_state(crate::serve::proto::FailoverState::Done);
+        e.set_tail_state(crate::serve::proto::TailState::Pending);
+        e.fork_token = b"fork".to_vec().into();
+        e
+    }
+
+    /// D336, the owner's Q4: no move of a partition starts while an old owner's tail of it
+    /// is pending; a replayed or discarded one is no bar.
+    #[test]
+    fn a_move_doesnt_start_while_an_old_owners_tail_is_pending() {
+        for p in ["p1", "p2"] {
+            let epoch = map().partitions.iter().find(|q| q.id == p).unwrap().epoch;
+            let mut old = map();
+            old.failovers.push(tail(p, "a", epoch));
+            let mut new = moving(MovePhase::Copying);
+            new.map_version = old.map_version + 1;
+            new.failovers = old.failovers.clone();
+            refused(validate_change(&old, &new), "old owner's tail");
+            for done in [
+                crate::serve::proto::TailState::Done,
+                crate::serve::proto::TailState::Discarded,
+            ] {
+                old.failovers[0].set_tail_state(done);
+                new.failovers = old.failovers.clone();
+                validate_change(&old, &new).unwrap();
+            }
+        }
+    }
+
+    /// D336, the owner's Q4: nor does it change node or history (a relocate) while one is.
+    #[test]
+    fn a_partition_with_a_pending_tail_keeps_its_node_and_history() {
+        let mut old = map();
+        old.failovers.push(tail("p3", "b", 1));
+        let mut new = old.clone();
+        new.map_version += 1;
+        let p3 = new.partitions.iter_mut().find(|q| q.id == "p3").unwrap();
+        p3.node = "a".into();
+        p3.epoch = 2;
+        refused(validate_change(&old, &new), "keeps its node and history");
+        old.failovers[0].set_tail_state(crate::serve::proto::TailState::Discarded);
+        new.failovers = old.failovers.clone();
+        validate_change(&old, &new).unwrap();
+    }
+
+    /// cli692's S1 on #2239: no map drops or rewrites a recorded tail. A PENDING one only
+    /// leaves PENDING (for DONE or DISCARDED, its token cleared or kept), one out of PENDING
+    /// never changes, and a new event carries none.
+    #[test]
+    fn a_recorded_tail_is_neither_dropped_nor_rewritten() {
+        use crate::serve::proto::TailState as T;
+        let mut old = map();
+        old.failovers.push(tail("p3", "b", 1));
+        fn change(old: &ClusterMap, f: &dyn Fn(&mut ClusterMap)) -> Result<(), Refusal> {
+            let mut new = old.clone();
+            new.map_version += 1;
+            f(&mut new);
+            validate_change(old, &new)
+        }
+        refused(change(&old, &|m| m.failovers.clear()), "drops or rewrites");
+        refused(
+            change(&old, &|m| {
+                m.failovers[0].fork_token = b"other".to_vec().into()
+            }),
+            "drops or rewrites",
+        );
+        refused(
+            change(&old, &|m| m.failovers[0].set_tail_state(T::None)),
+            "drops or rewrites",
+        );
+        refused(
+            change(&old, &|m| m.failovers[0].from_epoch = 9),
+            "drops or rewrites",
+        );
+        change(&old, &|m| {
+            m.failovers[0].set_tail_state(T::Discarded);
+            m.failovers[0].fork_token = Default::default();
+        })
+        .unwrap();
+        change(&old, &|m| m.failovers[0].set_tail_state(T::Done)).unwrap();
+        // Out of PENDING: it never changes again.
+        old.failovers[0].set_tail_state(T::Discarded);
+        refused(
+            change(&old, &|m| m.failovers[0].set_tail_state(T::Pending)),
+            "drops or rewrites",
+        );
+        // A new event with a tail.
+        let mut fresh = map();
+        let mut new = fresh.clone();
+        new.map_version += 1;
+        new.failovers.push(tail("p3", "b", 1));
+        refused(validate_change(&fresh, &new), "carries an old owner's tail");
+        fresh.failovers.push(pending("p3", "b", 2));
+        validate_change(&fresh, &fresh.clone()).ok();
+    }
+
+    /// simp724's P1 on #2239: a range move naming a partition with a pending tail doesn't hand
+    /// over, as its source or its target.
+    #[test]
+    fn no_hand_over_names_a_partition_with_a_pending_tail() {
+        for p in ["p1", "p2"] {
+            let mut before = moving(MovePhase::HandingOver);
+            before.map_version = 4;
+            let epoch = before.partitions.iter().find(|q| q.id == p).unwrap().epoch;
+            before.failovers.push(tail(p, "a", epoch));
+            let mut after = moving(MovePhase::HandedOver);
+            after.map_version = 5;
+            after.moves[0].handed_over_version = 5;
+            after.tables[0] = handed_over(&after.tables[0], b"c", Some(b"f"), "p2");
+            after.partitions[0].epoch = 2;
+            after.failovers = before.failovers.clone();
+            refused(validate_change(&before, &after), "hands over");
+        }
+    }
+
+    #[test]
+    fn uses_tail_replay_sees_every_tail_field() {
+        let mut m = map();
+        m.failovers.push(pending("p1", "a", 2));
+        assert!(!uses_tail_replay(&m));
+        m.failovers[0].set_tail_state(crate::serve::proto::TailState::None);
+        assert!(uses_tail_replay(&m));
+        let mut m = map();
+        m.failovers.push(pending("p1", "a", 2));
+        m.failovers[0].from_epoch = 1;
+        assert!(uses_tail_replay(&m));
+    }
+
     fn pending(p: &str, to: &str, to_epoch: u64) -> crate::serve::proto::FailoverEvent {
         let mut e = crate::serve::proto::FailoverEvent {
             partition: p.into(),
