@@ -22,6 +22,10 @@ name = "serve_feed_load"
 required-features = ["serve"]
 
 [[example]]
+name = "serve_span_load"
+required-features = ["serve"]
+
+[[example]]
 name = "serve_read_load"
 required-features = ["serve"]
 
