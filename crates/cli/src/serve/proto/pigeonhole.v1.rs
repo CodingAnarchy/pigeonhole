@@ -7580,6 +7580,24 @@ pub struct FailoverEvent {
     pub to_epoch: u64,
     #[prost(enumeration = "FailoverState", tag = "13")]
     pub state: i32,
+    /// D336 (#2148): PARTITION: the promoted copy's primary token as it was before the promote,
+    /// the point where the old owner's history and the new one fork. The old owner's tail is
+    /// what its file holds past it. An all-tables feed token: the primary's id and one position
+    /// per stream, up to a few KiB with a large catalog. Empty when unknown (a promote by a
+    /// build without D336, or a copy whose token was lost); cleared once `tail_state` leaves
+    /// PENDING.
+    #[prost(bytes = "bytes", tag = "14")]
+    pub fork_token: ::prost::bytes::Bytes,
+    /// D336: PARTITION: the old owner's tail, replayed into the new owner or not. Independent
+    /// of `state` (the promote's own): every reader of the promote keys on `state` alone.
+    #[prost(enumeration = "TailState", tag = "15")]
+    pub tail_state: i32,
+    /// D336: PARTITION: the old owner's file the tail is in: its history epoch (the origin
+    /// the replay marks its progress under) and its identity epoch (the source checks it).
+    #[prost(uint64, tag = "16")]
+    pub from_history_epoch: u64,
+    #[prost(uint64, tag = "17")]
+    pub from_epoch: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -8035,10 +8053,30 @@ pub struct LocalPartition {
     /// acknowledges. Absent on an owner, before the copy's first apply, and from an older node.
     #[prost(message, optional, tag = "38")]
     pub replica_applied_position: ::core::option::Option<Position>,
+    /// D336 (#2148): a promote's stamp reply only (never in `Status`): the promoted copy's
+    /// primary token from before its promote, its fork point. Every stamp of a promote answers
+    /// it, a rerun of a finished one too; empty when unknown (never an error). An all-tables
+    /// feed token, up to a few KiB.
+    #[prost(bytes = "bytes", tag = "39")]
+    pub fork_token: ::prost::bytes::Bytes,
+    /// D336: an old owner's kept tail of this partition, once it opens its file as a tail
+    /// source (PR 3); absent otherwise.
+    #[prost(message, optional, tag = "40")]
+    pub tail_kept: ::core::option::Option<TailKept>,
     /// D335 PR 2b, on the partition's owner: the first position it may answer without replica
     /// acks (`ASYNC`, too few healthy replicas). Absent while it answers covered.
     #[prost(message, optional, tag = "41")]
     pub degraded_from: ::core::option::Option<Position>,
+}
+/// D336: an old owner's tail of a partition, as its file holds it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TailKept {
+    /// The bytes of the file's feed history past the fork token.
+    #[prost(uint64, tag = "1")]
+    pub bytes: u64,
+    /// The file's last durable seqno.
+    #[prost(uint64, tag = "2")]
+    pub last_durable_seqno: u64,
 }
 /// A share held in doubt (D329).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -9058,6 +9096,49 @@ impl MovePhase {
             "MOVE_PHASE_HANDED_OVER" => Some(Self::HandedOver),
             "MOVE_PHASE_CLEANING" => Some(Self::Cleaning),
             "MOVE_PHASE_ABORTING" => Some(Self::Aborting),
+            _ => None,
+        }
+    }
+}
+/// D336 (#2148): what became of a failed-over partition's old owner's tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TailState {
+    /// An event recorded by a build without D336: treated as NONE.
+    Unspecified = 0,
+    /// Nothing to replay: the old owner was reachable and the copy had applied all it had
+    /// made durable, or the fork token is unknown (the event says why).
+    None = 1,
+    /// The old owner may hold commits the new owner lacks: kept until replayed or discarded.
+    /// While one is pending, the partition's moves and history changes are refused.
+    Pending = 2,
+    /// Replayed into the new owner.
+    Done = 3,
+    /// Given up on, by an operator or past the cap of 4 pending tails per partition.
+    Discarded = 4,
+}
+impl TailState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TAIL_STATE_UNSPECIFIED",
+            Self::None => "TAIL_STATE_NONE",
+            Self::Pending => "TAIL_STATE_PENDING",
+            Self::Done => "TAIL_STATE_DONE",
+            Self::Discarded => "TAIL_STATE_DISCARDED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TAIL_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "TAIL_STATE_NONE" => Some(Self::None),
+            "TAIL_STATE_PENDING" => Some(Self::Pending),
+            "TAIL_STATE_DONE" => Some(Self::Done),
+            "TAIL_STATE_DISCARDED" => Some(Self::Discarded),
             _ => None,
         }
     }

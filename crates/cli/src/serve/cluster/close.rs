@@ -501,10 +501,15 @@ pub(super) fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiErro
                 files.push(e.path());
             }
         }
-        // A stopped promote's intent (#2156) goes with the file it was for.
-        let intent = super::stamp::promote_intent(dir, id);
-        if intent.exists() {
-            files.push(intent);
+        // A stopped promote's intent (#2156), and its fork token (D336), go with the file
+        // they were for.
+        for side in [
+            super::stamp::promote_intent(dir, id),
+            super::stamp::promote_fork(dir, id),
+        ] {
+            if side.exists() {
+                files.push(side);
+            }
         }
     }
     if files.is_empty() {

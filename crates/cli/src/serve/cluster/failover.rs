@@ -881,6 +881,31 @@ impl Node {
              pigeonhole_cluster_writer_term gauge\npigeonhole_cluster_writer_term {}",
             map.writer_term
         );
+        // D336: each partition's old owners' tails the map holds, by state. A discarded one
+        // (an operator's, or past the cap of 4 pending) is acknowledged writes given up.
+        let _ = writeln!(
+            text,
+            "# HELP pigeonhole_cluster_old_owner_tails Old owners' tails of each partition the \
+             map holds, by state: pending (kept for a replay) or discarded (given up) (D336).\n\
+             # TYPE pigeonhole_cluster_old_owner_tails gauge"
+        );
+        for p in &map.partitions {
+            for (state, label) in [
+                (crate::serve::proto::TailState::Pending, "pending"),
+                (crate::serve::proto::TailState::Discarded, "discarded"),
+            ] {
+                let n = map
+                    .failovers
+                    .iter()
+                    .filter(|e| e.partition == p.id && e.tail_state() == state)
+                    .count();
+                let _ = writeln!(
+                    text,
+                    "pigeonhole_cluster_old_owner_tails{{partition=\"{}\",state=\"{label}\"}} {n}",
+                    p.id
+                );
+            }
+        }
     }
 
     /// Node `id`'s address in this node's map.
@@ -1027,13 +1052,13 @@ impl Promoter for NodeOps {
         Ok(statuses)
     }
 
-    async fn stamp(&self, id: &str, req: StampRequest) -> Result<(), Failure> {
+    async fn stamp(&self, id: &str, req: StampRequest) -> Result<Vec<u8>, Failure> {
         let node = self.node()?;
         if id == node.id {
             return node
                 .stamp(req)
                 .await
-                .map(|_| ())
+                .map(|(_, fork)| fork)
                 .map_err(|e| Failure::usage(&format!("stamp: {}", e.message)));
         }
         let address = node.address_of(id)?;
@@ -1041,10 +1066,12 @@ impl Promoter for NodeOps {
             .client(&address)
             .await
             .map_err(|e| Failure::usage(&e))?;
-        c.stamp(node.request(req).map_err(|e| Failure::usage(&e))?)
+        let lp = c
+            .stamp(node.request(req).map_err(|e| Failure::usage(&e))?)
             .await
-            .map_err(|s| Failure::usage(&format!("node {id:?}: stamp: {}", s.message())))?;
-        Ok(())
+            .map_err(|s| Failure::usage(&format!("node {id:?}: stamp: {}", s.message())))?
+            .into_inner();
+        Ok(lp.fork_token.to_vec())
     }
 
     async fn wait_closed(&self, id: &str, partition: &str) -> Result<(), Failure> {

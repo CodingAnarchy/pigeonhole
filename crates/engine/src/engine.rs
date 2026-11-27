@@ -321,6 +321,16 @@ pub struct Metrics {
     /// Cross-shard commits' two-phase rounds and the PREPAREs participants refused, by
     /// reason (ICR 0043).
     pub cross_shard: CrossShardMetrics,
+    /// Transactions across partitions (D329, ICR 0148): the rounds of shares prepared and
+    /// logged here, each in doubt until decided.
+    pub external_prepares: u64,
+    /// The decides taken on those rounds, `(commit, abort)`, the resolver's included.
+    pub external_decides: (u64, u64),
+    /// Change-feed readers' external shares (D329, ICR 0148), `(held, evicted)`: shares a
+    /// reader held, each from its PREPARE until the reader reads its decision (one read
+    /// again after a rewind counts again), and held shares evicted past a reader's
+    /// read-ahead cutoff (#2185), to be read again later.
+    pub feed_external: (u64, u64),
     /// The drift gauge (D271, ICR 0064): how far the largest default timestamp handed out is
     /// ahead of the clock now, and the largest such lead at any reservation since open, in
     /// µs. Both 0 while the clock leads.
@@ -4608,7 +4618,14 @@ impl Engine {
             let most = |i: usize| s.cross.max_attempts[i].load(Ordering::Relaxed);
             x.max_attempts_blind = x.max_attempts_blind.max(most(0));
             x.max_attempts_reading = x.max_attempts_reading.max(most(1));
+            m.external_prepares += s.external_prepares.load(Ordering::Relaxed);
+            m.external_decides.0 += s.external_commits.load(Ordering::Relaxed);
+            m.external_decides.1 += s.external_aborts.load(Ordering::Relaxed);
         }
+        m.feed_external = (
+            shared.feed_external_holds.load(Ordering::Relaxed),
+            shared.feed_external_evictions.load(Ordering::Relaxed),
+        );
         let pager = shared.pager.stats();
         m.stalls = (
             m.room_stalls.0 + m.pacing_stalls.0,
@@ -8557,6 +8574,8 @@ impl Shared {
             shards,
             view: ArcSwap::new(view),
             async_sync_reads: AtomicU64::new(0),
+            feed_external_holds: AtomicU64::new(0),
+            feed_external_evictions: AtomicU64::new(0),
             commit_parks: AtomicU64::new(0),
             view_lock: Mutex::new(0),
             view_record: Mutex::default(),

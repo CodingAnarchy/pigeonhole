@@ -406,8 +406,8 @@ pub(crate) trait Promoter {
     async fn sleep(&self, d: Duration) {
         tokio::time::sleep(d).await;
     }
-    /// Stamps node `id`'s copy.
-    async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<(), Failure>;
+    /// Stamps node `id`'s copy: its fork token, for a promote (D336; empty when unknown).
+    async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<Vec<u8>, Failure>;
     /// Waits for node `id` to close its replica copy of `partition`.
     async fn wait_closed(&self, id: &str, partition: &str) -> Result<(), Failure>;
     /// Waits for node `id` to serve `partition` at `epoch`.
@@ -462,9 +462,13 @@ pub(crate) fn next_epoch(m: &proto::ClusterMap, p: &proto::Partition) -> u64 {
 /// Whether `e` is kept in `m` whatever the event count: pending, or abandoned while its
 /// partition's epoch is at or below its `to_epoch`, where it's the floor (#2070,
 /// simp724), or while a hand-over of the partition is in flight. Past that, P's epoch is
-/// the floor itself.
+/// the floor itself. A done promote whose old owner's tail is still PENDING too (D336): the
+/// event is the tail's record.
 pub(crate) fn pinned(m: &proto::ClusterMap, e: &proto::FailoverEvent) -> bool {
     use proto::{FailoverKind as K, FailoverState as St};
+    if e.tail_state() == proto::TailState::Pending {
+        return true;
+    }
     match e.state() {
         St::Pending => true,
         // While a hand-over of its partition is in flight, too: a source that crashed before
@@ -961,8 +965,12 @@ pub(crate) async fn run(
     if replica {
         ops.wait_closed(to, partition).await?;
     }
-    // 2. The copy, promoted and stamped at the target epoch.
-    if !stamped {
+    // 2. The copy, promoted and stamped at the target epoch. A copy an earlier run stamped
+    // is stamped again, which does nothing but answer its fork token (D336, Amendment 4: an
+    // earlier run's reply may have been lost). That's reached only while the event is still
+    // PENDING, so before the map gives `to` the partition: a stamp is refused while P is open
+    // on `to` (cli692's Q1 on #2239).
+    let fork = {
         ops.stamp(
             to,
             proto::StampRequest {
@@ -979,8 +987,8 @@ pub(crate) async fn run(
                 create_version: 0,
             },
         )
-        .await?;
-    }
+        .await?
+    };
     ops.after_stamp()?;
     // 3. The map: P on ID at the target epoch, with a new history (no `copies`), from the
     // map as it is now (step 1 changed it). The map as this promote read it: P still on its
@@ -1050,7 +1058,49 @@ pub(crate) async fn run(
     }) {
         e.set_state(St::Done);
     }
-    let map_version = ops.set_map(m2).await?.version;
+    // D336: the old owner's tail, from the fork on, in the event this map finishes. Without
+    // a fork token the event keeps none of its fields (UNSPECIFIED, which reads as NONE).
+    // A map with them needs every node to keep them (`tail_replay`): when one doesn't, the
+    // map is set without them, since the promote must go on either way.
+    let plain = m2.clone();
+    if fork.is_empty() {
+        warnings.push(format!(
+            "node {to:?}'s copy of {partition} reported no fork token (its promote ran on an \
+             older build, or its token was lost): the old owner's tail can't be replayed"
+        ));
+    } else {
+        for e in m2.failovers.iter_mut().filter(|e| {
+            e.kind() == K::Partition
+                && e.partition == partition
+                && e.to == to
+                && e.to_epoch == target
+                && e.state() == St::Done
+        }) {
+            let tail = tail_state(how, e);
+            e.set_tail_state(tail);
+            if tail == proto::TailState::Pending {
+                e.fork_token = fork.clone().into();
+                e.from_history_epoch = p.history_epoch;
+                e.from_epoch = p.epoch;
+            }
+        }
+        discard_past_cap(&mut m2, partition);
+    }
+    let map_version = match ops.set_map(m2).await {
+        // The install's `tail_replay` gate, by its whole refusal (cli692's Q2 on #2239): a
+        // map set's error reaches here as text alone (both paths make it a usage failure).
+        Err(f) if !fork.is_empty() && f.message().contains(&super::tail_replay_refusal()) => {
+            warnings.push(format!(
+                "the cluster hasn't adopted map feature {:?} (ClusterMap.adopted_features), \
+                 and not every node answered with it now: {partition}'s old owner's tail isn't \
+                 recorded. Once every node runs a build with it, set any map while they all \
+                 answer (phdb cluster set-map), so a later promote records its tail",
+                super::TAIL_REPLAY_FEATURE
+            ));
+            ops.set_map(plain).await?.version
+        }
+        r => r?.version,
+    };
     // 4. Serving on ID, as a move waits for its new node (#2035): done means P takes reads
     // and writes there.
     ops.wait_serving(to, partition, target).await?;
@@ -1062,6 +1112,54 @@ pub(crate) async fn run(
         map_version,
         warnings,
     })
+}
+
+/// The most old owners' tails one partition keeps PENDING (D336, the owner's Q5).
+pub(crate) const PENDING_TAILS: usize = 4;
+
+/// D336: past [`PENDING_TAILS`] PENDING tails of `partition` in `m`, the oldest are
+/// DISCARDED, their fork tokens cleared: the cap bounds the map, and a partition that failed
+/// over that often without a replay has bigger problems. Status shows each discarded one.
+pub(crate) fn discard_past_cap(m: &mut proto::ClusterMap, partition: &str) {
+    let pending = m
+        .failovers
+        .iter()
+        .filter(|e| e.partition == partition && e.tail_state() == proto::TailState::Pending)
+        .count();
+    let mut over = pending.saturating_sub(PENDING_TAILS);
+    // The map's events are in the order they were recorded: the oldest come first.
+    for e in m.failovers.iter_mut() {
+        if over == 0 {
+            break;
+        }
+        if e.partition == partition && e.tail_state() == proto::TailState::Pending {
+            e.set_tail_state(proto::TailState::Discarded);
+            e.fork_token = Default::default();
+            over -= 1;
+        }
+    }
+}
+
+/// D336 (#2148): whether a promote leaves an old owner's tail to replay. Kept (PENDING)
+/// when the old owner may hold commits the copy lacks: a writer failover, a promote with the
+/// old owner unreachable, or a reachable one whose durable seqno, as the copy last heard it,
+/// is past what the copy applied or unknown. Called only with a fork token: without one
+/// there's nothing a replay could start from, and the event records no tail.
+fn tail_state(how: &How, e: &proto::FailoverEvent) -> proto::TailState {
+    let may_hold = match how {
+        How::Failover { .. }
+        | How::Manual {
+            old_unreachable: true,
+        } => true,
+        How::Manual {
+            old_unreachable: false,
+        } => e.primary_seqno == 0 || e.primary_seqno > e.applied_seqno,
+    };
+    if may_hold {
+        proto::TailState::Pending
+    } else {
+        proto::TailState::None
+    }
 }
 
 /// [`Promoter`] over the CLI's clients (`phdb cluster promote`).
@@ -1150,13 +1248,15 @@ impl Promoter for CliOps<'_> {
         Ok(asks.join_all().await.into_iter().collect())
     }
 
-    async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<(), Failure> {
+    async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<Vec<u8>, Failure> {
         let url = url_of(self.args, &self.address(id)?);
         let (mut c, token) = connect(self.args, &url).await?;
-        c.stamp(request(req, token.as_deref())?)
+        let lp = c
+            .stamp(request(req, token.as_deref())?)
             .await
-            .map_err(|s| Failure::usage(&format!("{url}: stamp: {}", s.message())))?;
-        Ok(())
+            .map_err(|s| Failure::usage(&format!("{url}: stamp: {}", s.message())))?
+            .into_inner();
+        Ok(lp.fork_token.to_vec())
     }
 
     async fn wait_closed(&self, id: &str, partition: &str) -> Result<(), Failure> {
@@ -1267,6 +1367,8 @@ mod tests {
         clock: Cell<u64>,
         step: u64,
         stamped: Cell<bool>,
+        /// The next run stops after its stamp, before its map (as `STOP_AFTER_STAMP`).
+        stop_after_stamp: Cell<bool>,
     }
 
     impl Promoter for Fake {
@@ -1317,9 +1419,9 @@ mod tests {
             Ok(s.remove(0))
         }
 
-        async fn stamp(&self, _id: &str, _req: proto::StampRequest) -> Result<(), Failure> {
+        async fn stamp(&self, _id: &str, _req: proto::StampRequest) -> Result<Vec<u8>, Failure> {
             self.stamped.set(true);
-            Ok(())
+            Ok(b"fork".to_vec())
         }
 
         async fn wait_closed(&self, _id: &str, _partition: &str) -> Result<(), Failure> {
@@ -1327,6 +1429,13 @@ mod tests {
         }
 
         async fn wait_serving(&self, _id: &str, _p: &str, _epoch: u64) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn after_stamp(&self) -> Result<(), Failure> {
+            if self.stop_after_stamp.replace(false) {
+                return Err(Failure::usage("the test's stop after the stamp"));
+            }
             Ok(())
         }
     }
@@ -1389,7 +1498,32 @@ mod tests {
             clock: Cell::new(0),
             step: u64::try_from(step.as_nanos()).unwrap(),
             stamped: Cell::new(false),
+            stop_after_stamp: Cell::new(false),
         }
+    }
+
+    /// D336 (cli692's Q1 on #2239): a promote stopped after its stamp, before its map, is run
+    /// again. The rerun finds the copy stamped, stamps it again (which only answers its fork
+    /// token), and records the token and a PENDING tail in the event its map finishes.
+    #[test]
+    fn a_promote_rerun_after_its_stamp_records_the_fork_token() {
+        let f = fake(
+            vec![quiet(10_000), quiet(10_000)],
+            2,
+            Duration::from_secs(1),
+        );
+        f.stop_after_stamp.set(true);
+        block_on(run(&f, &three(), "p3", "b", &failover())).unwrap_err();
+        assert!(f.stamped.get());
+        assert_eq!(f.map.borrow().failovers[0].state(), S::Pending);
+        let m = f.map.borrow().clone();
+        block_on(run(&f, &m, "p3", "b", &failover())).unwrap();
+        let m = f.map.borrow();
+        let e = &m.failovers[0];
+        assert_eq!(e.state(), S::Done);
+        assert_eq!(e.tail_state(), proto::TailState::Pending);
+        assert_eq!(&e.fork_token[..], b"fork");
+        assert_eq!((e.from_history_epoch, e.from_epoch), (1, 3));
     }
 
     fn failover() -> How {
@@ -1583,7 +1717,7 @@ mod tests {
             async fn sleep(&self, d: Duration) {
                 self.0.sleep(d).await;
             }
-            async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<(), Failure> {
+            async fn stamp(&self, id: &str, req: proto::StampRequest) -> Result<Vec<u8>, Failure> {
                 self.0.stamp(id, req).await
             }
             async fn wait_closed(&self, id: &str, p: &str) -> Result<(), Failure> {
@@ -1768,5 +1902,86 @@ mod tests {
         assert_eq!(m.failovers[0].to_epoch, 100, "the pending one stays");
         assert_eq!(m.failovers[1].to_epoch, 4, "the oldest finished ones went");
         assert_eq!(m.failovers.last().unwrap().to_epoch, 19);
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    fn done_tail(p: &str, epoch: u64, tail: proto::TailState) -> proto::FailoverEvent {
+        let mut e = proto::FailoverEvent {
+            partition: p.into(),
+            from: "a".into(),
+            to: "b".into(),
+            to_epoch: epoch,
+            fork_token: format!("fork{epoch}").into_bytes().into(),
+            ..Default::default()
+        };
+        e.set_kind(proto::FailoverKind::Partition);
+        e.set_state(proto::FailoverState::Done);
+        e.set_tail_state(tail);
+        e
+    }
+
+    /// D336, the owner's Q5: past 4 PENDING tails of a partition, the oldest are DISCARDED
+    /// and their tokens cleared; another partition's are untouched.
+    #[test]
+    fn past_four_pending_tails_the_oldest_are_discarded() {
+        let mut m = proto::ClusterMap::default();
+        for epoch in 1..=6 {
+            m.failovers
+                .push(done_tail("p1", epoch, proto::TailState::Pending));
+        }
+        m.failovers
+            .push(done_tail("p2", 1, proto::TailState::Pending));
+        discard_past_cap(&mut m, "p1");
+        let states: Vec<_> = m.failovers.iter().map(|e| e.tail_state()).collect();
+        use proto::TailState::{Discarded, Pending};
+        assert_eq!(
+            states,
+            [
+                Discarded, Discarded, Pending, Pending, Pending, Pending, Pending
+            ]
+        );
+        assert!(m.failovers[0].fork_token.is_empty());
+        assert!(!m.failovers[2].fork_token.is_empty());
+    }
+
+    /// D336: a finished event whose tail is PENDING is kept past the ring of finished events.
+    #[test]
+    fn a_pending_tail_is_kept_past_the_event_ring() {
+        let mut m = proto::ClusterMap::default();
+        m.failovers
+            .push(done_tail("p1", 1, proto::TailState::Pending));
+        for epoch in 2..=(super::super::map::FAILOVER_EVENTS as u64 + 3) {
+            push_event(&mut m, done_tail("p2", epoch, proto::TailState::None));
+        }
+        assert_eq!(m.failovers[0].partition, "p1");
+        assert_eq!(m.failovers[0].tail_state(), proto::TailState::Pending);
+    }
+
+    /// D336: which promotes leave a tail to replay.
+    #[test]
+    fn a_tail_is_pending_when_the_old_owner_may_hold_commits() {
+        let mut e = proto::FailoverEvent::default();
+        let failover = How::Failover {
+            in_doubt_xids: Vec::new(),
+            in_doubt_count: 0,
+        };
+        let unreachable = How::Manual {
+            old_unreachable: true,
+        };
+        let reachable = How::Manual {
+            old_unreachable: false,
+        };
+        assert_eq!(tail_state(&failover, &e), proto::TailState::Pending);
+        assert_eq!(tail_state(&unreachable, &e), proto::TailState::Pending);
+        // The owner's durable seqno unknown: it may.
+        assert_eq!(tail_state(&reachable, &e), proto::TailState::Pending);
+        (e.applied_seqno, e.primary_seqno) = (10, 10);
+        assert_eq!(tail_state(&reachable, &e), proto::TailState::None);
+        e.primary_seqno = 11;
+        assert_eq!(tail_state(&reachable, &e), proto::TailState::Pending);
     }
 }

@@ -373,7 +373,12 @@ pub pigeonhole::EngineMetrics::compaction_failures: u64
 pub pigeonhole::EngineMetrics::compactions: u64
 pub pigeonhole::EngineMetrics::compactions_reclaimed: u64
 pub pigeonhole::EngineMetrics::cross_shard: pigeonhole::CrossShardMetrics
+pub pigeonhole::EngineMetrics::external_aborts: u64
+pub pigeonhole::EngineMetrics::external_commits: u64
+pub pigeonhole::EngineMetrics::external_prepares: u64
 pub pigeonhole::EngineMetrics::feed_background_syncs: u64
+pub pigeonhole::EngineMetrics::feed_external_evicted: u64
+pub pigeonhole::EngineMetrics::feed_external_held: u64
 pub pigeonhole::EngineMetrics::feed_sidecar_syncs: u64
 pub pigeonhole::EngineMetrics::file_growth_nanos: u64
 pub pigeonhole::EngineMetrics::file_growths: u64

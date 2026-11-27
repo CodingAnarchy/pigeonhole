@@ -171,9 +171,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         self.caller(&req, &[Scope::Cluster, Scope::Admin], "stamp a partition")?;
         let req = req.into_inner();
         let id = req.partition.clone();
-        let installed = self.0.stamp(req).await?;
+        let (installed, fork) = self.0.stamp(req).await?;
         let mut lp = self.local(&id).await?;
         lp.files = installed;
+        lp.fork_token = fork.into();
         Ok(tonic::Response::new(lp))
     }
 
