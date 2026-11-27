@@ -281,13 +281,10 @@ pub(super) fn record_gone(id: &str, partition: &str, node: &str, epoch: u64) -> 
     ))
 }
 
-/// The map as `args`' node has it.
+/// The map as its writer has it ([`super::cli::writer_map`], #2249): a change built on it
+/// is set there.
 pub(super) async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
-    let (mut c, token) = connect(args, &args.node).await?;
-    Ok(c.get_map(request(GetMapRequest {}, token.as_deref())?)
-        .await
-        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
-        .into_inner())
+    super::cli::writer_map(args).await
 }
 
 /// Sets the move's record change, `change` applied to the map as it is now (its version
