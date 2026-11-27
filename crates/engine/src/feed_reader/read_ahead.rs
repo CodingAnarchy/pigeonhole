@@ -229,6 +229,12 @@ impl FeedReader {
             .filter(|(_, h)| h.external)
             .map(|(&(id, _), _)| id)
             .collect();
+        if !ids.is_empty() {
+            // One per share (a round's shares on several streams count each).
+            self.shared
+                .feed_external_evictions
+                .fetch_add(ids.len() as u64, Ordering::Relaxed);
+        }
         for id in ids {
             self.evict_round(id);
         }

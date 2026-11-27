@@ -211,6 +211,23 @@ pub struct EngineMetrics {
     /// last one, never per commit. 0 while the feed is off. See
     /// [`DatabaseInfo::feed`](crate::DatabaseInfo::feed) for the feed's state.
     pub feed_sidecar_syncs: u64,
+    /// Transactions across partitions on a `phdb serve` cluster (D329, ICR 0148): the shares
+    /// this database prepared and logged for them, each held in doubt until its transaction's
+    /// home decides it. 0 outside a cluster.
+    pub external_prepares: u64,
+    /// Decisions on those shares taken here to commit them (the resolver's included).
+    /// `external_prepares` less both decision counts is about the shares in doubt now, give
+    /// or take shares found in doubt at open (prepared before it, decided after).
+    pub external_commits: u64,
+    /// Decisions on those shares taken here to abort them (the resolver's included).
+    pub external_aborts: u64,
+    /// Change-feed readers' holds of those shares: each reader holds a share from its PREPARE
+    /// until it reads the share's decision, and a share read again after a rewind counts
+    /// again. 0 while the feed is off.
+    pub feed_external_held: u64,
+    /// Held shares a change-feed reader let go of because its read-ahead reached its limit
+    /// (#2185), to read again once it gets there.
+    pub feed_external_evicted: u64,
 }
 
 impl EngineMetrics {
@@ -443,6 +460,11 @@ impl EngineMetrics {
             group_syncs: 0,
             feed_background_syncs: 0,
             feed_sidecar_syncs: 0,
+            external_prepares: m.external_prepares,
+            external_commits: m.external_decides.0,
+            external_aborts: m.external_decides.1,
+            feed_external_held: m.feed_external.0,
+            feed_external_evicted: m.feed_external.1,
         }
     }
 }
@@ -692,6 +714,9 @@ mod tests {
         m.cross_shard.rounds = 22;
         m.cross_shard.refused_room = 23;
         m.cross_shard.refused_pending_overlap = 24;
+        m.external_prepares = 61;
+        m.external_decides = (62, 63);
+        m.feed_external = (64, 65);
         let e = EngineMetrics::from_engine(m.clone());
         assert_eq!(e.commits(Durability::None).count, 1);
         assert_eq!(e.commits(Durability::GroupSync).count, 3);
@@ -723,6 +748,16 @@ mod tests {
         );
         assert_eq!((e.threads_started, e.threads_pinned), (17, 3));
         assert_eq!(e.cross_shard.rounds, 22);
+        assert_eq!(
+            [
+                e.external_prepares,
+                e.external_commits,
+                e.external_aborts,
+                e.feed_external_held,
+                e.feed_external_evicted
+            ],
+            [61, 62, 63, 64, 65]
+        );
 
         // The rest by name (ICR 0087).
         let v = internal(&m, Some(25), None);

@@ -624,6 +624,24 @@ async fn line(port: u16, p: &str) -> super::super::proto::LocalPartition {
         .unwrap()
 }
 
+/// The value of the `/metrics` sample of node `port` whose line starts with `series` and
+/// holds `label` (one sample expected), through `Admin.Metrics`.
+async fn sample(port: u16, series: &str, label: &str) -> Option<u64> {
+    let text = super::super::proto::admin_client::AdminClient::new(channel(port).await)
+        .metrics(super::super::proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .text;
+    let mut found = text
+        .lines()
+        .filter(|l| l.starts_with(series) && l.contains(label))
+        .map(|l| l.rsplit(' ').next().unwrap().parse::<u64>().unwrap());
+    let v = found.next();
+    assert!(found.next().is_none(), "{series} twice:\n{text}");
+    v
+}
+
 #[test]
 fn a_share_in_doubt_shows_in_status_and_is_decided_by_hand_only_when_its_home_cant_answer() {
     // D329 2b: p1's status line lists the share in doubt. The operator's decide is refused
@@ -649,6 +667,16 @@ fn a_share_in_doubt_shows_in_status_and_is_decided_by_hand_only_when_its_home_ca
         assert_eq!(lp.in_doubt, 1, "{lp:?}");
         assert_eq!(lp.in_doubt_oldest_xid, id);
         assert_eq!(lp.in_doubt_shares[0].xid, id, "{lp:?}");
+        // On /metrics too (ICR 0148): the gauges, and the engine's count of the prepare.
+        let gauge = "pigeonhole_cluster_txn_in_doubt_shares{partition=\"p1\"}";
+        let bytes = "pigeonhole_cluster_txn_in_doubt_wal_bytes{partition=\"p1\"}";
+        assert_eq!(sample(a, gauge, "").await, Some(1));
+        assert!(sample(a, bytes, "").await.unwrap() > 0);
+        // The engine's counters are read at most once per 100 ms.
+        eventually("the prepare on /metrics", async || {
+            sample(a, "pigeonhole_txn_external_prepares_total{", "").await == Some(1)
+        })
+        .await;
         let e = decide(a, "p1", &id, true, false).await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert!(in_doubt(&t, &id), "a refused decide leaves it");
@@ -663,6 +691,16 @@ fn a_share_in_doubt_shows_in_status_and_is_decided_by_hand_only_when_its_home_ca
         // With the home answering, `force` decides (here: commit, the operator's call).
         decide(a, "p1", &id, true, true).await.unwrap();
         assert!(!in_doubt(&t, &id));
+        assert_eq!(sample(a, gauge, "").await, Some(0));
+        assert_eq!(sample(a, bytes, "").await, Some(0));
+        let decided = "pigeonhole_txn_external_decides_total{";
+        let committed = "pigeonhole_outcome=\"committed\"";
+        let aborted = "pigeonhole_outcome=\"aborted\"";
+        eventually("the decide on /metrics", async || {
+            sample(a, decided, committed).await == Some(1)
+        })
+        .await;
+        assert_eq!(sample(a, decided, aborted).await, Some(0));
         assert_eq!(get_row(a, "alice").await.unwrap(), Some(b"1".to_vec()));
         lost("bob").await
     });

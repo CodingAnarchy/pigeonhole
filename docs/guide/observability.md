@@ -146,6 +146,8 @@ Counters are cumulative from registration. They stay monotonic across an automat
 | `pigeonhole.transaction.retries` | `pigeonhole_transaction_retries_total` | counter | `{retry}` |  | Attempts Pigeonhole::transact retried. |
 | `pigeonhole.cross_shard.rounds` | `pigeonhole_cross_shard_rounds_total` | counter | `{round}` |  | Two-phase rounds of cross-shard commits decided. |
 | `pigeonhole.cross_shard.failed_fast` | `pigeonhole_cross_shard_failed_fast_total` | counter | `{commit}` |  | Cross-shard commits that failed with Conflict without another round. |
+| `pigeonhole.txn.external.prepares` | `pigeonhole_txn_external_prepares_total` | counter | `{share}` |  | Shares of transactions across partitions prepared and logged here, each in doubt until its home decides it; 0 outside a cluster. |
+| `pigeonhole.txn.external.decides` | `pigeonhole_txn_external_decides_total` | counter | `{share}` | `pigeonhole.outcome` | Decisions taken here on shares of transactions across partitions: to commit them (outcome committed) or abort them (outcome aborted), the resolver's included. |
 | `pigeonhole.write_stalls` | `pigeonhole_write_stalls_total` | counter | `{stall}` | `pigeonhole.stall.reason` | Write stalls: commits held for memtable arena room (reason room) or paced because L0 was too deep (reason pacing). |
 | `pigeonhole.write_stall.time` | `pigeonhole_write_stall_time_seconds_total` | counter | `s` | `pigeonhole.stall.reason` | Time the shards spent in write stalls, summed over shards; its rate is the fraction of time stalled. |
 | `pigeonhole.flushes` | `pigeonhole_flushes_total` | counter | `{flush}` | `pigeonhole.outcome` | Memtable flushes completed (outcome success) and failed (outcome failure; retried, nothing lost). |
@@ -183,6 +185,8 @@ Counters are cumulative from registration. They stay monotonic across an automat
 | `pigeonhole.io.ring_attach_failures` | `pigeonhole_io_ring_attach_failures_total` | counter | `{failure}` |  | Times a thread could not get an io_uring ring (io_uring only). |
 | `pigeonhole.io.inline` | `pigeonhole_io_inline_total` | counter | `{op}` |  | I/O run inline on the calling thread instead of through io_uring (io_uring only). |
 | `pigeonhole.feed.syncs` | `pigeonhole_feed_syncs_total` | counter | `{sync}` | `pigeonhole.feed.sync.kind` | Syncs the change feed made on its own (kind background) and of its sidecar file (kind sidecar); only while the feed is on. |
+| `pigeonhole.feed.external.holds` | `pigeonhole_feed_external_holds_total` | counter | `{share}` |  | Shares of transactions across partitions that change-feed readers held from their PREPARE until they read the decision; a share read again after a rewind counts again; only while the feed is on. |
+| `pigeonhole.feed.external.evictions` | `pigeonhole_feed_external_evictions_total` | counter | `{share}` |  | Held shares of transactions across partitions that a change-feed reader let go of at its read-ahead limit, to read again later; only while the feed is on. |
 | `pigeonhole.feed.retained.size` | `pigeonhole_feed_retained_size_bytes` | gauge | `By` |  | WAL bytes the change feed retains. |
 | `pigeonhole.feed.retained.limit` | `pigeonhole_feed_retained_limit_bytes` | gauge | `By` |  | The change feed's retention limit; near it, slow subscribers start expiring. |
 | `pigeonhole.feed.held_blobs.size` | `pigeonhole_feed_held_blobs_size_bytes` | gauge | `By` |  | Blob bytes the change feed's retained history holds. |
