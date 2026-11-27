@@ -105,6 +105,7 @@ fn a_node_serves_each_of_its_partitions_through_any_entry_node() {
         let e = data(c)
             .await
             .batch(crate::serve::proto::BatchRequest {
+                replication: 0,
                 rows: vec![put_row("bob", "x"), put_row("yan", "y")],
                 durability: 0,
             })
@@ -760,6 +761,7 @@ fn a_spanning_transactions_branch_on_its_homes_node_is_a_local_call() {
         let reply = txns(a)
             .await
             .commit(crate::serve::proto::TxnCommitRequest {
+                replication: 0,
                 txn_id: id.clone(),
                 rows: Vec::new(),
             })
@@ -833,6 +835,7 @@ fn a_spanning_transactions_branches_are_renewed_by_its_other_calls() {
         let reply = txns(c)
             .await
             .commit(crate::serve::proto::TxnCommitRequest {
+                replication: 0,
                 txn_id: id.clone(),
                 rows: vec![put_row("zed", "1")],
             })
@@ -867,6 +870,7 @@ fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
                 txns(c)
                     .await
                     .commit(crate::serve::proto::TxnCommitRequest {
+                        replication: 0,
                         txn_id: id,
                         rows: Vec::new(),
                     })
@@ -878,6 +882,7 @@ fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
         let e = data(c)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(put_row("hank", "1")),
                 durability: 0,
             })
@@ -892,6 +897,7 @@ fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
             data(c)
                 .await
                 .mutate(crate::serve::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(put_row("hank", "1")),
                     durability: 0,
                 })
@@ -1006,7 +1012,11 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
     let commit = |id: String, rows| async move {
         txns(c)
             .await
-            .commit(crate::serve::proto::TxnCommitRequest { txn_id: id, rows })
+            .commit(crate::serve::proto::TxnCommitRequest {
+                txn_id: id,
+                rows,
+                replication: 0,
+            })
             .await
     };
     t.rt.block_on(async {

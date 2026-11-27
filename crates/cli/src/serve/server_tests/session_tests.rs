@@ -82,6 +82,7 @@ fn a_commit_whose_client_went_away_still_lands_and_is_recorded() {
     };
     let rows: Vec<proto::RowWrites> = serde_json::from_value(txn_rows("gone", b"landed")).unwrap();
     let commit = ServiceOp::Commit(proto::TxnCommitRequest {
+        replication: 0,
         txn_id: id.clone(),
         rows,
     });
@@ -98,6 +99,7 @@ fn a_commit_whose_client_went_away_still_lands_and_is_recorded() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let info = loop {
         let again = ServiceOp::Commit(proto::TxnCommitRequest {
+            replication: 0,
             txn_id: id.clone(),
             rows: Vec::new(),
         });

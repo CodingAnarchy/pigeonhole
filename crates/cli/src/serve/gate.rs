@@ -164,6 +164,10 @@ pub(crate) struct WriteGate {
     term: AtomicU64,
     /// Woken when the last write finishes while fenced.
     drained: Notify,
+    /// Woken when the lease ends early (`lapse`): a write waiting for its replica acks
+    /// (D335) answers `OutcomeUnknown` at once. A lease that runs out on the clock wakes
+    /// nobody; a waiter sleeps until its end.
+    ended: Notify,
     /// The ranges a move gates (D331): read beside the gate on every call.
     ranges: super::ranges::RangeGate,
 }
@@ -186,6 +190,7 @@ impl WriteGate {
             clock,
             term: AtomicU64::new(0),
             drained: Notify::new(),
+            ended: Notify::new(),
             ranges: super::ranges::RangeGate::default(),
         })
     }
@@ -334,6 +339,13 @@ impl WriteGate {
         self.term.fetch_add(1, Ordering::SeqCst);
         self.lease_end.store(0, Ordering::SeqCst);
         self.leased_once.store(false, Ordering::SeqCst);
+        self.ended.notify_waiters();
+    }
+
+    /// Notified when the lease ends early ([`lapse`](Self::lapse)). Enable it before
+    /// checking [`leased`](Self::leased), so a lapse in between isn't missed.
+    pub(crate) fn ended(&self) -> tokio::sync::futures::Notified<'_> {
+        self.ended.notified()
     }
 
     /// Lifts the operator's fence: an operator's `unfence`. The partition takes writes once

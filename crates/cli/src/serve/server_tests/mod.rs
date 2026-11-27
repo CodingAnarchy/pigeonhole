@@ -473,6 +473,7 @@ fn seed_rows_in(s: &Server, c: &mut DataClient<tonic::transport::Channel>, table
             })
             .collect();
         s.block_on(c.mutate(proto::MutateRequest {
+            replication: 0,
             writes: Some(proto::RowWrites {
                 row: Some(proto::RowKey {
                     table: table.into(),

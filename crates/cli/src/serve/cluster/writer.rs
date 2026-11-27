@@ -1532,7 +1532,12 @@ mod model {
         /// The stamp's checks (§4, simp724's S2): its epoch stamped once, and the copy holds
         /// every acknowledged write at or below what the writer saw.
         fn stamp(&mut self, j: usize, k: usize, epoch: u64) {
+            // A promote's rerun stamps its copy again on the same node, which only answers
+            // its fork token (D336).
             if let Some(&by) = self.stamped.get(&(k, epoch)) {
+                if by == j {
+                    return;
+                }
                 panic!(
                     "seed {}: p{k}'s epoch {epoch} stamped on n{by}, then on n{j}",
                     self.seed
@@ -1837,11 +1842,11 @@ mod model {
                 .collect())
         }
 
-        async fn stamp(&self, id: &str, req: StampRequest) -> Result<(), Failure> {
+        async fn stamp(&self, id: &str, req: StampRequest) -> Result<Vec<u8>, Failure> {
             let j = self.reach(id)?;
             let k: usize = req.partition[1..].parse().unwrap();
             self.world.borrow_mut().stamp(j, k, req.to_epoch);
-            Ok(())
+            Ok(Vec::new())
         }
 
         async fn wait_closed(&self, id: &str, _partition: &str) -> Result<(), Failure> {

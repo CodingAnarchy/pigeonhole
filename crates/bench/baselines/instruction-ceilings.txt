@@ -34,6 +34,17 @@
 # counter path (0.92-1.2% -> 0.3-0.8%); pooling the batch buffer back to the client is #320's
 # remaining item. Owner's decision, 2026-11-17.
 #
+# commit-incr's noise is one-sided (2026-11-26, 118 counts from the 59 PR runs of 2026-11-25
+# 11:58Z to 2026-11-26 23:49Z): main counts one exact value most of the time (11127; 11156
+# since #2235's +29), and about 45% of counts land up to 1.3% below it (10988 at the lowest),
+# and above it only once (11190, +34). So one base count against one head count reads
+# +0.8-1.1% whenever base draws low and head draws the mode, on PRs that don't touch the
+# engine (#2241 +1.0%, #2219 +0.8%; 1.0% is the threshold). The workflow's RECOUNT_MAX
+# counts commit-incr again on both sides when base and head differ by more than 0.5%, and
+# judges each side's higher count: resampling those 118 counts, a PR that changes nothing
+# fails 0.2% of the time instead of 2.9%. The ceiling holds the mode plus headroom; the low
+# draws never test it. Pooling the batch buffer (#2245) would make the count exact again.
+#
 # Raised by D195 (owner decision, 2026-10-09): flushed 1905 -> 1912 and compacted 1282 -> 1288
 # (#384 merged after these ceilings were measured), get-sst 17883 -> 17983 with headroom 0.5%
 # (placement drift on main after #392/#396). Each is main 99f8929's count times (1 + headroom).
