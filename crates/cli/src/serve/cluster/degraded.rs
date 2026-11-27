@@ -36,7 +36,7 @@ struct Record {
 }
 
 impl Record {
-    fn from_pos(&self) -> Option<Pos> {
+    fn start(&self) -> Option<Pos> {
         self.from.map(|(seqno, n)| Pos { seqno, n })
     }
 }
@@ -117,7 +117,7 @@ impl Records {
                 } else {
                     DegradedState::Clear
                 } as i32,
-                degraded_from: r.from_pos().map(Position::from),
+                degraded_from: r.start().map(Position::from),
             })
             .collect()
     }
@@ -128,7 +128,7 @@ impl Records {
         self.lock()
             .get(id)
             .filter(|r| r.epoch == epoch && r.history == history)
-            .and_then(Record::from_pos)
+            .and_then(Record::start)
     }
 
     /// A lease grant's records (`mine` is the request's map: a grant is given only at the
@@ -178,7 +178,7 @@ impl Records {
             let Some(r) = table.get(&g.partition).filter(|r| r.epoch == g.epoch) else {
                 continue;
             };
-            match (ask, r.from_pos()) {
+            match (ask, r.start()) {
                 // A FLAGGED record is echoed whatever was asked: an owner that no longer
                 // knows of it (restarted without its own record, or one that left after a
                 // majority's clear this grantor missed) resumes its fallback and clears it,
@@ -245,7 +245,7 @@ fn apply(r: Option<Record>, epoch: u64, history: u64, ask: Ask) -> Option<Record
     if epoch > r.epoch {
         return Some(fresh);
     }
-    let from = match (ask, r.from_pos()) {
+    let from = match (ask, r.start()) {
         (Ask::Nothing, _) => return None,
         (Ask::Clear, _) => None,
         // A start already recorded stays unless lower: a flag is never raised without a
@@ -276,13 +276,13 @@ mod tests {
         assert_eq!(r.epoch, 3);
         // Flagged, then a lower epoch's clear changes nothing.
         let f = apply(Some(r), 3, 1, Ask::Flag(pos(10))).unwrap();
-        assert_eq!(f.from_pos(), Some(pos(10)));
+        assert_eq!(f.start(), Some(pos(10)));
         assert_eq!(apply(Some(f), 2, 1, Ask::Clear), None);
         // A renewal changes nothing; a higher flag keeps the lower start.
         assert_eq!(apply(Some(f), 3, 1, Ask::Nothing), None);
         assert_eq!(apply(Some(f), 3, 1, Ask::Flag(pos(20))), None);
         let lower = apply(Some(f), 3, 1, Ask::Flag(pos(5))).unwrap();
-        assert_eq!(lower.from_pos(), Some(pos(5)));
+        assert_eq!(lower.start(), Some(pos(5)));
         // The clear at the epoch, then a newer epoch starts clear.
         let c = apply(Some(f), 3, 1, Ask::Clear).unwrap();
         assert_eq!(c.from, None);
@@ -310,7 +310,7 @@ mod tests {
             }
         );
         let r = apply(Some(dead), 1, 1, Ask::Flag(pos(3))).unwrap();
-        assert_eq!(r.from_pos(), Some(pos(3)));
+        assert_eq!(r.start(), Some(pos(3)));
     }
 
     fn map(parts: &[(&str, u64, u64, u32)]) -> ClusterMap {
