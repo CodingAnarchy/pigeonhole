@@ -163,6 +163,7 @@ async fn put_when_leased(port: u16, row: &str) {
         data(port)
             .await
             .mutate(MutateRequest {
+                replication: 0,
                 writes: Some(put_row(row, "v")),
                 durability: 0,
             })
@@ -227,6 +228,7 @@ async fn put(port: u16, row: &str, value: &str) {
     data(port)
         .await
         .mutate(MutateRequest {
+            replication: 0,
             writes: Some(put_row(row, value)),
             durability: 0,
         })
@@ -2220,6 +2222,7 @@ fn a_keys_writes_on_the_source_come_before_its_writes_on_the_target_across_a_han
                 data(c)
                     .await
                     .mutate(MutateRequest {
+                        replication: 0,
                         writes: Some(put_row("d", "3")),
                         durability: 0,
                     })
@@ -2367,6 +2370,7 @@ async fn put_in(port: u16, table: &str, row: &str) -> u64 {
         match data(port)
             .await
             .mutate(MutateRequest {
+                replication: 0,
                 writes: Some(w),
                 durability: 0,
             })
@@ -3238,6 +3242,7 @@ fn a_subscription_from_the_oldest_starts_past_a_pruned_partial_move() {
                 data(c)
                     .await
                     .mutate(MutateRequest {
+                        replication: 0,
                         writes: Some({
                             let mut w = put_row("n1", "after");
                             w.row.as_mut().unwrap().table = "orders".into();

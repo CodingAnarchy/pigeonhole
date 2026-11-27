@@ -3212,6 +3212,14 @@ fn a_capped_reader_never_jumps_the_decision_of_an_external_round_it_holds_a_shar
         r.chunk_skips() > 0,
         "no chunk was jumped: the index never bit"
     );
+    // ICR 0148: every round prepared and committed here is counted; the reader held both
+    // shares of each at least once (again after a rewind), and evicted some past its cutoff,
+    // the path this test is about.
+    let m = db.metrics();
+    assert_eq!(m.external_prepares, 300);
+    assert_eq!(m.external_decides, (300, 0));
+    let (held, evicted) = m.feed_external;
+    assert!(held >= 600 && evicted > 0, "{:?}", m.feed_external);
     drop(r);
     db.close().unwrap();
 }

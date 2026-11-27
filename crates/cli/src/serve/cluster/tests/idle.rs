@@ -68,6 +68,7 @@ async fn put(port: u16, row: &str, value: &str) {
     data(port)
         .await
         .mutate(MutateRequest {
+            replication: 0,
             writes: Some(put_row(row, value)),
             durability: 0,
         })

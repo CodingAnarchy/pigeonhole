@@ -36,6 +36,7 @@ pub(super) fn load(rt: &tokio::runtime::Runtime, port: u16, n: usize) -> Vec<Vec
             data(port)
                 .await
                 .mutate(super::super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(cells_row(r, &[3], i as u64)),
                     durability: 0,
                 })

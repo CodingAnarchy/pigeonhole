@@ -1939,6 +1939,11 @@ impl FeedReader {
                             "an untagged share of a tagged round"
                         ),
                     }
+                    if external {
+                        self.shared
+                            .feed_external_holds
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let h = Held {
                         stream: s,
                         start,

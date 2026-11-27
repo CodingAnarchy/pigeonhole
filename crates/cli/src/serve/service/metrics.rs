@@ -446,6 +446,50 @@ fn render_pinning(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     }
 }
 
+/// `pigeonhole_cluster_txn_in_doubt_shares{partition}` and
+/// `pigeonhole_cluster_txn_in_doubt_wal_bytes{partition}` (D329, ICR 0148): each of a cluster
+/// node's partitions' shares of transactions across partitions held in doubt now, and the WAL
+/// bytes they keep (what `--txn-max-in-doubt` and `--txn-max-in-doubt-wal-bytes` limit). The
+/// same reading as `Status`'s: the engine's in-doubt registry, under its lock for an instant.
+/// Nothing on a single node, which has no spanning transactions.
+fn render_in_doubt(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
+    use std::fmt::Write as _;
+    let rows: Vec<(&str, usize, u64)> = parts
+        .iter()
+        .filter_map(|(id, p)| {
+            let id = (*id)?;
+            let shares = p.db.in_doubt_shares();
+            Some((id, shares.len(), shares.iter().map(|s| s.2).sum()))
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "# HELP pigeonhole_cluster_txn_in_doubt_shares Shares of transactions across \
+         partitions this partition holds in doubt now: prepared, their decision not yet \
+         known here (D329).\n# TYPE pigeonhole_cluster_txn_in_doubt_shares gauge"
+    );
+    for (id, n, _) in &rows {
+        let _ = writeln!(
+            out,
+            "pigeonhole_cluster_txn_in_doubt_shares{{partition=\"{id}\"}} {n}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP pigeonhole_cluster_txn_in_doubt_wal_bytes The WAL bytes this partition's \
+         in-doubt shares keep (D329).\n# TYPE pigeonhole_cluster_txn_in_doubt_wal_bytes gauge"
+    );
+    for (id, _, bytes) in &rows {
+        let _ = writeln!(
+            out,
+            "pigeonhole_cluster_txn_in_doubt_wal_bytes{{partition=\"{id}\"}} {bytes}"
+        );
+    }
+}
+
 /// One serve metric's `# TYPE` once (the exposition format allows it once), then a sample
 /// per partition: labelled `pigeonhole_partition` on a cluster node (D317 ticket 8b, as the
 /// engine's `pigeonhole.partition`), unlabelled on a single node. No partitions, no lines.
@@ -565,6 +609,7 @@ impl Service {
             render_text_packs(&mut text, parts);
         }
         render_pinning(&mut text, parts);
+        render_in_doubt(&mut text, parts);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
         }

@@ -351,6 +351,18 @@ async fn call(
     };
     // A read reserves twice its reply's cap for JSON (#1567, cli692's D2).
     caller.json = true;
+    // D335: a write that asked not to wait for its partition's replica acks. Only a cluster
+    // node reads the header: a single node's calls keep their cost.
+    if shared.router.is_cluster() {
+        match super::acks::replication_async(
+            headers
+                .get(super::acks::REPLICATION_HEADER)
+                .map(|v| v.as_bytes()),
+        ) {
+            Ok(a) => caller.replication_async = a,
+            Err(e) => return e.into_response(),
+        }
+    }
     // A client stream: NDJSON, its lines reserved as they arrive.
     if (service.as_str(), method.as_str()) == ("Vectors", "BulkLoad") {
         return bulk_load(&shared, &caller, req).await;

@@ -835,6 +835,7 @@ async fn run(
                 let sent = Instant::now();
                 let r = client
                     .mutate(proto::MutateRequest {
+                        replication: 0,
                         writes: Some(proto::RowWrites {
                             row: Some(proto::RowKey {
                                 table: "busy".into(),
