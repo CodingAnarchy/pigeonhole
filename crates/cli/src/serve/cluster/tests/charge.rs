@@ -122,6 +122,7 @@ fn with_silent_b(
     rt.block_on(async {
         let mut d = data(ports[0]).await;
         d.mutate(super::super::super::proto::MutateRequest {
+            replication: 0,
             writes: Some(graph_row(
                 b"a1",
                 [0.0; 4],
@@ -215,6 +216,7 @@ fn a_read_whose_budget_is_more_than_the_servers_runs_alone_and_two_take_turns() 
             data(port)
                 .await
                 .mutate(super::super::super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(graph_row(row, [0.0; 4], &[])),
                     durability: 0,
                 })
@@ -313,6 +315,7 @@ fn a_wait_for_room_that_outlasts_the_deadline_answers_overloaded() {
             data(ports[0])
                 .await
                 .mutate(super::super::super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(cells_row(r.as_bytes(), &[480_000, 480_000], 0)),
                     durability: 0,
                 })
@@ -381,6 +384,7 @@ fn a_traversal_whose_visited_set_leaves_no_room_for_a_page_ends_cut() {
             data(ports[0])
                 .await
                 .mutate(super::super::super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(graph_row(b"a1", [0.0; 4], &edges)),
                     durability: 0,
                 })
@@ -433,6 +437,7 @@ fn fanned_out_reads_through_every_node_under_a_small_budget_all_answer() {
             data(port)
                 .await
                 .mutate(super::super::super::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(graph_row(row, [0.0; 4], &edges)),
                     durability: 0,
                 })

@@ -110,6 +110,7 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
         data(a)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(w),
                 durability: 0,
             })
@@ -328,6 +329,7 @@ fn opened_off_the_others_cores_alone() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        replica_acks: 0,
         id: id.into(),
         node: "a".into(),
         epoch: 1,
@@ -442,6 +444,7 @@ fn opened_off_the_others_cores_alone() {
                 let _ = data(port)
                     .await
                     .mutate(crate::serve::proto::MutateRequest {
+                        replication: 0,
                         writes: Some(put_row(&format!("a{i}"), "1")),
                         durability: 0,
                     })
@@ -664,6 +667,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        replica_acks: 0,
         moves_history: Default::default(),
         pinned: Default::default(),
         id: id.into(),
@@ -810,6 +814,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        replica_acks: 0,
         moves_history: Default::default(),
         pinned: Default::default(),
         id: id.into(),
@@ -1198,6 +1203,7 @@ fn a_table_created_while_another_partition_opens_keeps_its_rows() {
         data(a)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(w),
                 durability: 0,
             })
@@ -1346,6 +1352,7 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        replica_acks: 0,
         moves_history: Default::default(),
         pinned: Default::default(),
         id: id.into(),

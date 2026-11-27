@@ -878,6 +878,7 @@ impl Service {
                 commit: Some(proto::CommitInfo {
                     seqno,
                     durability: 0,
+                    replica_acks: 0,
                 }),
                 parts: Vec::new(),
             })

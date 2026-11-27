@@ -181,6 +181,7 @@ fn a_feed_polls_token_resumes_through_another_node_with_no_commit_repeated_or_lo
             let mut data = data(ports[1]).await;
             for row in &written {
                 data.mutate(MutateRequest {
+                    replication: 0,
                     writes: Some(put_row(row, "v")),
                     durability: 0,
                 })
@@ -265,6 +266,7 @@ fn mcp_messages_forwarding_to_each_other_on_full_nodes_all_answer() {
                 data(port)
                     .await
                     .mutate(MutateRequest {
+                        replication: 0,
                         writes: Some(put_row(row, "v")),
                         durability: 0,
                     })
