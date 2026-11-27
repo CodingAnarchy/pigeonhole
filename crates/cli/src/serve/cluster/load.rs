@@ -54,8 +54,10 @@ pub(crate) const INTERVAL: Duration = Duration::from_secs(30);
 /// Status reads: a few KiB/s) had a ceiling near its partitions' own rates, and a lone such
 /// partition read as near 1.0: too hot, never cold (#2174). Over at least 32 MiB/s a
 /// trickle reads near 0 (1 MiB/s is 0.03), the share rises smoothly from 0 with no step,
-/// and `partition_max_load` (0.5) takes 16 MiB/s sustained, real work on any device. A
-/// device that has run faster than this keeps its own ceiling, as before.
+/// and `partition_max_load` (0.5) takes 16 MiB/s sustained. A device that has run faster
+/// than this keeps its own ceiling, as before. One that can't run 32 MiB/s never reads its
+/// whole share (one capped at 10 MiB/s reads at most 0.31), so on it only `load_cpu` can
+/// make a partition too hot (cli692's D1 on #2248): the price of reading no trickle as hot.
 pub(crate) const CEILING_FLOOR: f64 = (32u64 << 20) as f64;
 /// The longest `--balance-window`, in seconds (a day): it bounds the ceiling's seconds kept.
 pub(crate) const MAX_WINDOW_SECS: u64 = 86_400;

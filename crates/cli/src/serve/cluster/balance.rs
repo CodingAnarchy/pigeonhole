@@ -1026,16 +1026,17 @@ mod tests {
         }
     }
 
-    /// #2208: a node over the gate and over its load bound still moves, as before: at 0.09
-    /// it's real load, 2.1x the mean, and p2 lands on b within its bounds.
+    /// #2208: a node over the gate and over its load bound still moves, as before: at 0.11
+    /// it's real load, 1.74x the mean. p2 lands on b at 0.07, over the gate, so it's the
+    /// ratio that admits it (1.1x, within 1.25); p1 would take b to 1.9x (cli692's N2).
     #[test]
     fn a_node_over_the_gate_and_its_bound_still_moves() {
         let nodes = [node("a"), node("b"), node("c")];
         let parts = [
-            part("p1", "a", 0.06, 1 << 30),
+            part("p1", "a", 0.08, 1 << 30),
             part("p2", "a", 0.03, 1 << 28),
-            part("p3", "b", 0.02, 1 << 30),
-            part("p4", "c", 0.02, 1 << 30),
+            part("p3", "b", 0.04, 1 << 30),
+            part("p4", "c", 0.04, 1 << 30),
         ];
         let (mut c, mut t) = (Counters::default(), 0);
         let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
