@@ -605,6 +605,7 @@ impl Backend for ServeBackend {
             .call(ServiceOp::Batch(proto::BatchRequest {
                 rows,
                 durability: 0,
+                replication: 0,
             }))
             .map_err(|f| {
                 if f.code() == "InvalidArgument" {

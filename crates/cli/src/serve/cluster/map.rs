@@ -155,6 +155,16 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
                 ));
             }
         }
+        // D335: a write waits for at most every replica.
+        if p.replica_acks as usize > p.replicas.len() {
+            return Err(format!(
+                "partition {:?}'s replica_acks {} is more than its replica count, {}: a write \
+                 would wait for more acknowledgements than there are replicas",
+                p.id,
+                p.replica_acks,
+                p.replicas.len()
+            ));
+        }
     }
     let mut tables = HashSet::new();
     // A co-location group's single partition, and the table that set it.
@@ -1816,6 +1826,7 @@ mod tests {
             address: format!("127.0.0.1:{port}"),
         };
         let part = |id: &str, node: &str| Partition {
+            replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
             history_epoch: 0,
@@ -2538,6 +2549,7 @@ mod tests {
             address: "127.0.0.1:7003".into(),
         });
         ok.partitions.push(Partition {
+            replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
             history_epoch: 0,
@@ -2647,6 +2659,7 @@ mod tests {
         assert_eq!(history(&promoted, "p1"), (4, 4));
         // A new partition's history starts at its epoch.
         moved.partitions.push(Partition {
+            replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
             id: "p4".into(),

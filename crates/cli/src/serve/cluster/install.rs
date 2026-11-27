@@ -189,9 +189,33 @@ impl Node {
         // D331: each partition's range gate, and a source's hand-over.
         if let Some(m) = &installed {
             self.apply_moves(m);
+            // D335: each partition's replica acks as the map has them (k, its replicas),
+            // still under the install lock, as an open arms them.
+            self.apply_acks(m);
         }
         self.wake_copies(&moved);
         Ok(version)
+    }
+
+    /// D335: every open partition's replica acks take `map`'s k and replicas
+    /// ([`ReplicaAcks::configure`](crate::serve::acks::ReplicaAcks::configure)): a write
+    /// waits by the map's k, and a node the map no longer lists stops counting (A1).
+    fn apply_acks(&self, map: &ClusterMap) {
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
+            return;
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return;
+        };
+        for (id, service) in cluster.parts.load().iter() {
+            if let Some(part) = service.part_opt() {
+                part.acks.configure(crate::serve::acks::AckConfig::of(
+                    map,
+                    id,
+                    self.peers.replica_ack_timeout,
+                ));
+            }
+        }
     }
 
     /// Wakes this node's replica copies of `moved` (D330 amendment 2): their followers look
@@ -379,6 +403,10 @@ impl Node {
                 self.every_node_keeps(&map, TAIL_REPLAY_FEATURE, TAIL_REPLAY_WHAT)
                     .await?;
             }
+            if !uses_replica_acks(&current) && uses_replica_acks(&map) {
+                self.every_node_keeps(&map, REPLICA_ACK_WAIT_FEATURE, "a partition's replica_acks")
+                    .await?;
+            }
             // A node the map adds must report each adopted feature, and the writer adopts
             // what every node reports now.
             self.new_nodes_keep_adopted(&current, &map).await?;
@@ -426,6 +454,10 @@ impl Node {
             }
             if map::uses_tail_replay(&map) {
                 self.every_node_keeps(&map, TAIL_REPLAY_FEATURE, TAIL_REPLAY_WHAT)
+                    .await?;
+            }
+            if uses_replica_acks(&map) {
+                self.every_node_keeps(&map, REPLICA_ACK_WAIT_FEATURE, "a partition's replica_acks")
                     .await?;
             }
             if map::uses_failover(&map) || map.writer_term > 0 {

@@ -210,6 +210,9 @@ struct Peers {
     failover_after: Duration,
     /// `--cluster-failover-max-lag-ms` (D330 PR 2): none for 0.
     failover_max_lag: Option<Duration>,
+    /// `--cluster-replica-ack-timeout-ms` (D335): how long a write waits for its
+    /// partition's `replica_acks` acknowledgements.
+    pub(crate) replica_ack_timeout: Duration,
     /// `--balance-window` (D332): the load averages' and the device ceiling's window.
     balance_window: Duration,
     /// How often a partition's load averages take a reading ([`load::INTERVAL`]; shorter in

@@ -548,6 +548,7 @@ async fn grpc_call(
             .map(|_| ()),
         Op::Mutate => c
             .mutate(proto::MutateRequest {
+                replication: 0,
                 writes: Some(row_writes(row, value)),
                 durability: durability as i32,
             })
@@ -555,6 +556,7 @@ async fn grpc_call(
             .map(|_| ()),
         Op::Batch => c
             .batch(proto::BatchRequest {
+                replication: 0,
                 rows: (0..BATCH_ROWS)
                     .map(|i| row_writes((row + i) % rows, value))
                     .collect(),

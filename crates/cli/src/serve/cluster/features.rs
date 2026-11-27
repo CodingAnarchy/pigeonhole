@@ -21,6 +21,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     ADOPTED_FEATURES_FEATURE,
     REPLICA_ACKS_FEATURE,
     TAIL_REPLAY_FEATURE,
+    REPLICA_ACK_WAIT_FEATURE,
 ];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.adopted_features` itself: a node without it (1.3)
@@ -29,9 +30,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
 pub(crate) const ADOPTED_FEATURES_FEATURE: &str = "adopted_features";
 
 /// [`MAP_FEATURES`]' name for D335 (ICR 0146): a build that serves
-/// `Replication.FollowAcked`, so its replica copies acknowledge what they applied. D335's
-/// map fields (a partition's `replica_acks`) come under the same name: a map sets them only
-/// once every node reports it.
+/// `Replication.FollowAcked`, so its replica copies acknowledge what they applied.
 pub(crate) const REPLICA_ACKS_FEATURE: &str = "replica_acks";
 
 /// [`MAP_FEATURES`]' name for D336's `FailoverEvent` fields (`fork_token`, `tail_state`,
@@ -48,6 +47,17 @@ pub(crate) const TAIL_REPLAY_WHAT: &str = "an old owner's tail";
 /// starts with, which only that gate writes (cli692's Q2 on #2239).
 pub(crate) fn tail_replay_refusal() -> String {
     format!("the map can't add {TAIL_REPLAY_WHAT} until every node")
+}
+
+/// [`MAP_FEATURES`]' name for D335 PR 2's map field, `Partition.replica_acks`: a node
+/// without it would drop the field and read as divergent, so a map sets it only once every
+/// node reports it.
+pub(crate) const REPLICA_ACK_WAIT_FEATURE: &str = "replica_ack_wait";
+
+/// Whether `map` sets any partition's `replica_acks` (D335): what needs
+/// [`REPLICA_ACK_WAIT_FEATURE`] on every node.
+pub(crate) fn uses_replica_acks(map: &ClusterMap) -> bool {
+    map.partitions.iter().any(|p| p.replica_acks > 0)
 }
 
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,

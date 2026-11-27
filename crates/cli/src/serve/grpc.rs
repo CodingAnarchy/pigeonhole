@@ -48,6 +48,17 @@ fn caller_of<T>(shared: &Shared, req: &mut Request<T>) -> Result<auth::Caller, A
     }
 }
 
+/// D335: whether a cluster node's call asked not to wait for its partition's replica acks
+/// (`x-pigeonhole-replication`). Read only on the cluster paths, never in [`caller_of`]: a
+/// single node's calls keep their cost (the serve callgrind shapes, D193).
+fn replication_async<T>(req: &Request<T>) -> Result<bool, ApiError> {
+    super::acks::replication_async(
+        req.metadata()
+            .get(super::acks::REPLICATION_HEADER)
+            .map(|v| v.as_bytes()),
+    )
+}
+
 /// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
 /// deadline, which the budget wait and a replica's wait for the client's primary seqno share
 /// (cli692's R1 on #1594), and an HTTP/1.1 body's pre-read too (perf287 on #1613).
@@ -523,7 +534,8 @@ async fn call_served<T>(
     mut req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<(ServiceReply, Option<super::replica::Served>), Status> {
-    let caller = caller_of(shared, &mut req)?;
+    let mut caller = caller_of(shared, &mut req)?;
+    caller.replication_async = replication_async(&req)?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -1032,6 +1044,9 @@ impl proto::replication_server::Replication for ReplicationGrpc {
             }
         };
         let attached = acks.attach(&start.node);
+        #[cfg(test)]
+        let reader = tokio::spawn(read_acks(inbound, attached, cluster.node.dir().to_owned()));
+        #[cfg(not(test))]
         let reader = tokio::spawn(read_acks(inbound, attached));
         Ok(Response::new(Box::pin(Acked {
             batches: GrpcStream(batches),
@@ -1045,12 +1060,49 @@ impl proto::replication_server::Replication for ReplicationGrpc {
 async fn read_acks(
     mut inbound: tonic::Streaming<proto::FollowMessage>,
     attached: super::acks::Attached,
+    #[cfg(test)] dir: std::path::PathBuf,
 ) {
     use proto::follow_message::Kind;
-    while let Ok(Some(m)) = inbound.message().await {
+    // The test's hold: the latest acknowledgement held back while the owner is listed.
+    #[cfg(test)]
+    let mut held: Option<super::acks::Pos> = None;
+    #[cfg(test)]
+    let holding = || {
+        super::cluster::HOLD_ACKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|d| dir.starts_with(d))
+    };
+    loop {
+        #[cfg(test)]
+        if let Some(p) = held
+            && !holding()
+        {
+            attached.ack(p);
+            held = None;
+        }
+        #[cfg(test)]
+        let m = tokio::select! {
+            m = inbound.message() => m,
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)), if held.is_some() => {
+                continue;
+            }
+        };
+        #[cfg(not(test))]
+        let m = inbound.message().await;
+        let Ok(Some(m)) = m else {
+            return;
+        };
         match m.kind {
             Some(Kind::Ack(proto::Ack { position: Some(p) })) => {
-                attached.ack(super::acks::Pos::from(&p))
+                let p = super::acks::Pos::from(&p);
+                #[cfg(test)]
+                if holding() {
+                    held = held.max(Some(p));
+                    continue;
+                }
+                attached.ack(p)
             }
             _ => return,
         }
@@ -1139,7 +1191,11 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
         mut req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
     ) -> Result<Response<proto::Empty>, Status> {
         let shared = &self.0;
-        let caller = caller_of(shared, &mut req)?;
+        let mut caller = caller_of(shared, &mut req)?;
+        // D335: a bulk load opted down by the header (a cluster node's only).
+        if shared.router.is_cluster() {
+            caller.replication_async = replication_async(&req)?;
+        }
         let first_budget = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
         let meter = req.extensions().get::<Meter>().cloned().unwrap_or_default();
         let limits = shared.limits;

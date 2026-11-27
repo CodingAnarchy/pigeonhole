@@ -649,6 +649,7 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
             data(b)
                 .await
                 .mutate(crate::serve::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(put_row("ann", "2")),
                     durability: 0,
                 })
@@ -1228,6 +1229,7 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
         let e = data(c)
             .await
             .mutate(MutateRequest {
+                replication: 0,
                 writes: Some(put_row("amy", "0")),
                 durability: 0,
             })
@@ -1251,6 +1253,7 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
         let e = data(c)
             .await
             .mutate(MutateRequest {
+                replication: 0,
                 writes: Some(put_row("amy", "1")),
                 durability: 0,
             })
