@@ -330,6 +330,7 @@ fn opened_off_the_others_cores_alone() {
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
         replica_acks: 0,
+        replica_ack_policy: 0,
         id: id.into(),
         node: "a".into(),
         epoch: 1,
