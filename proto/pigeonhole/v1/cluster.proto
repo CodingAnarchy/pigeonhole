@@ -1357,6 +1357,10 @@ message DecideTxnRequest {
 message ResolveTxn {
   string xid = 1;
   string acked = 2;
+  // D336 PR 3a: answer from the home's decision row alone and write nothing: no row (or a
+  // live session) answers UNKNOWN, never an abort marker. An old owner's tail replay asks
+  // so (Amendment 5's (a)): since #2164 an absent row may be a collected COMMITTED.
+  bool read_only = 3;
 }
 
 // The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and

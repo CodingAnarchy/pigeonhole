@@ -257,6 +257,34 @@ pub(crate) enum ClusterCommand {
         #[arg(long, conflicts_with = "old_unreachable")]
         copy: bool,
     },
+    /// Replay a partition's old owner's tail (D336): the commits a failover left on the old
+    /// owner's file past the fork, which no replica applied, are applied on the partition's
+    /// owner at their original timestamps, each as a new commit. It picks the partition's
+    /// oldest PENDING tail, or `--event`'s, and the owner reads it from the old node (which
+    /// opens its file as a tail source, closed again `TAIL_SOURCE_IDLE`, 60 s, after its last
+    /// read). Once the owner reports the whole tail applied, skipped or refused, the tail is
+    /// set DONE through the map's writer. Run it again to resume one that stopped: it goes
+    /// on from its mark.
+    ReplayTail {
+        partition: String,
+        /// The failover event, by the epoch it gave the partition (`to_epoch`, as `status`
+        /// lists it); default the oldest PENDING one.
+        #[arg(long, value_name = "EPOCH")]
+        event: Option<u64>,
+        /// Read the whole tail and apply nothing: report what would be applied, skipped and
+        /// refused.
+        #[arg(long, conflicts_with = "discard")]
+        dry_run: bool,
+        /// Give the tail up with no replay (DISCARDED): its commits are lost, and the old
+        /// node may drop its file.
+        #[arg(long)]
+        discard: bool,
+        /// Report after SECS (at least 1); the replay goes on. Default 60.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
     /// Make node `--to`, which holds a replica of the partition, its owner (D328): the
     /// replica copy is closed, made a primary at the last commit it applied and stamped at
     /// the next epoch, then the map gives `--to` the partition, with a new change-feed
@@ -650,6 +678,21 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             old_unreachable,
             copy,
         } => runtime()?.block_on(relocate(node, partition, to, *old_unreachable, *copy)),
+        ClusterCommand::ReplayTail {
+            partition,
+            event,
+            dry_run,
+            discard,
+            timeout,
+            node,
+        } => runtime()?.block_on(super::replay_cli::run(
+            node,
+            partition,
+            *event,
+            *dry_run,
+            *discard,
+            timeout.map(Duration::from_secs),
+        )),
         ClusterCommand::Promote {
             partition,
             to,

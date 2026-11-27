@@ -27661,12 +27661,18 @@ impl serde::Serialize for ResolveTxn {
         if !self.acked.is_empty() {
             len += 1;
         }
+        if self.read_only {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ResolveTxn", len)?;
         if !self.xid.is_empty() {
             struct_ser.serialize_field("xid", &self.xid)?;
         }
         if !self.acked.is_empty() {
             struct_ser.serialize_field("acked", &self.acked)?;
+        }
+        if self.read_only {
+            struct_ser.serialize_field("read_only", &self.read_only)?;
         }
         struct_ser.end()
     }
@@ -27680,12 +27686,15 @@ impl<'de> serde::Deserialize<'de> for ResolveTxn {
         const FIELDS: &[&str] = &[
             "xid",
             "acked",
+            "read_only",
+            "readOnly",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Xid,
             Acked,
+            ReadOnly,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -27709,6 +27718,7 @@ impl<'de> serde::Deserialize<'de> for ResolveTxn {
                         match value {
                             "xid" => Ok(GeneratedField::Xid),
                             "acked" => Ok(GeneratedField::Acked),
+                            "readOnly" | "read_only" => Ok(GeneratedField::ReadOnly),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -27730,6 +27740,7 @@ impl<'de> serde::Deserialize<'de> for ResolveTxn {
             {
                 let mut xid__ = None;
                 let mut acked__ = None;
+                let mut read_only__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Xid => {
@@ -27744,11 +27755,18 @@ impl<'de> serde::Deserialize<'de> for ResolveTxn {
                             }
                             acked__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ReadOnly => {
+                            if read_only__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("readOnly"));
+                            }
+                            read_only__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ResolveTxn {
                     xid: xid__.unwrap_or_default(),
                     acked: acked__.unwrap_or_default(),
+                    read_only: read_only__.unwrap_or_default(),
                 })
             }
         }

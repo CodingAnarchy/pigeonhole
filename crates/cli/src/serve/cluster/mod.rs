@@ -40,6 +40,7 @@ pub(crate) mod range_follow;
 mod range_merge;
 pub(crate) mod range_move;
 pub(crate) mod range_prune;
+mod replay_cli;
 pub(crate) mod replay_tag;
 mod restore;
 pub(crate) mod route;

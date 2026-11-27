@@ -326,15 +326,21 @@ impl Node {
         }
         let open_here = self.fences.is_opening(id)
             || self.fences.gate(id).is_some()
-            || self.server.get().and_then(|o| o.shared.upgrade()).is_some_and(|s| {
-                s.router.cluster.as_ref().is_some_and(|c| {
-                    c.parts.load().contains_key(id) || c.replicas.load().contains_key(id)
-                })
-            });
+            || self
+                .server
+                .get()
+                .and_then(|o| o.shared.upgrade())
+                .is_some_and(|s| {
+                    s.router.cluster.as_ref().is_some_and(|c| {
+                        c.parts.load().contains_key(id) || c.replicas.load().contains_key(id)
+                    })
+                });
         if open_here {
             return Err(ApiError::failed_precondition(format!(
                 "partition {id:?} is still open on node {:?} in another role (a fenced owner, \
-                 or a copy): it serves as a tail source once that closes; retry",
+                 or a copy): it serves as a tail source once that closes (an old owner's file \
+                 stays open, fenced, until closed: phdb cluster close {id} --node <node {0:?}'s \
+                 URL>); retry",
                 self.id
             )));
         }
@@ -431,8 +437,8 @@ fn open_source(
     // A file whose feed recorded a shard count keeps it (ICR 0132), whatever `share` says.
     let options = super::open::options_for(served, share, None, None, false);
     let options = Memory::with_caches(1, MEMTABLE_FLOOR, 0).apply(options);
-    let db = super::open_retrying(path, &options)
-        .map_err(|e| ApiError::from_engine(&e).for_read())?;
+    let db =
+        super::open_retrying(path, &options).map_err(|e| ApiError::from_engine(&e).for_read())?;
     let hold = match db.hold_feed_retention(cap) {
         Ok(h) => h,
         Err(e) => {

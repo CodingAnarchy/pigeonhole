@@ -21,7 +21,7 @@
 //!   map, a family the owner's table lacks (its reconcile hasn't caught up), a corrupt tag,
 //!   and a D329 share or decision whose outcome isn't settled (Amendment 5).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -198,13 +198,24 @@ pub(crate) fn read_mark(db: &Pigeonhole, h: u64) -> Result<Option<Mark>, ApiErro
 }
 
 /// A logged put of `value` to `row`'s `q` in the marks' family, now.
-fn put(b: &mut pigeonhole::replication::LoggedBatch<'_>, t: &pigeonhole::Table, row: &[u8], q: &[u8], value: &[u8]) {
+fn put(
+    b: &mut pigeonhole::replication::LoggedBatch<'_>,
+    t: &pigeonhole::Table,
+    row: &[u8],
+    q: &[u8],
+    value: &[u8],
+) {
     // A plain value's stored form: its tag, then its bytes.
     let stored = [&[0u8][..], value].concat();
     b.push(t, row, FAMILY, ChangeKind::Put, q, now_micros(), &stored);
 }
 
-fn push_mark(b: &mut pigeonhole::replication::LoggedBatch<'_>, t: &pigeonhole::Table, h: u64, m: &Mark) {
+fn push_mark(
+    b: &mut pigeonhole::replication::LoggedBatch<'_>,
+    t: &pigeonhole::Table,
+    h: u64,
+    m: &Mark,
+) {
     let row = mark_row(h);
     put(b, t, &row, b"seqno", m.seqno.to_string().as_bytes());
     put(b, t, &row, b"token", &m.token);
@@ -235,10 +246,29 @@ fn derived_tables(map: &proto::ClusterMap) -> BTreeMap<String, &'static str> {
 enum Verdict {
     /// Its kept changes (by index into the commit's), with the reason any others were
     /// passed over.
-    Apply { kept: Vec<usize>, passed: Option<&'static str> },
+    Apply {
+        kept: Vec<usize>,
+        passed: Option<&'static str>,
+    },
     /// Nothing to apply: the mark alone moves.
     Skip(&'static str),
     /// Refused whole (R1): the mark moves past it, and it's named.
+    Refuse(String),
+}
+
+/// What a tail commit's D329 side comes to (Amendment 5).
+#[derive(Debug)]
+enum Txn {
+    /// No transaction's: as §7 judges it.
+    Plain,
+    /// Abort markers to write, each `(row, stored, ts)` (d).
+    Rows(Vec<(Vec<u8>, Vec<u8>, u64)>),
+    /// A branch's decided share, applied with its xid; with `drop_first`, the copy's prepare
+    /// of it goes first (b).
+    Share { drop_first: bool },
+    /// A home's commit point (c): its row's latest value in the tail, then its share.
+    CommitPoint((Vec<u8>, Vec<u8>, u64)),
+    /// Refused whole, named.
     Refuse(String),
 }
 
@@ -318,6 +348,7 @@ impl Judge<'_> {
 struct Ctx {
     db: Pigeonhole,
     gate: Arc<WriteGate>,
+    service: Arc<crate::serve::service::Service>,
 }
 
 impl Node {
@@ -456,6 +487,7 @@ impl Node {
         Ok(Ctx {
             db: service.part()?.db.clone(),
             gate,
+            service,
         })
     }
 
@@ -476,6 +508,9 @@ impl Node {
             )));
         }
         run.progress().mark = mark.seqno;
+        // Each decision row's last value in the tail (R2 as Amendment 1's M1 has it: a
+        // commit point's branches as their later acks left them).
+        let latest = self.latest_decisions(&event, &mark).await?;
         let mut stream = self.open_tail(&event, &mark).await?;
         loop {
             let msg = std::future::poll_fn(|c| stream.as_mut().poll_next(c))
@@ -500,7 +535,7 @@ impl Node {
                     }
                     self.pending_tail(id, h, e)?;
                     let cx = self.replay_ctx(id)?;
-                    self.replay_one(id, run, &cx, &mut mark, c).await?;
+                    self.replay_one(id, run, &cx, &mut mark, c, &latest).await?;
                 }
                 None => return Err(ApiError::internal("an empty ReadTail message")),
             }
@@ -508,6 +543,7 @@ impl Node {
     }
 
     /// One tail commit: judged, then applied, skipped or refused, with the mark.
+    #[allow(clippy::too_many_lines)]
     async fn replay_one(
         &self,
         id: &str,
@@ -515,6 +551,7 @@ impl Node {
         cx: &Ctx,
         mark: &mut Mark,
         c: proto::TailCommit,
+        latest: &HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<(), ApiError> {
         let h = run.from_history_epoch;
         let (origin, xid) = match replay_tag::split(&c.tag) {
@@ -542,114 +579,334 @@ impl Node {
             .transpose()?
             .flatten();
         if other.as_ref().is_some_and(|m| m.seqno >= origin.seqno) {
-            return self.pass_tail(id, run, cx, mark, next, "already", None).await;
-        }
-        if !xid.is_empty() {
-            return Err(ApiError::failed_precondition(format!(
-                "tail commit {} is a share of transaction {}: PR 3a's replay stops at a D329 \
-                 share or decision; discard the tail, or wait for a build that settles it",
-                c.seqno,
-                String::from_utf8_lossy(&xid)
-            )));
+            return self
+                .pass_tail(id, run, cx, mark, next, "already", None)
+                .await;
         }
         let map = self.get_map()?;
-        let routes = self.routes();
-        let routes = routes
-            .as_ref()
-            .ok_or_else(|| ApiError::partition_unavailable("this node has no map yet"))?;
-        let derived = derived_tables(&map);
-        let records = super::schema::records(&cx.db).map_err(ApiError::internal)?;
-        let verdict = Judge {
-            partition: id,
-            routes,
-            derived: &derived,
-            records: &records,
-        }
-        .judge(&c);
-        match verdict {
-            Verdict::Skip(why) => self.pass_tail(id, run, cx, mark, next, why, None).await,
+        let verdict = {
+            let routes = self.routes();
+            let routes = routes
+                .as_ref()
+                .ok_or_else(|| ApiError::partition_unavailable("this node has no map yet"))?;
+            let derived = derived_tables(&map);
+            let records = super::schema::records(&cx.db).map_err(ApiError::internal)?;
+            Judge {
+                partition: id,
+                routes,
+                derived: &derived,
+                records: &records,
+            }
+            .judge(&c)
+        };
+        let (kept, passed) = match verdict {
             Verdict::Refuse(why) => {
                 eprintln!(
                     "phdb serve: partition {id}'s tail replay refused commit {} (history epoch \
                      {h}): {why}",
                     c.seqno
                 );
-                self.pass_tail(id, run, cx, mark, next, "refused", Some(why)).await
+                return self
+                    .pass_tail(id, run, cx, mark, next, "refused", Some(why))
+                    .await;
             }
-            Verdict::Apply { kept, passed } => {
-                if let Some(why) = passed {
-                    run.named(c.seqno, why);
-                }
-                if run.dry_run {
-                    run.progress().applied += 1;
-                    *mark = next;
-                    return Ok(());
-                }
-                // The other history's mark moves with it, with that history's token as the
-                // earlier replay wrote it in this very commit (S3's chain).
-                let other_mark = (origin.history_epoch != h).then(|| Mark {
-                    seqno: origin.seqno,
-                    token: carried_token(&c, origin.history_epoch)
-                        .or_else(|| other.map(|m| m.token))
-                        .unwrap_or_default(),
-                });
-                let tag = replay_tag::encode(origin, &xid).ok_or_else(|| {
-                    ApiError::internal(format!(
-                        "tail commit {}'s replay tag passes 255 bytes",
-                        c.seqno
-                    ))
-                })?;
-                let (db, changes) = (cx.db.clone(), c.changes);
-                let (m, om) = (next.clone(), other_mark);
-                let held = cx.gate.enter()?;
-                tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-                    let marks = marks_table(&db)?;
-                    let mut tables: BTreeMap<&str, pigeonhole::Table> = BTreeMap::new();
-                    let mut b = db.logged_batch();
-                    for i in kept {
-                        let ch = &changes[i];
-                        let t = match tables.get(ch.table.as_str()) {
-                            Some(t) => t,
-                            None => {
-                                let t = db.table(&ch.table)?.open()?;
-                                tables.entry(ch.table.as_str()).or_insert(t)
-                            }
-                        };
-                        if !t.families().contains(&ch.family.as_str()) {
-                            return Err(ApiError::failed_precondition(format!(
-                                "table {} here has no family {}: its schema reconcile hasn't \
-                                 caught up; the replay stops, and a rerun resumes",
-                                ch.table, ch.family
-                            )));
-                        }
-                        b.push(
-                            t,
-                            &ch.row,
-                            &ch.family,
-                            super::range_follow::change_kind(ch.kind)?,
-                            &ch.qualifier,
-                            ch.timestamp,
-                            &ch.stored,
-                        );
-                    }
-                    push_mark(&mut b, &marks, h, &m);
-                    if let Some(om) = &om {
-                        push_mark(&mut b, &marks, origin.history_epoch, om);
-                    }
-                    b.tag_xid(&tag);
-                    b.commit_with(pigeonhole::Durability::GroupSync)?;
-                    Ok(())
-                })
-                .await
-                .map_err(|e| ApiError::internal(format!("a tail replay's commit: {e}")))??;
-                held.committed()?;
-                run.progress().applied += 1;
-                self.replays.count(id, "applied");
-                *mark = next;
-                run.progress().mark = mark.seqno;
-                Ok(())
+            // Catalog changes, range drops and feed-silent commits hold no D329 row.
+            Verdict::Skip(why @ ("catalog" | "range_drop" | "silent")) => {
+                return self.pass_tail(id, run, cx, mark, next, why, None).await;
             }
+            Verdict::Skip(why) => (Vec::new(), Some(why)),
+            Verdict::Apply { kept, passed } => (kept, passed),
+        };
+        // D329 (Amendment 5): what the commit's transaction rows and xid come to.
+        let txn = self.judge_txn(id, cx, &map, &c, &xid, latest).await?;
+        let (rows, drop_first, keep_xid) = match txn {
+            Txn::Plain => (Vec::new(), false, !xid.is_empty()),
+            Txn::Rows(rows) => (rows, false, false),
+            Txn::Share { drop_first } => (Vec::new(), drop_first, true),
+            Txn::CommitPoint(row) => (vec![row], false, true),
+            Txn::Refuse(why) => {
+                eprintln!(
+                    "phdb serve: partition {id}'s tail replay refused commit {} (history epoch \
+                     {h}): {why}",
+                    c.seqno
+                );
+                return self
+                    .pass_tail(id, run, cx, mark, next, "refused", Some(why))
+                    .await;
+            }
+        };
+        if kept.is_empty() && rows.is_empty() {
+            return self
+                .pass_tail(
+                    id,
+                    run,
+                    cx,
+                    mark,
+                    next,
+                    passed.unwrap_or("nothing_kept"),
+                    None,
+                )
+                .await;
         }
+        if let Some(why) = passed {
+            run.named(c.seqno, why);
+        }
+        if run.dry_run {
+            run.progress().applied += 1;
+            *mark = next;
+            return Ok(());
+        }
+        // (b), simp724's and the coordinator's shape: the copy's prepare of the share is
+        // dropped first, writing no data, no decision and no feed event; the share then
+        // lands below with the mark, in one commit. A crash between the two finds the share
+        // no longer in doubt and the mark unmoved, and the rerun asks the home (path (a)).
+        if drop_first {
+            let (db, x) = (cx.db.clone(), xid.clone());
+            let held = cx.gate.enter()?;
+            tokio::task::spawn_blocking(move || db.decide(&x, false).map_err(ApiError::from))
+                .await
+                .map_err(|e| ApiError::internal(format!("a tail replay's drop: {e}")))??;
+            held.committed()?;
+            #[cfg(test)]
+            seams::after_drop(&self.dir)?;
+        }
+        // The other history's mark moves with it, with that history's token as the earlier
+        // replay wrote it in this very commit (S3's chain).
+        let other_mark = (origin.history_epoch != h).then(|| Mark {
+            seqno: origin.seqno,
+            token: carried_token(&c, origin.history_epoch)
+                .or_else(|| other.map(|m| m.token))
+                .unwrap_or_default(),
+        });
+        let tag =
+            replay_tag::encode(origin, if keep_xid { &xid } else { b"" }).ok_or_else(|| {
+                ApiError::internal(format!(
+                    "tail commit {}'s replay tag passes 255 bytes",
+                    c.seqno
+                ))
+            })?;
+        let (db, changes) = (cx.db.clone(), c.changes);
+        let (m, om) = (next.clone(), other_mark);
+        let decisions = if rows.is_empty() {
+            None
+        } else {
+            Some(cx.service.decisions_table().await?)
+        };
+        let held = cx.gate.enter()?;
+        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+            let marks = marks_table(&db)?;
+            let mut tables: BTreeMap<&str, pigeonhole::Table> = BTreeMap::new();
+            let mut b = db.logged_batch();
+            // A commit point's row first, before the share it carries (Amendment 1's M1).
+            if let Some(t) = &decisions {
+                for (row, stored, ts) in &rows {
+                    b.push(
+                        t,
+                        row,
+                        super::spanning::DECISION_FAMILY,
+                        ChangeKind::Put,
+                        super::spanning::DECISION_QUALIFIER,
+                        *ts,
+                        stored,
+                    );
+                }
+            }
+            for i in kept {
+                let ch = &changes[i];
+                let t = match tables.get(ch.table.as_str()) {
+                    Some(t) => t,
+                    None => {
+                        let t = db.table(&ch.table)?.open()?;
+                        tables.entry(ch.table.as_str()).or_insert(t)
+                    }
+                };
+                if !t.families().contains(&ch.family.as_str()) {
+                    return Err(ApiError::failed_precondition(format!(
+                        "table {} here has no family {}: its schema reconcile hasn't caught \
+                         up; the replay stops, and a rerun resumes",
+                        ch.table, ch.family
+                    )));
+                }
+                b.push(
+                    t,
+                    &ch.row,
+                    &ch.family,
+                    super::range_follow::change_kind(ch.kind)?,
+                    &ch.qualifier,
+                    ch.timestamp,
+                    &ch.stored,
+                );
+            }
+            push_mark(&mut b, &marks, h, &m);
+            if let Some(om) = &om {
+                push_mark(&mut b, &marks, origin.history_epoch, om);
+            }
+            b.tag_xid(&tag);
+            b.commit_with(pigeonhole::Durability::GroupSync)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("a tail replay's commit: {e}")))??;
+        held.committed()?;
+        run.progress().applied += 1;
+        self.replays.count(id, "applied");
+        *mark = next;
+        run.progress().mark = mark.seqno;
+        #[cfg(test)]
+        seams::after_apply(&self.dir)?;
+        Ok(())
+    }
+
+    /// Amendment 5's rules for tail commit `c` of partition `id`, whose tag's xid is `xid`
+    /// (empty for none), with `latest` each decision row's last value in the tail.
+    async fn judge_txn(
+        &self,
+        id: &str,
+        cx: &Ctx,
+        map: &proto::ClusterMap,
+        c: &proto::TailCommit,
+        xid: &[u8],
+        latest: &HashMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<Txn, ApiError> {
+        use proto::TxnOutcomeState as S;
+        let decisions: Vec<&proto::RawChange> = c
+            .changes
+            .iter()
+            .filter(|ch| ch.table == super::spanning::DECISIONS)
+            .collect();
+        let x = String::from_utf8_lossy(xid).into_owned();
+        // (c): a home's commit point, its share and its decision row in one commit.
+        if !xid.is_empty() && decisions.iter().any(|ch| *ch.row == *xid) {
+            if cx.service.decision(&x).await?.is_some() {
+                return Ok(Txn::Refuse(format!(
+                    "r2: transaction {x}'s commit point, which this owner already holds a \
+                     decision for"
+                )));
+            }
+            let ch = decisions
+                .iter()
+                .find(|ch| *ch.row == *xid && !ch.stored.is_empty())
+                .ok_or_else(|| ApiError::internal("a commit point's row with no value"))?;
+            let value = latest
+                .get(xid)
+                .cloned()
+                .unwrap_or_else(|| ch.stored.get(1..).unwrap_or_default().to_vec());
+            let text = String::from_utf8_lossy(&value).into_owned();
+            let mut unknown = Vec::new();
+            for b in text.lines().skip(1).filter(|l| !l.starts_with('+')) {
+                if !self.share_in_doubt(map, b, &x).await {
+                    unknown.push(b.to_owned());
+                }
+            }
+            if !unknown.is_empty() {
+                return Ok(Txn::Refuse(format!(
+                    "r2: transaction {x}'s commit point, whose branches {} neither acked it nor \
+                     hold it in doubt: replaying it could break the transaction's atomicity",
+                    unknown.join(", ")
+                )));
+            }
+            let stored = [&[0u8][..], &value].concat();
+            return Ok(Txn::CommitPoint((xid.to_vec(), stored, ch.timestamp)));
+        }
+        // (d): abort markers, each only over no decision here; a row's acks and its
+        // collection are the commit point's and the home's own.
+        if xid.is_empty() && !decisions.is_empty() {
+            let mut rows = Vec::new();
+            for ch in decisions {
+                if !ch
+                    .stored
+                    .get(1..)
+                    .is_some_and(|v| v.starts_with(b"aborted "))
+                {
+                    continue;
+                }
+                let tx = String::from_utf8_lossy(&ch.row).into_owned();
+                if cx.service.decision(&tx).await?.is_some() {
+                    return Ok(Txn::Refuse(format!(
+                        "an abort marker of transaction {tx}, which this owner already holds a \
+                         decision for"
+                    )));
+                }
+                rows.push((ch.row.to_vec(), ch.stored.to_vec(), ch.timestamp));
+            }
+            return Ok(if rows.is_empty() {
+                Txn::Plain
+            } else {
+                Txn::Rows(rows)
+            });
+        }
+        if xid.is_empty() {
+            return Ok(Txn::Plain);
+        }
+        let home = crate::serve::sessions::spanning_parts(&x).map(|(home, ..)| home.to_owned());
+        if home.as_deref() == Some(id) {
+            return Ok(Txn::Plain);
+        }
+        // A branch's decided share. (b): this copy still holds its prepare in doubt.
+        if cx.db.in_doubt().iter().any(|(held, _)| *held == *xid) {
+            return Ok(Txn::Share { drop_first: true });
+        }
+        // (a): its home's decision row, read only.
+        let asked = self.ask_home_read_only(&x).await;
+        match asked {
+            Ok(r) if r.state == S::Committed as i32 => Ok(Txn::Share { drop_first: false }),
+            Ok(r) if r.state == S::Aborted as i32 => Ok(Txn::Refuse(format!(
+                "conflict: transaction {x}'s share was applied on the old owner, but its home \
+                 records it aborted"
+            ))),
+            Ok(r) => Err(ApiError::failed_precondition(format!(
+                "in_doubt: transaction {x}'s share, whose home has no decision for it ({}): \
+                 decide it with phdb cluster txn decide, then run replay-tail again, or discard \
+                 the tail",
+                r.reason
+            ))),
+            Err(e) => Err(ApiError::failed_precondition(format!(
+                "in_doubt: transaction {x}'s share, whose home didn't answer ({}): run \
+                 replay-tail again once it does, or discard the tail",
+                e.message
+            ))),
+        }
+    }
+
+    /// Whether branch `branch` of transaction `xid` is held in doubt on its owner now.
+    async fn share_in_doubt(&self, map: &proto::ClusterMap, branch: &str, xid: &str) -> bool {
+        let Some(p) = map.partitions.iter().find(|p| p.id == branch) else {
+            return false;
+        };
+        matches!(
+            self.row_of(&p.node, branch).await,
+            Ok(Some(lp)) if lp.in_doubt_shares.iter().any(|s| s.xid == xid)
+        )
+    }
+
+    /// Amendment 5's (a): transaction `xid`'s home's decision row, read only.
+    async fn ask_home_read_only(&self, xid: &str) -> Result<proto::TxnResolution, ApiError> {
+        #[cfg(test)]
+        seams::ASKED_HOME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((self.dir.clone(), xid.to_owned()));
+        let shared = self
+            .server
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .ok_or_else(|| ApiError::partition_unavailable("the server is stopping"))?;
+        let cluster = shared
+            .router
+            .cluster
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("not a cluster node"))?;
+        super::spanning::ask_home(
+            &cluster.node,
+            &cluster.parts,
+            &cluster.forwarder,
+            &cluster.spanning,
+            xid,
+            None,
+            shared.limits.request_timeout,
+            true,
+        )
+        .await
     }
 
     /// A tail commit passed over (`why`), or refused (`refused` names it): its mark alone.
@@ -666,7 +923,8 @@ impl Node {
     ) -> Result<(), ApiError> {
         let seqno = next.seqno;
         if !run.dry_run {
-            self.commit_mark_only(cx, run.from_history_epoch, &next).await?;
+            self.commit_mark_only(cx, run.from_history_epoch, &next)
+                .await?;
         }
         *mark = next;
         let outcome = match (&refused, why) {
@@ -712,13 +970,61 @@ impl Node {
         Ok(())
     }
 
-    /// `ReadTail` on `event`'s old node, from `mark`.
+    /// Reads the tail from `mark` once for each decision row's last value in it.
+    async fn latest_decisions(
+        &self,
+        event: &proto::FailoverEvent,
+        mark: &Mark,
+    ) -> Result<HashMap<Vec<u8>, Vec<u8>>, ApiError> {
+        let mut out = HashMap::new();
+        let mut stream = self.open_tail(event, mark).await?;
+        loop {
+            let msg = std::future::poll_fn(|c| stream.as_mut().poll_next(c))
+                .await
+                .ok_or_else(|| ApiError::unavailable("the tail source's stream ended early"))??;
+            match msg.event {
+                Some(Event::Commit(c)) => {
+                    for ch in c.changes.iter().filter(|ch| {
+                        ch.table == super::spanning::DECISIONS && !ch.stored.is_empty()
+                    }) {
+                        out.insert(ch.row.to_vec(), ch.stored[1..].to_vec());
+                    }
+                }
+                Some(Event::End(_)) | None => return Ok(out),
+            }
+        }
+    }
+
+    /// `ReadTail` on `event`'s old node, from `mark`: retried a moment while the source is
+    /// still busy with the stream before.
     async fn open_tail(
         &self,
         event: &proto::FailoverEvent,
         mark: &Mark,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<proto::ReadTailEvent, ApiError>> + Send>>, ApiError>
-    {
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<proto::ReadTailEvent, ApiError>> + Send>>,
+        ApiError,
+    > {
+        let mut wait = Duration::from_millis(20);
+        loop {
+            match self.open_tail_once(event, mark).await {
+                Err(e) if e.code == "Unavailable" && wait < Duration::from_secs(2) => {
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn open_tail_once(
+        &self,
+        event: &proto::FailoverEvent,
+        mark: &Mark,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<proto::ReadTailEvent, ApiError>> + Send>>,
+        ApiError,
+    > {
         let shared = self
             .server
             .get()
@@ -812,5 +1118,219 @@ impl Stream for Remote {
             .map(|item| {
                 item.map(|r| r.map_err(|s| super::forward::classify(&s, &this.address, false)))
             })
+    }
+}
+
+impl Node {
+    /// Partition `partition`'s line in node `id`'s `Status` (this node's own, or a peer's
+    /// within the push timeout).
+    async fn row_of(
+        &self,
+        id: &str,
+        partition: &str,
+    ) -> Result<Option<proto::LocalPartition>, ApiError> {
+        let st = if id == self.id {
+            let me = self
+                .me
+                .upgrade()
+                .ok_or_else(|| ApiError::partition_unavailable("the node is stopping"))?;
+            tokio::task::spawn_blocking(move || me.status()).await?
+        } else {
+            let address = self
+                .address_of(id)
+                .map_err(|f| ApiError::unavailable(f.message().to_owned()))?;
+            tokio::time::timeout(self.peers.push_timeout, async {
+                let mut c = self.client(&address).await?;
+                c.status(self.request(proto::StatusRequest::default())?)
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|s| s.message().to_owned())
+            })
+            .await
+            .map_err(|_| ApiError::unavailable(format!("node {id:?}: timed out")))?
+            .map_err(|e| ApiError::unavailable(format!("node {id:?}: {e}")))?
+        };
+        Ok(st.partitions.into_iter().find(|lp| lp.id == partition))
+    }
+
+    /// The writer's checks on `new` over `current` for old owners' tails (D336 PR 3a):
+    /// - **C4:** a tail goes DONE only as its owner reports it: P's owner at P's epoch in
+    ///   `current` answers a finished replay of that event (not running, no error) whose
+    ///   mark reached the source's end and equals `replayed_through`;
+    /// - **C3:** a node a PENDING tail names as its old owner leaves the map only by a forced
+    ///   map, which records the tail DISCARDED ([`discard_removed_sources`]).
+    pub(super) async fn check_tails(
+        &self,
+        current: &proto::ClusterMap,
+        new: &proto::ClusterMap,
+    ) -> Result<(), ApiError> {
+        use proto::TailState as T;
+        for e in current
+            .failovers
+            .iter()
+            .filter(|e| e.tail_state() == T::Pending)
+        {
+            if !new.nodes.iter().any(|n| n.id == e.from) {
+                return Err(ApiError::failed_precondition(format!(
+                    "node {:?} holds partition {:?}'s old owner's tail, PENDING: replay it or \
+                     discard it (phdb cluster replay-tail {} [--discard]) before the map drops \
+                     the node, or drop it with a forced map, which discards the tail",
+                    e.from, e.partition, e.partition
+                )));
+            }
+            let Some(n) = new.failovers.iter().find(|n| {
+                n.kind == e.kind
+                    && n.partition == e.partition
+                    && n.to == e.to
+                    && n.to_epoch == e.to_epoch
+            }) else {
+                continue;
+            };
+            if n.tail_state() != T::Done {
+                continue;
+            }
+            let Some(p) = current.partitions.iter().find(|p| p.id == e.partition) else {
+                return Err(ApiError::failed_precondition(format!(
+                    "partition {:?} isn't in the map: its tail can't be confirmed replayed",
+                    e.partition
+                )));
+            };
+            let lp = self.row_of(&p.node, &p.id).await?;
+            let done = lp.as_ref().and_then(|lp| {
+                let r = lp.replay.as_ref()?;
+                (lp.epoch == p.epoch
+                    && r.from_history_epoch == e.from_history_epoch
+                    && r.from_epoch == e.from_epoch
+                    && !r.running
+                    && r.last_error.is_empty()
+                    && r.source_end > 0
+                    && r.mark >= r.source_end)
+                    .then_some(r.mark)
+            });
+            if done != Some(n.replayed_through) {
+                return Err(ApiError::failed_precondition(format!(
+                    "partition {:?}'s owner {:?} reports no finished replay of its old owner's \
+                     tail (history epoch {}) at mark {}: a tail is set DONE only by its replay \
+                     (phdb cluster replay-tail {})",
+                    e.partition, p.node, e.from_history_epoch, n.replayed_through, e.partition
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// C3 (cli692 on the design): a forced map that drops a node a PENDING tail names as its old
+/// owner records that tail DISCARDED, its fork token cleared: nothing can read it now.
+pub(super) fn discard_removed_sources(map: &mut proto::ClusterMap) -> Vec<String> {
+    let mut discarded = Vec::new();
+    let nodes: Vec<String> = map.nodes.iter().map(|n| n.id.clone()).collect();
+    for e in map
+        .failovers
+        .iter_mut()
+        .filter(|e| e.tail_state() == proto::TailState::Pending && !nodes.contains(&e.from))
+    {
+        e.set_tail_state(proto::TailState::Discarded);
+        e.fork_token = Default::default();
+        discarded.push(format!(
+            "partition {}'s old owner's tail (node {}, history epoch {}): source node removed",
+            e.partition, e.from, e.from_history_epoch
+        ));
+    }
+    discarded
+}
+
+impl Node {
+    /// After an install of `map` (D336 PR 3a, Amendment 4): each partition open here as its
+    /// owner, with a lease, drops the promotes' fork rows that no PENDING tail of it names
+    /// (DONE, DISCARDED, NONE, or an event gone from the map). Best effort, through the gate,
+    /// on a task of its own: a partition without its lease yet is pruned at a later map.
+    pub(super) fn prune_forks_soon(&self, map: &proto::ClusterMap) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
+            return;
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return;
+        };
+        for (id, service) in cluster.parts.load().iter() {
+            let keep: Vec<u64> = map
+                .failovers
+                .iter()
+                .filter(|e| e.partition == *id && e.tail_state() == proto::TailState::Pending)
+                .map(|e| e.to_epoch)
+                .collect();
+            let (Some(gate), Ok(part)) = (service.gate().cloned(), service.part()) else {
+                continue;
+            };
+            if !gate.leased() {
+                continue;
+            }
+            let (db, id) = (part.db.clone(), id.clone());
+            handle.spawn(async move {
+                let Ok(held) = gate.enter() else { return };
+                let pruned = tokio::task::spawn_blocking(move || {
+                    let gone: Vec<u64> = identity::fork_epochs(&db)?
+                        .into_iter()
+                        .filter(|e| !keep.contains(e))
+                        .collect();
+                    identity::drop_forks(&db, &gone)
+                })
+                .await;
+                match pruned {
+                    Ok(Ok(())) => {
+                        let _ = held.committed();
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("phdb serve: partition {id}'s fork rows weren't pruned: {e}")
+                    }
+                    Err(e) => eprintln!("phdb serve: partition {id}'s fork row prune: {e}"),
+                }
+            });
+        }
+    }
+}
+
+/// Test seams (D336 PR 3a's crash tests).
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use crate::serve::errors::ApiError;
+
+    /// Cluster directories whose next (b) drop stops the run right after it, as a crash
+    /// between the drop and the apply would.
+    pub(crate) static STOP_AFTER_DROP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Cluster directories whose next applied tail commit stops the run right after its
+    /// commit, as a crash after the apply would.
+    pub(crate) static STOP_AFTER_APPLY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// The inspection seam: each read-only ask of a home (Amendment 5's (a)), by cluster
+    /// directory and xid.
+    pub(crate) static ASKED_HOME: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn after_drop(dir: &Path) -> Result<(), ApiError> {
+        stop_once(&STOP_AFTER_DROP, dir, "the test's stop after the drop")
+    }
+
+    pub(crate) fn after_apply(dir: &Path) -> Result<(), ApiError> {
+        stop_once(&STOP_AFTER_APPLY, dir, "the test's stop after the apply")
+    }
+
+    fn stop_once(list: &Mutex<Vec<PathBuf>>, dir: &Path, why: &str) -> Result<(), ApiError> {
+        let mut armed = list
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match armed.iter().position(|d| d == dir) {
+            Some(i) => {
+                armed.swap_remove(i);
+                Err(ApiError::unavailable(why.to_owned()))
+            }
+            None => Ok(()),
+        }
     }
 }

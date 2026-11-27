@@ -216,7 +216,10 @@ impl Node {
                 }) else {
                     continue;
                 };
-                if m.partitions.iter().any(|p| p.id == lp.id && p.node == self.id) {
+                if m.partitions
+                    .iter()
+                    .any(|p| p.id == lp.id && p.node == self.id)
+                {
                     continue;
                 }
                 lp.tail_kept = Some(proto::TailKept {

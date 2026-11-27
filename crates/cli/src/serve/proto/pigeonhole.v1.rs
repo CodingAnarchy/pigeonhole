@@ -8649,6 +8649,11 @@ pub struct ResolveTxn {
     pub xid: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub acked: ::prost::alloc::string::String,
+    /// D336 PR 3a: answer from the home's decision row alone and write nothing: no row (or a
+    /// live session) answers UNKNOWN, never an abort marker. An old owner's tail replay asks
+    /// so (Amendment 5's (a)): since #2164 an absent row may be a collected COMMITTED.
+    #[prost(bool, tag = "3")]
+    pub read_only: bool,
 }
 /// The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
 /// `UNKNOWN` leave it in doubt (`reason` says why).

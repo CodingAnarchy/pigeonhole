@@ -110,6 +110,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 &r.xid,
                 None,
                 shared.limits.request_timeout,
+                false,
             )
             .await;
             // A home that answers UNKNOWN (its history changed) can't settle the share: the
@@ -466,7 +467,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         &self,
         req: Request<proto::ReplayTailRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin, Scope::Cluster], "replay an old owner's tail")?;
+        self.caller(
+            &req,
+            &[Scope::Admin, Scope::Cluster],
+            "replay an old owner's tail",
+        )?;
         let r = req.into_inner();
         let id = r.partition.clone();
         self.0.replay_tail(r).await?;

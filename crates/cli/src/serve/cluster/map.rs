@@ -982,6 +982,7 @@ pub(crate) fn uses_tail_replay(m: &ClusterMap) -> bool {
             || e.tail_state() != crate::serve::proto::TailState::Unspecified
             || e.from_history_epoch != 0
             || e.from_epoch != 0
+            || e.replayed_through != 0
     })
 }
 
@@ -1372,6 +1373,20 @@ fn validate_tail_holds(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
         let Some(n) = new.partitions.iter().find(|p| p.id == o.id) else {
             continue;
         };
+        // Amendment 2's M1: nothing places P on the old node while its tail is pending, as
+        // owner or replica: an install there would move the kept file aside.
+        for t in new.failovers.iter().filter(|t| {
+            t.partition == o.id && t.tail_state() == crate::serve::proto::TailState::Pending
+        }) {
+            if n.node == t.from || n.replicas.contains(&t.from) {
+                return Err(format!(
+                    "partition {:?} has an old owner's tail pending on node {:?} (its failover \
+                     to node {:?} at epoch {}): the map can't place it on that node, as owner \
+                     or replica, until the tail is replayed or discarded",
+                    o.id, t.from, t.to, t.to_epoch
+                ));
+            }
+        }
         if n.epoch == o.epoch && n.node == o.node {
             continue;
         }
@@ -1410,12 +1425,25 @@ fn validate_tail_events(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusa
     };
     let tailless = |e: &crate::serve::proto::FailoverEvent| {
         e.tail_state() == T::Unspecified
+            && e.replayed_through == 0
             && e.fork_token.is_empty()
             && e.from_history_epoch == 0
             && e.from_epoch == 0
     };
     for e in &old.failovers {
         let now = new.failovers.iter().find(|n| key(n) == key(e));
+        if e.tail_state() == T::Pending
+            && let Some(n) = now
+            && n.tail_state() == T::Done
+            && n.replayed_through == 0
+        {
+            return Err(format!(
+                "the map sets partition {:?}'s old owner's tail (its failover to node {:?} at \
+                 epoch {}) DONE without a replay's mark (replayed_through): only a replay sets \
+                 it DONE (phdb cluster replay-tail {}); give it up with replay-tail --discard",
+                e.partition, e.to, e.to_epoch, e.partition
+            ));
+        }
         let ok = match (e.tail_state(), now) {
             (T::Unspecified, _) => true,
             (T::Pending, None) => false,
@@ -1423,9 +1451,16 @@ fn validate_tail_events(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusa
                 n.from_history_epoch == e.from_history_epoch
                     && n.from_epoch == e.from_epoch
                     && match n.tail_state() {
-                        T::Pending => n.fork_token == e.fork_token,
-                        T::Done | T::Discarded => {
-                            n.fork_token.is_empty() || n.fork_token == e.fork_token
+                        T::Pending => n.fork_token == e.fork_token && n.replayed_through == 0,
+                        // DONE only with the replay's mark (D336 PR 3a): the writer sets it
+                        // from the owner's report, so no hand-made map claims a replay.
+                        T::Done => {
+                            (n.fork_token.is_empty() || n.fork_token == e.fork_token)
+                                && n.replayed_through != 0
+                        }
+                        T::Discarded => {
+                            (n.fork_token.is_empty() || n.fork_token == e.fork_token)
+                                && n.replayed_through == 0
                         }
                         _ => false,
                     }
@@ -1433,6 +1468,7 @@ fn validate_tail_events(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusa
             (_, None) => true,
             (_, Some(n)) => {
                 n.tail_state == e.tail_state
+                    && n.replayed_through == e.replayed_through
                     && n.fork_token == e.fork_token
                     && n.from_history_epoch == e.from_history_epoch
                     && n.from_epoch == e.from_epoch

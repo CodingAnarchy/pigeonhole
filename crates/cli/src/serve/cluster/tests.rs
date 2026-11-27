@@ -1515,9 +1515,45 @@ fn data_node_full(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    data_node_feed(
+        rt, dir, id, local, listener, tokens, limits, db, restart, None,
+    )
+}
+
+/// [`data_node_full`] with the node's `--change-feed` as `change_feed`: a partition it
+/// opens while serving (a promoted copy, say) keeps a feed too.
+#[allow(clippy::too_many_arguments)]
+fn data_node_feed(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    db: Option<pigeonhole::Pigeonhole>,
+    restart: bool,
+    change_feed: Option<u64>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
     let locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)> =
         local.map(|p| (p, db)).into_iter().collect();
-    let (stop, mut dbs) = data_node_many(rt, dir, id, locals, listener, tokens, limits, restart);
+    let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+    let (stop, mut dbs, _) = data_node_placed(
+        rt,
+        dir,
+        id,
+        locals,
+        listener,
+        tokens,
+        limits,
+        restart,
+        placement,
+        None,
+        change_feed,
+    );
     (stop, dbs.pop())
 }
 

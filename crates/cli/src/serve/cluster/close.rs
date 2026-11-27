@@ -419,7 +419,7 @@ impl Node {
         // D336 PR 3a: an old owner's file open as a tail source is being read.
         if self.tail_sources.holds(id) {
             return Err(ApiError::failed_precondition(format!(
-                "partition {id:?}'s file here is open as the source of a tail replay: it                  closes {}s after the replay's last read",
+                "partition {id:?}'s file here is open as the source of a tail replay: it closes {}s after the replay's last read",
                 super::tail_source::TAIL_SOURCE_IDLE.as_secs()
             )));
         }

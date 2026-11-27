@@ -1418,7 +1418,8 @@ fn a_slow_client_that_keeps_taking_outlasts_a_large_events_wait() {
                 .unwrap()
                 .clone();
             let token = Bytes::copy_from_slice(direct.token().as_bytes());
-            hub.push(commit, token, direct.position().seqno(), 16 << 20).unwrap();
+            hub.push(commit, token, direct.position().seqno(), 16 << 20)
+                .unwrap();
         }
         let mut got = Vec::new();
         while got.len() < want.len() {
@@ -1517,7 +1518,8 @@ fn a_client_that_stops_taking_times_out_an_idle_limit_after_its_last_take() {
                 .unwrap()
                 .clone();
             let token = Bytes::copy_from_slice(direct.token().as_bytes());
-            hub.push(commit, token, direct.position().seqno(), 16 << 20).unwrap();
+            hub.push(commit, token, direct.position().seqno(), 16 << 20)
+                .unwrap();
         }
         // 50 takes, 100 ms apart (each under the limit), then none: the large event began
         // waiting after about 40, so its wait spans the last ten or so.
@@ -1602,7 +1604,8 @@ fn a_now_start_keeps_a_commit_pushed_before_its_task_first_runs() {
             .unwrap()
             .clone();
         let token = Bytes::copy_from_slice(direct.token().as_bytes());
-        hub.push(commit, token, direct.position().seqno(), 1 << 20).unwrap();
+        hub.push(commit, token, direct.position().seqno(), 1 << 20)
+            .unwrap();
         assert_eq!(seqnos(&mut c, Duration::from_secs(1)).await, [n]);
         drop((c, hub));
     });

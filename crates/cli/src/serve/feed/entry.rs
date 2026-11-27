@@ -216,7 +216,10 @@ pub(super) fn commit_event(
     tag: &[u8],
 ) -> Result<proto::FeedEvent, ApiError> {
     let (origin, xid) = crate::serve::cluster::replay_tag::split(tag).map_err(|e| {
-        ApiError::from_code(pigeonhole::ErrorCode::Corruption, &format!("commit {}: {e}", c.seqno))
+        ApiError::from_code(
+            pigeonhole::ErrorCode::Corruption,
+            &format!("commit {}: {e}", c.seqno),
+        )
     })?;
     Ok(proto::FeedEvent {
         token,

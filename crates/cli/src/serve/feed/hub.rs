@@ -492,7 +492,10 @@ pub(super) fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = (
             match item {
                 Some(Ok(commit)) => {
                     let at = d.stream.position().seqno();
-                    if hub.push(commit, token_of(&d.stream), at, d.ring_bytes).is_err() {
+                    if hub
+                        .push(commit, token_of(&d.stream), at, d.ring_bytes)
+                        .is_err()
+                    {
                         hub.fail();
                         return;
                     }
