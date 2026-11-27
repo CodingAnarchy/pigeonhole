@@ -2810,7 +2810,9 @@ mod tests {
     fn a_recorded_tail_is_neither_dropped_nor_rewritten() {
         use crate::serve::proto::TailState as T;
         let mut old = map();
-        old.failovers.push(tail("p3", "b", 1));
+        // b's tail, p3 failed over to a (M1: no map places p3 on b while it's pending).
+        p3(&mut old).node = "a".into();
+        old.failovers.push(tail("p3", "a", 1));
         fn change(old: &ClusterMap, f: &dyn Fn(&mut ClusterMap)) -> Result<(), Refusal> {
             let mut new = old.clone();
             new.map_version += 1;
@@ -2837,7 +2839,16 @@ mod tests {
             m.failovers[0].fork_token = Default::default();
         })
         .unwrap();
-        change(&old, &|m| m.failovers[0].set_tail_state(T::Done)).unwrap();
+        // DONE only with the replay's mark (D336 PR 3a).
+        refused(
+            change(&old, &|m| m.failovers[0].set_tail_state(T::Done)),
+            "without a replay's mark",
+        );
+        change(&old, &|m| {
+            m.failovers[0].set_tail_state(T::Done);
+            m.failovers[0].replayed_through = 7;
+        })
+        .unwrap();
         // Out of PENDING: it never changes again.
         old.failovers[0].set_tail_state(T::Discarded);
         refused(
