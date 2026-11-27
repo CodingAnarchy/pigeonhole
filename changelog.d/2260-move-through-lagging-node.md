@@ -1,0 +1,2 @@
+### Fixed
+- **`phdb cluster move`, a range move, a merge or an abort through a node one map behind the writer no longer fails as stale** (#2249). Such a command read its base map from `--node`. When that node hadn't yet installed the writer's latest map, the writer refused the change ("the cluster map is at version X, not Y: re-read it and set it again"). The command now builds on the writer's map, and falls back to the node's own map when the writer can't be reached. A hand-written `phdb cluster set-map` file sent through a lagging node is still refused as before.
