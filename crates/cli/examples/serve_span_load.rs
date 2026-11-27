@@ -672,6 +672,12 @@ async fn paced_caller(
     let conn = (i / sh.conns.len()) % sh.conns[node].len();
     let mut t = Tally::new();
     while let Some(at) = due.recv().await {
+        // Past the measured phase, what's still queued is dropped, not sent: a server that
+        // fell behind would otherwise keep working through it after the counters' last read.
+        if sh.stop.load(Ordering::Relaxed) {
+            outstanding.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
         let (spanning, e) = operation(&sh, &mut rng, node, conn).await;
         if sh.measuring.load(Ordering::Relaxed) {
             record(&mut t, spanning, at.elapsed().as_micros() as u64, e);
