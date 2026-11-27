@@ -2808,12 +2808,50 @@ fn a_split_stopped_at_handed_over_is_finished_by_resume() {
     });
 }
 
-/// D331 PR 5 (Must 3, never-both before CLEANING): a move whose source is cut off from its
-/// peers right after the hand-over can't acknowledge it, so the driver sets CLEANING only
-/// once the source's lease ran out on the majority (the lease bound): by then the cut-off
-/// source no longer serves, and the target does. Joined again, it drops its copy and the
-/// move ends. p2's range of `users` ([m, end), on b) moves into p1 (on a, the map's writer,
-/// which stays with the majority).
+/// #2259: the cut seam holds on receive too. A map pushed by a peer the node is cut apart
+/// from is refused when it arrives, as a push whose dial passed just before the cut would
+/// arrive, and the node keeps its map; joined again, the same push is taken. (A dial is
+/// checked again once it connected, and a fetched map when its answer arrives.)
+#[test]
+fn a_push_from_a_cut_peer_is_refused_when_it_arrives() {
+    let t = three();
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        let mut v2 = t.v1.clone();
+        v2.map_version = 2;
+        let from_a = || {
+            let mut req = tonic::Request::new(PushMapRequest {
+                map: Some(v2.clone()),
+            });
+            req.metadata_mut()
+                .insert(super::super::NODE_ID_HEADER, "a".parse().unwrap());
+            req
+        };
+        let cut = |off: bool| {
+            super::super::cut_node(&t.dirs[1], &format!("127.0.0.1:{b}"), &t.dirs, off);
+        };
+        cut(true);
+        let e = client(b).await.push_map(from_a()).await.unwrap_err();
+        assert!(e.message().contains("cut off"), "{e:?}");
+        assert_eq!(map_of(b).await.map_version, 1);
+        cut(false);
+        client(b).await.push_map(from_a()).await.unwrap();
+        assert_eq!(map_of(b).await.map_version, 2);
+    });
+    let _ = (&t.db_a, &t.db_b);
+}
+
+/// D331 PR 5 (Must 3, never-both before CLEANING): a move whose source's node is cut off
+/// from its peers right after the hand-over. The driver's own calls still reach it (the
+/// seam cuts node-to-node dials only), so the driver sets CLEANING by whichever of
+/// `never_both`'s rules holds first: the source took the hand-over map before the cut (its
+/// push comes before the stop, so this is the usual one), or a majority holds that map and
+/// its lease ran out on a majority. Either way the source serves none of the range by then, and the target does.
+/// Cut off, the source can't take the CLEANING map, so it doesn't drop its copy and the move
+/// waits there; its partition's lease runs out meanwhile. Joined again, it drops its copy
+/// and the move ends. p2's range of `users` ([m, end), on b) moves into p1 (on a, the map's
+/// writer, which stays with the majority). The lease-bound rule alone is
+/// `a_move_whose_source_is_down_after_the_hand_over_goes_on_to_cleaning`'s.
 #[test]
 fn a_source_cut_off_at_the_hand_over_stops_serving_before_the_target_serves() {
     let t = three();
@@ -2850,8 +2888,14 @@ fn a_source_cut_off_at_the_hand_over_stops_serving_before_the_target_serves() {
             super::super::cut_node(&t.dirs[1], &format!("127.0.0.1:{b}"), &t.dirs, off);
         };
         cut(true);
-        // The driver can't hear b: it waits out b's lease, sets CLEANING, then waits for
-        // b's drop, which can't come while b is cut off.
+        // b's lease rounds from before the cut end within one push timeout (500 ms here), so
+        // none is in flight when CLEANING is set (#2259: on Windows a round's fetch that
+        // dialed before the cut brought b the CLEANING map, and b dropped its copy). The
+        // seam refuses such a call's answer too, the fetches with no timeout among them;
+        // this keeps the test off that edge.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // CLEANING is set, then the driver waits for b's drop, which can't come while b is
+        // cut off: the CLEANING map doesn't reach it.
         let waited =
             super::super::range_move::resume(&args, &id, Some(Duration::from_secs(20))).await;
         assert!(waited.is_err(), "the move ended with its source cut off");
