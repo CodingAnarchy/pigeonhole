@@ -114,6 +114,7 @@ impl Client {
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
                 partition: String::new(),
                 xid: Default::default(),
+                replayed: None,
             };
             self.send(Out::event(event), &mut pos).await?;
         }
@@ -346,8 +347,8 @@ impl Client {
             if self.skipping(commit.seqno())? {
                 return Ok(());
             }
-            let xid = commit.xid().unwrap_or_default();
-            self.send(Out::event(commit_event(token.clone(), c, xid)), pos)
+            let tag = commit.xid().unwrap_or_default();
+            self.send(Out::event(commit_event(token.clone(), c, tag)?), pos)
                 .await?;
         }
         Ok(())
@@ -408,6 +409,7 @@ impl Client {
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
                 partition: String::new(),
                 xid: Default::default(),
+                replayed: None,
             }),
             pos,
         )

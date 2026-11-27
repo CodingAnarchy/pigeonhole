@@ -1316,7 +1316,7 @@ fn cell_bytes(c: &CopiedCell) -> usize {
 }
 
 /// A logged kind number (FORMAT §2) as the library's kind.
-fn change_kind(k: u32) -> Result<ChangeKind, ApiError> {
+pub(super) fn change_kind(k: u32) -> Result<ChangeKind, ApiError> {
     Ok(match k {
         1 => ChangeKind::Put,
         2 => ChangeKind::Merge,

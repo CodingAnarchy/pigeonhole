@@ -307,7 +307,7 @@ fn ring(start: u64, commits: &[Commit], evicted: usize) -> Ring {
     for c in commits {
         r.entries.push_back(Arc::new(Entry {
             prev,
-            ..Entry::new(c, Bytes::new())
+            ..Entry::new(c, Bytes::new()).unwrap()
         }));
         prev = c.seqno();
     }
@@ -1418,7 +1418,7 @@ fn a_slow_client_that_keeps_taking_outlasts_a_large_events_wait() {
                 .unwrap()
                 .clone();
             let token = Bytes::copy_from_slice(direct.token().as_bytes());
-            hub.push(commit, token, direct.position().seqno(), 16 << 20);
+            hub.push(commit, token, direct.position().seqno(), 16 << 20).unwrap();
         }
         let mut got = Vec::new();
         while got.len() < want.len() {
@@ -1517,7 +1517,7 @@ fn a_client_that_stops_taking_times_out_an_idle_limit_after_its_last_take() {
                 .unwrap()
                 .clone();
             let token = Bytes::copy_from_slice(direct.token().as_bytes());
-            hub.push(commit, token, direct.position().seqno(), 16 << 20);
+            hub.push(commit, token, direct.position().seqno(), 16 << 20).unwrap();
         }
         // 50 takes, 100 ms apart (each under the limit), then none: the large event began
         // waiting after about 40, so its wait spans the last ten or so.
@@ -1602,7 +1602,7 @@ fn a_now_start_keeps_a_commit_pushed_before_its_task_first_runs() {
             .unwrap()
             .clone();
         let token = Bytes::copy_from_slice(direct.token().as_bytes());
-        hub.push(commit, token, direct.position().seqno(), 1 << 20);
+        hub.push(commit, token, direct.position().seqno(), 1 << 20).unwrap();
         assert_eq!(seqnos(&mut c, Duration::from_secs(1)).await, [n]);
         drop((c, hub));
     });
@@ -1619,7 +1619,7 @@ fn a_shared_entry_is_the_exact_encoding_of_the_event_a_client_with_no_prefix_cov
     let (commits, db, dir) = commits("encoded", 3);
     for c in &commits {
         let token = Bytes::from_static(b"the token right after it");
-        let e = Arc::new(Entry::new(c, token.clone()));
+        let e = Arc::new(Entry::new(c, token.clone()).unwrap());
         let want = prost::Message::encode_to_vec(&proto::FeedEvent {
             token: token.clone(),
             event: Some(proto::feed_event::Event::Commit(proto::FeedCommit {
@@ -1641,6 +1641,7 @@ fn a_shared_entry_is_the_exact_encoding_of_the_event_a_client_with_no_prefix_cov
             })),
             partition: String::new(),
             xid: Default::default(),
+            replayed: None,
         });
         assert_eq!(e.encoded().map(|b| &b[..]), Some(&want[..]));
         let mut wire = Vec::new();
@@ -1661,7 +1662,7 @@ fn a_shared_entry_is_the_exact_encoding_of_the_event_a_client_with_no_prefix_cov
         // would give them.
         for prefix in [&b""[..], b"r", b"zz"] {
             let got = e.for_prefix(prefix);
-            let want = filtered(c, prefix).map(|f| commit_event(token.clone(), f, b""));
+            let want = filtered(c, prefix).map(|f| commit_event(token.clone(), f, b"").unwrap());
             assert_eq!(got, want, "prefix {prefix:?}");
         }
         let decoded = <proto::FeedEvent as prost::Message>::decode(&want[..]).unwrap();

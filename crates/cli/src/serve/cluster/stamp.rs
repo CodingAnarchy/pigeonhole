@@ -27,7 +27,7 @@ pub(crate) static FAIL_AFTER_FIRST_RENAME: std::sync::Mutex<Vec<PathBuf>> =
     std::sync::Mutex::new(Vec::new());
 
 /// `.phdb-incoming/<P>.installing`.
-fn marker(dir: &Path, partition: &str) -> PathBuf {
+pub(super) fn marker(dir: &Path, partition: &str) -> PathBuf {
     dir.join(INCOMING).join(format!("{partition}.installing"))
 }
 
@@ -460,7 +460,11 @@ impl Node {
                 let id = name.strip_suffix(".phdb")?.to_owned();
                 (super::map::id_ok(&id) && !skip.contains(&id)).then_some(id)
             })
-            .filter(|id| self.part_state(id).is_none() && !self.replica_open(id))
+            .filter(|id| {
+                self.part_state(id).is_none()
+                    && !self.replica_open(id)
+                    && !self.tail_sources.holds(id)
+            })
             .filter(|id| !self.split_unmarked(id))
             .collect();
         for id in candidates {
@@ -637,7 +641,7 @@ fn create_file(dir: &Path, req: &StampRequest) -> Result<(), ApiError> {
 
 /// Whether `.phdb-incoming` holds any staged file or header of partition `p`, complete or
 /// not.
-fn staged_any(dir: &Path, p: &str) -> bool {
+pub(super) fn staged_any(dir: &Path, p: &str) -> bool {
     let prefix = format!("{p}.phdb");
     std::fs::read_dir(dir.join(INCOMING)).is_ok_and(|entries| {
         entries

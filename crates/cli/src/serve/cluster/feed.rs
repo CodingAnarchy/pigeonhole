@@ -1096,6 +1096,7 @@ impl Merge {
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
             xid: Default::default(),
+            replayed: None,
         }
     }
 
@@ -1373,6 +1374,7 @@ fn state_event(partition: &str, e: Option<&ApiError>) -> proto::FeedEvent {
         )),
         partition: partition.to_owned(),
         xid: Default::default(),
+        replayed: None,
     }
 }
 
@@ -2426,6 +2428,7 @@ pub(super) mod tests {
             }),
             partition: String::new(),
             xid: Default::default(),
+            replayed: None,
         };
         Bytes::from(prost::Message::encode_to_vec(&e))
     }

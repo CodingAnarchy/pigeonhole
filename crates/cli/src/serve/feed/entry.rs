@@ -29,11 +29,17 @@ pub(super) const ENTRY_OVERHEAD: usize = 112;
 impl Entry {
     /// An entry for `commit`, encoded for clients with no prefix and sized with that
     /// encoding (simp724's R1, perf287's P1 on #1541); `prev` is set when it's pushed.
-    pub(super) fn new(commit: &Commit, token: Bytes) -> Self {
-        let encoded: Option<Bytes> = filtered(commit, b"").map(|c| {
-            let xid = commit.xid().unwrap_or_default();
-            prost::Message::encode_to_vec(&commit_event(token.clone(), c, xid)).into()
-        });
+    ///
+    /// `Err` for a commit whose tag is corrupt ([`commit_event`]): the hub fails, and each
+    /// client meets the error on its own stream.
+    pub(super) fn new(commit: &Commit, token: Bytes) -> Result<Self, ApiError> {
+        let encoded: Option<Bytes> = filtered(commit, b"")
+            .map(|c| {
+                let tag = commit.xid().unwrap_or_default();
+                commit_event(token.clone(), c, tag)
+                    .map(|e| prost::Message::encode_to_vec(&e).into())
+            })
+            .transpose()?;
         // The token is the event's field 1, which prost writes first: its tag, its length,
         // then its bytes. Kept as that slice, it isn't held twice.
         let token = match &encoded {
@@ -49,13 +55,13 @@ impl Entry {
             None => token,
         };
         let bytes = ENTRY_OVERHEAD + encoded.as_ref().map_or(token.len(), Bytes::len);
-        Entry {
+        Ok(Entry {
             seqno: commit.seqno(),
             token,
             prev: 0,
             bytes,
             encoded,
-        }
+        })
     }
 
     /// The event a client with `prefix` sends for this entry: the commit's changes to rows
@@ -200,15 +206,28 @@ pub(super) fn prefix_out(e: &Arc<Entry>, prefix: &[u8]) -> Option<Out> {
     }
 }
 
-/// A commit event: `c` with the token right after it, and its spanning transaction's id
-/// (`xid`, D329 2b; empty for any other commit).
-pub(super) fn commit_event(token: Bytes, c: proto::FeedCommit, xid: &[u8]) -> proto::FeedEvent {
-    proto::FeedEvent {
+/// A commit event: `c` with the token right after it, and what its tag says (`tag`, the
+/// engine's raw one): its spanning transaction's id (D329 2b) and, for a commit an old
+/// owner's tail replay wrote, its origin (D336 §8). A tag that starts as a replay's but
+/// isn't one this build reads is corrupt (`DataLoss`), never sent as an xid.
+pub(super) fn commit_event(
+    token: Bytes,
+    c: proto::FeedCommit,
+    tag: &[u8],
+) -> Result<proto::FeedEvent, ApiError> {
+    let (origin, xid) = crate::serve::cluster::replay_tag::split(tag).map_err(|e| {
+        ApiError::from_code(pigeonhole::ErrorCode::Corruption, &format!("commit {}: {e}", c.seqno))
+    })?;
+    Ok(proto::FeedEvent {
         token,
         event: Some(proto::feed_event::Event::Commit(c)),
         partition: String::new(),
         xid: Bytes::copy_from_slice(xid),
-    }
+        replayed: origin.map(|o| proto::ReplayOrigin {
+            history_epoch: o.history_epoch,
+            seqno: o.seqno,
+        }),
+    })
 }
 
 /// `commit` as the client sees it: its changes to rows under `prefix`, or `None` when it has
