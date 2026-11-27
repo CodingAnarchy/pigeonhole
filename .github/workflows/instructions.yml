@@ -468,20 +468,26 @@ jobs:
           # judges the retry's counts: a real change fails twice. Loud either way: a warning
           # per shape, a section in the summary, and both runs' callgrind outputs uploaded
           # (the callgrind-retry artifact), so an outlier can be diffed by function.
-          # A RECOUNT_MAX shape is also counted again past its own percent, and its retry
-          # doesn't replace the first count: each side keeps the higher of its two.
-          maxed=$(for kv in $RECOUNT_MAX; do printf '%s ' "${kv%%=*}"; done)
-          retry=$(
+          # A RECOUNT_MAX shape is also counted again past its own percent. When that is the
+          # only reason it is retried, its retry doesn't replace the first count: each side
+          # keeps the higher of its two (`maxed`). Retried as an outlier or for its ceiling, it
+          # takes the retry's count like any other shape (perf287's N1 on #2244), so a high
+          # outlier can still be retried away.
+          outliers=$(
             {
               python3 scripts/instruction-ceilings.py check /tmp/head.txt |
                 sed -n 's/^| \([^ |]*\) | [0-9]* | [0-9]* | \*\*above the ceiling\*\* |$/\1/p' || true
               awk '$2 != "-" && $4 != "x" && ($3 > $2 * 1.02 || $3 < $2 * 0.98) { print $1 }' /tmp/pairs.txt
-              awk -v recount="$RECOUNT_MAX" '
-                BEGIN { n = split(recount, kv, " "); for (i = 1; i <= n; i++) { split(kv[i], p, "="); r[p[1]] = p[2] } }
-                ($1 in r) && $2 != "-" && $4 != "x" &&
-                  ($3 > $2 * (1 + r[$1] / 100) || $3 < $2 * (1 - r[$1] / 100)) { print $1 }' /tmp/pairs.txt
             } | sort -u | tr '\n' ' '
           )
+          maxed=$(
+            awk -v recount="$RECOUNT_MAX" -v outliers=" $outliers " '
+              BEGIN { n = split(recount, kv, " "); for (i = 1; i <= n; i++) { split(kv[i], p, "="); r[p[1]] = p[2] } }
+              ($1 in r) && !index(outliers, " " $1 " ") && $2 != "-" && $4 != "x" &&
+                ($3 > $2 * (1 + r[$1] / 100) || $3 < $2 * (1 - r[$1] / 100)) { print $1 }' /tmp/pairs.txt |
+              tr '\n' ' '
+          )
+          retry="$outliers$maxed"
           if [ -n "${retry// }" ]; then
             cp /tmp/base.txt /tmp/base-first.txt
             cp /tmp/head.txt /tmp/head-first.txt
@@ -497,7 +503,7 @@ jobs:
             fi
             # The retry's counts replace the first run's for the retried shapes only: a retried
             # hotrow state reruns all three, and the other two keep their first counts
-            # (simp724's R1 on #2037). A RECOUNT_MAX shape keeps the higher of its two counts.
+            # (simp724's R1 on #2037). A shape in `maxed` keeps the higher of its two counts.
             for side in base head; do
               awk -v names=" $retry " -v maxed=" $maxed " '
                    FILENAME == ARGV[1] { if (index(names, " " $1 " ")) r[$1] = $2; next }
@@ -519,7 +525,7 @@ jobs:
             {
               echo "### RETRIED: an outlier's shapes were counted twice"
               echo
-              echo "The gate below judges the retry, except that each side of a shape in RECOUNT_MAX ($maxed) is judged on the higher of its two counts. Both runs' callgrind outputs are in this job's \`callgrind-retry\` artifact."
+              echo "The gate below judges the retry, except that each side of a shape retried only by RECOUNT_MAX (${maxed:-none}) is judged on the higher of its two counts. Both runs' callgrind outputs are in this job's \`callgrind-retry\` artifact."
               echo
               echo "| shape | first base | first head | retry base | retry head |"
               echo "|---|--:|--:|--:|--:|"
