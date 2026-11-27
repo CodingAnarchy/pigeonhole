@@ -2845,8 +2845,8 @@ fn a_push_from_a_cut_peer_is_refused_when_it_arrives() {
 /// from its peers right after the hand-over. The driver's own calls still reach it (the
 /// seam cuts node-to-node dials only), so the driver sets CLEANING by whichever of
 /// `never_both`'s rules holds first: the source took the hand-over map before the cut (its
-/// push comes before the stop, so this is the usual one), or its lease ran out on the
-/// majority. Either way the source serves none of the range by then, and the target does.
+/// push comes before the stop, so this is the usual one), or a majority holds that map and
+/// its lease ran out on a majority. Either way the source serves none of the range by then, and the target does.
 /// Cut off, the source can't take the CLEANING map, so it doesn't drop its copy and the move
 /// waits there; its partition's lease runs out meanwhile. Joined again, it drops its copy
 /// and the move ends. p2's range of `users` ([m, end), on b) moves into p1 (on a, the map's
@@ -2888,10 +2888,11 @@ fn a_source_cut_off_at_the_hand_over_stops_serving_before_the_target_serves() {
             super::super::cut_node(&t.dirs[1], &format!("127.0.0.1:{b}"), &t.dirs, off);
         };
         cut(true);
-        // b's calls from before the cut end within one push timeout (500 ms here): none is
-        // in flight when CLEANING is set (#2259: on Windows a lease round's fetch that
+        // b's lease rounds from before the cut end within one push timeout (500 ms here), so
+        // none is in flight when CLEANING is set (#2259: on Windows a round's fetch that
         // dialed before the cut brought b the CLEANING map, and b dropped its copy). The
-        // seam refuses such a call's answer too; this keeps the test off that edge.
+        // seam refuses such a call's answer too, the fetches with no timeout among them;
+        // this keeps the test off that edge.
         tokio::time::sleep(Duration::from_millis(600)).await;
         // CLEANING is set, then the driver waits for b's drop, which can't come while b is
         // cut off: the CLEANING map doesn't reach it.
