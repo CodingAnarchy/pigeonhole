@@ -316,9 +316,10 @@ fn a_move_through_a_node_one_map_behind_the_writer_sets_its_changes_at_the_write
             r
         };
         let (moved, still) = tokio::join!(moving, release);
-        let moved = moved.unwrap_or_else(|e| panic!("the move through b: {}", e.message()));
+        if let Err(e) = moved {
+            panic!("the move through b: {}", e.message());
+        }
         assert_eq!(still, behind, "b was behind up to the move's commit point");
-        let _ = moved;
         let m = client(t.ports[0])
             .await
             .get_map(crate::serve::proto::GetMapRequest {})
