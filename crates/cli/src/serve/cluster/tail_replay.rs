@@ -197,17 +197,18 @@ pub(crate) fn read_mark(db: &Pigeonhole, h: u64) -> Result<Option<Mark>, ApiErro
     Ok(Some(Mark { seqno, token }))
 }
 
-/// A logged put of `value` to `row`'s `q` in the marks' family, now.
+/// A logged put of `value` to `row`'s `q` in the marks' family, at `ts`.
 fn put(
     b: &mut pigeonhole::replication::LoggedBatch<'_>,
     t: &pigeonhole::Table,
     row: &[u8],
     q: &[u8],
+    ts: u64,
     value: &[u8],
 ) {
     // A plain value's stored form: its tag, then its bytes.
     let stored = [&[0u8][..], value].concat();
-    b.push(t, row, FAMILY, ChangeKind::Put, q, now_micros(), &stored);
+    b.push(t, row, FAMILY, ChangeKind::Put, q, ts, &stored);
 }
 
 fn push_mark(
@@ -216,15 +217,20 @@ fn push_mark(
     h: u64,
     m: &Mark,
 ) {
+    // Each mark cell's timestamp is the mark's own seqno, which only moves forward in its
+    // history, so the newest mark is the one a read returns whatever the clocks of the owners
+    // that wrote them (cli692's M-a on #2265: a logged batch takes no timestamp floor, and an
+    // owner whose clock is behind would hide its mark behind the last one).
     let row = mark_row(h);
-    put(b, t, &row, b"seqno", m.seqno.to_string().as_bytes());
-    put(b, t, &row, b"token", &m.token);
-}
-
-fn now_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as u64)
+    put(
+        b,
+        t,
+        &row,
+        b"seqno",
+        m.seqno,
+        m.seqno.to_string().as_bytes(),
+    );
+    put(b, t, &row, b"token", m.seqno, &m.token);
 }
 
 /// The tables an index or a memory store keeps (R1): derived data, refused whole in PR 3a.
@@ -694,7 +700,7 @@ impl Node {
                     c.seqno
                 ))
             })?;
-        let (db, changes) = (cx.db.clone(), c.changes);
+        let (db, changes, created) = (cx.db.clone(), c.changes, c.created);
         let (m, om) = (next.clone(), other_mark);
         let decisions = if rows.is_empty() {
             None
@@ -745,6 +751,22 @@ impl Node {
                     ch.timestamp,
                     &ch.stored,
                 );
+            }
+            // cli692's S-a on #2265: each table, opened above, is still the one the judge
+            // matched by `created`. A table dropped and made again since would take the old
+            // commit into its new incarnation; the run stops instead, and a rerun judges again.
+            // A drop after this fails the commit itself.
+            if !tables.is_empty() {
+                let now = super::schema::records(&db).map_err(ApiError::internal)?;
+                for name in tables.keys() {
+                    if now.get(*name) != created.get(*name) {
+                        return Err(ApiError::failed_precondition(format!(
+                            "table {name} here changed while the replay judged its commit (a \
+                             drop or a make again): the replay stops, and a rerun judges it \
+                             again"
+                        )));
+                    }
+                }
             }
             push_mark(&mut b, &marks, h, &m);
             if let Some(om) = &om {
@@ -803,7 +825,7 @@ impl Node {
             let text = String::from_utf8_lossy(&value).into_owned();
             let mut unknown = Vec::new();
             for b in text.lines().skip(1).filter(|l| !l.starts_with('+')) {
-                if !self.share_in_doubt(map, b, &x).await {
+                if !self.share_in_doubt(map, b, &x).await? {
                     unknown.push(b.to_owned());
                 }
             }
@@ -863,10 +885,14 @@ impl Node {
                 "conflict: transaction {x}'s share was applied on the old owner, but its home \
                  records it aborted"
             ))),
+            // UNKNOWN: no decision row, which for a share the old owner applied means its
+            // home collected the row past its retention (simp724's N1 on #2265).
             Ok(r) => Err(ApiError::failed_precondition(format!(
-                "in_doubt: transaction {x}'s share, whose home has no decision for it ({}): \
-                 decide it with phdb cluster txn decide, then run replay-tail again, or discard \
-                 the tail",
+                "in_doubt: transaction {x}'s share was applied on the old owner, but its home \
+                 holds no decision for it ({}): its record was collected past \
+                 --txn-outcome-retention, so the replay can't tell whether it committed. \
+                 Discard the tail (and, if you know the transaction committed, put its rows \
+                 again yourself)",
                 r.reason
             ))),
             Err(e) => Err(ApiError::failed_precondition(format!(
@@ -877,15 +903,33 @@ impl Node {
         }
     }
 
-    /// Whether branch `branch` of transaction `xid` is held in doubt on its owner now.
-    async fn share_in_doubt(&self, map: &proto::ClusterMap, branch: &str, xid: &str) -> bool {
+    /// Whether branch `branch` of transaction `xid` is held in doubt on its owner now. An
+    /// owner that doesn't answer, or doesn't report the branch, is an error that stops the
+    /// run with the mark unmoved (simp724's S1 on #2265): "couldn't ask" isn't "not in doubt",
+    /// which would refuse the commit point for good. A branch the map no longer has holds
+    /// nothing.
+    async fn share_in_doubt(
+        &self,
+        map: &proto::ClusterMap,
+        branch: &str,
+        xid: &str,
+    ) -> Result<bool, ApiError> {
         let Some(p) = map.partitions.iter().find(|p| p.id == branch) else {
-            return false;
+            return Ok(false);
         };
-        matches!(
-            self.row_of(&p.node, branch).await,
-            Ok(Some(lp)) if lp.in_doubt_shares.iter().any(|s| s.xid == xid)
-        )
+        let couldnt = |why: String| {
+            ApiError::failed_precondition(format!(
+                "in_doubt: transaction {xid}'s commit point: branch {branch}'s owner {:?} \
+                 couldn't be asked whether it holds its share in doubt ({why}): run \
+                 replay-tail again once it answers, or discard the tail",
+                p.node
+            ))
+        };
+        match self.row_of(&p.node, branch).await {
+            Ok(Some(lp)) => Ok(lp.in_doubt_shares.iter().any(|s| s.xid == xid)),
+            Ok(None) => Err(couldnt(format!("it doesn't report partition {branch}"))),
+            Err(e) => Err(couldnt(e.message)),
+        }
     }
 
     /// Amendment 5's (a): transaction `xid`'s home's decision row, read only.
@@ -1357,5 +1401,51 @@ pub(crate) mod seams {
             }
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// cli692's M-a on #2265: a mark's cells take the mark's seqno as their timestamp, so the
+    /// newest mark is the one read back, whatever the clock of the owner that wrote it: no
+    /// clock is read at all. Each mark's cells carry its seqno, and each later mark is read.
+    #[test]
+    fn a_marks_cells_take_its_seqno_as_their_timestamp_so_the_newest_mark_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Pigeonhole::open(
+            dir.path().join("p.phdb"),
+            pigeonhole::Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        let t = marks_table(&db).unwrap();
+        for seqno in [5u64, 9, 12] {
+            let mut b = db.logged_batch();
+            push_mark(
+                &mut b,
+                &t,
+                3,
+                &Mark {
+                    seqno,
+                    token: vec![u8::try_from(seqno).unwrap()],
+                },
+            );
+            b.commit_with(pigeonhole::Durability::GroupSync).unwrap();
+            assert_eq!(
+                read_mark(&db, 3).unwrap(),
+                Some(Mark {
+                    seqno,
+                    token: vec![u8::try_from(seqno).unwrap()],
+                })
+            );
+            for q in [&b"seqno"[..], b"token"] {
+                let cell = t.get(&mark_row(3), FAMILY, q).unwrap().unwrap();
+                assert_eq!(cell.timestamp(), seqno, "{q:?}");
+            }
+        }
+        // Another history's mark is its own row.
+        assert_eq!(read_mark(&db, 4).unwrap(), None);
+        db.close().unwrap();
     }
 }

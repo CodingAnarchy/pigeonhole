@@ -234,11 +234,13 @@ async fn replay_until_done(a: u16) -> std::collections::BTreeMap<&'static str, s
 /// one dropped and made again after the failover. The old owner's commits to the first
 /// table before its drop are skipped as dropped (the source's pre-scan gives them
 /// `created` 0); its commit after the table was made again is replayed; every commit to the
-/// second is skipped, since the new owner's table isn't the one they wrote. A plain table's
-/// tail commit is replayed; a dry run first applies nothing and leaves the tail PENDING.
+/// second is skipped, since the new owner's table isn't the one they wrote. A table dropped
+/// after the failover and not made again (cli692's third case) is skipped too, and stops
+/// nothing. A plain table's tail commit is replayed; a dry run first applies nothing and
+/// leaves the tail PENDING.
 #[test]
 fn a_tail_replays_into_the_new_owner_and_skips_tables_dropped_inside_or_after_it() {
-    let t = tail_rig(&["t0", "inside", "after"]);
+    let t = tail_rig(&["t0", "inside", "after", "gone"]);
     let a = t.ports[0];
     t.rt.block_on(async {
         put_in(a, "t0", "k1", "v1").await;
@@ -247,11 +249,14 @@ fn a_tail_replays_into_the_new_owner_and_skips_tables_dropped_inside_or_after_it
         create_on_p3(a, "inside").await;
         put_in(a, "inside", "again", "y").await;
         put_in(a, "after", "late", "z").await;
+        put_in(a, "gone", "late", "w").await;
     });
     let e = fail_over_to_b(&t);
     t.rt.block_on(async {
         drop_table(a, "after").await;
         create_on_p3(a, "after").await;
+        // cli692's third case: dropped after the failover and not made again.
+        drop_table(a, "gone").await;
         // Not on b: the tail is c's alone.
         assert_eq!(get_in(a, "t0", "k1").await.unwrap(), None);
         // A dry run judges the tail and changes nothing.
@@ -299,6 +304,19 @@ fn a_tail_replays_into_the_new_owner_and_skips_tables_dropped_inside_or_after_it
         );
         assert!(done.replayed_through > 0, "{done:?}");
         assert!(done.fork_token.is_empty(), "{done:?}");
+        // c's tail source closes once the tail isn't PENDING, not 60 s after its last read
+        // (cli692's S-b on #2265): p3's file there is the node's again at once.
+        let c = t.ports[2];
+        eventually_within(
+            Duration::from_secs(5),
+            "c to close p3's tail source",
+            async || {
+                status_of(c).await.partitions.iter().all(|lp| {
+                    !(lp.id == "p3" && lp.role() == crate::serve::proto::PartitionRole::TailSource)
+                })
+            },
+        )
+        .await;
         // The owner's fork row for the event goes once no PENDING tail names it.
         let b_dir = t.dirs[1].clone();
         eventually("b to prune p3's fork row", async || {
@@ -640,5 +658,80 @@ fn a_pending_tail_refuses_a_hand_made_done_and_maps_that_place_its_partition_on_
         replay_until_done(a).await;
         assert_eq!(get_in(a, "t0", "k1").await.unwrap(), Some(b"v1".to_vec()));
         edited(a, &on_c(true)).await.unwrap();
+    });
+}
+
+/// simp724's S1 on #2265: a home's commit point in the tail (c) needs each unacked branch
+/// in doubt on its owner. An owner the replay can't ask stops the run with the mark
+/// unmoved, rather than counting as "not in doubt" and refusing the commit point for good;
+/// once it answers, a rerun applies it. p3 (on c) is the home, p1 (on a) the branch, and
+/// the commit stops after its commit point (the spanning seam), so p1's share stays in
+/// doubt on a.
+#[test]
+fn a_commit_point_whose_branch_owner_cant_be_asked_stops_the_replay_with_its_mark_unmoved() {
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    let t = tail_rig(&["t0"]);
+    let [a, b, _] = t.ports;
+    t.rt.block_on(async {
+        let r = crate::serve::proto::BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        };
+        let xid = txns(a).await.begin(r).await.unwrap().into_inner().txn_id;
+        let mut home = put_row("kx", "vx");
+        home.row.as_mut().unwrap().table = "t0".into();
+        txn_write(a, &xid, vec![put_row("alice", "branch"), home], None)
+            .await
+            .unwrap();
+        let p = pause(&xid, Step::Decide);
+        let commit = {
+            let xid = xid.clone();
+            tokio::spawn(async move { commit(a, &xid, None).await })
+        };
+        p.reached.notified().await;
+        p.go.send(true).unwrap();
+        let _ = commit.await;
+    });
+    fail_over_to_b(&t);
+    // b can't reach a's Status: p1's owner can't be asked.
+    let pair = (t.dirs[1].clone(), format!("127.0.0.1:{a}"));
+    super::super::super::CUT_BETWEEN
+        .lock()
+        .unwrap()
+        .push(pair.clone());
+    t.rt.block_on(async {
+        let mut stopped = None;
+        for _ in 0..60 {
+            match replay_tail(a, false).await {
+                Ok(r) if r["note"].as_str().unwrap().contains("couldn't be asked") => {
+                    stopped = Some(r);
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+        let r = stopped.expect("the replay to stop on p1's owner");
+        assert_eq!(
+            (r["tail_state"].as_str(), r["refused"].as_u64()),
+            (Some("PENDING"), Some(0)),
+            "{r:?}"
+        );
+        // Stopped before the source's end, with nothing applied past the commit point.
+        assert_eq!(
+            (r["source_end"].as_u64(), r["applied"].as_u64()),
+            (Some(0), Some(0)),
+            "{r:?}"
+        );
+        assert_eq!(get_in(b, "t0", "kx").await.unwrap(), None, "{r:?}");
+    });
+    super::super::super::CUT_BETWEEN
+        .lock()
+        .unwrap()
+        .retain(|e| *e != pair);
+    t.rt.block_on(async {
+        let r = replay_until_done(a).await;
+        assert_eq!(r["refused"], 0, "{r:?}");
+        assert_eq!(get_in(b, "t0", "kx").await.unwrap(), Some(b"vx".to_vec()));
     });
 }

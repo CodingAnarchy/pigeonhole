@@ -192,8 +192,10 @@ impl Node {
             // D335: each partition's replica acks as the map has them (k, its replicas),
             // still under the install lock, as an open arms them.
             self.apply_acks(m);
-            // D336 PR 3a: fork rows no PENDING tail needs go.
+            // D336 PR 3a: fork rows no PENDING tail needs go, and so do idle tail sources
+            // of tails no longer PENDING (cli692's S-b on #2265).
             self.prune_forks_soon(m);
+            self.tail_sources.close_settled(m, &self.id);
         }
         self.wake_copies(&moved);
         Ok(version)

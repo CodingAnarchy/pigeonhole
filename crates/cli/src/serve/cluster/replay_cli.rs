@@ -106,8 +106,7 @@ pub(crate) async fn run(
     let note = if !progress.last_error.is_empty() {
         format!(
             "the replay stopped: {}. The tail stays PENDING: fix the cause and run replay-tail \
-             again, which resumes from its mark (a transaction share in doubt: decide it with \
-             phdb cluster txn decide, then rerun), or give the tail up with replay-tail \
+             again, which resumes from its mark, or give the tail up with replay-tail \
              {partition} --discard",
             progress.last_error
         )

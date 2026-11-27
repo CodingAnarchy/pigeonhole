@@ -187,6 +187,62 @@ impl TailSources {
         }
     }
 
+    /// Closes `source`, taken from `id` and refused by the check again (cli692's S-b on
+    /// #2265): kept idle, it would hold P's file here for [`TAIL_SOURCE_IDLE`] for nothing.
+    fn close_taken(&self, id: &str, source: Source) {
+        self.release(id);
+        if let Err(e) = source.db.close() {
+            eprintln!("phdb serve: partition {id}'s tail source didn't close cleanly: {e}");
+        }
+    }
+
+    /// Closes each idle source whose tail `map` no longer holds PENDING naming node `me`
+    /// (cli692's S-b on #2265): a replayed or discarded tail's file is P's again at once, for
+    /// a map that places P back here. On a thread of its own: an install calls it.
+    pub(crate) fn close_settled(&self, map: &proto::ClusterMap, me: &str) {
+        let settled: Vec<(String, Source)> = {
+            let mut open = self.open();
+            let ids: Vec<String> = open
+                .iter()
+                .filter(|(id, slot)| match slot {
+                    Slot::Idle { source, .. } => !map.failovers.iter().any(|e| {
+                        e.partition == **id
+                            && e.from == me
+                            && e.tail_state() == proto::TailState::Pending
+                            && e.from_history_epoch == source.history_epoch
+                            && e.from_epoch == source.epoch
+                    }),
+                    Slot::Busy { .. } => false,
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| match open.remove(&id) {
+                    Some(Slot::Idle { source, .. }) => Some((id, source)),
+                    _ => None,
+                })
+                .collect()
+        };
+        if settled.is_empty() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("phdb-tail-source-close".into())
+            .spawn(move || {
+                for (id, source) in settled {
+                    if let Err(e) = source.db.close() {
+                        eprintln!(
+                            "phdb serve: partition {id}'s tail source didn't close cleanly: {e}"
+                        );
+                    }
+                }
+            })
+            .map_or_else(
+                |e| eprintln!("phdb serve: the tail sources' close didn't start: {e}"),
+                drop,
+            );
+    }
+
     /// Forgets `id`'s busy mark after an open that failed.
     fn release(&self, id: &str) {
         let mut open = self.open();
@@ -229,6 +285,12 @@ impl Node {
             ));
         }
         let sources = Arc::clone(&self.tail_sources);
+        // Not under `opening` (cli692's S-c on #2265): an `open_as` of P that passed its
+        // `holds` check before this `take` races the source's open, and the engine settles it.
+        // A second writer open of one path in one process is refused (`WriterLocked`: the
+        // OFD lock on Linux, the per-process lock registry elsewhere), so the loser waits out
+        // `open_retrying`'s 1.5 s and fails, and its caller retries; neither writes through
+        // the other's handle.
         let held = sources.take(&id, r.from_history_epoch, r.from_epoch)?;
         let source = match held {
             Some(s) => s,
@@ -250,7 +312,7 @@ impl Node {
         };
         // Checked again with the source in hand: the map may have moved on while it opened.
         if let Err(e) = self.may_read_tail(&r) {
-            sources.give_back(&id, source);
+            sources.close_taken(&id, source);
             return Err(e);
         }
         let feed = match source
@@ -480,7 +542,15 @@ fn drops(db: &pigeonhole::Pigeonhole, token: &[u8]) -> Result<Drops, ApiError> {
         .map_err(engine)?;
     feed.include_silent();
     let mut out = Drops::new();
-    while let Some(event) = feed.next_event(QUIET).map_err(engine)? {
+    let mut end = End::new(db);
+    loop {
+        let Some(event) = feed.next_event(QUIET).map_err(engine)? else {
+            if end.reached(&feed)? {
+                return Ok(out);
+            }
+            continue;
+        };
+        end.saw(event_seqno(event));
         if let pigeonhole::FeedEvent::Catalog(c) = event {
             for edit in c.edits() {
                 if let pigeonhole::CatalogEdit::TableDropped { table, .. } = edit {
@@ -489,7 +559,60 @@ fn drops(db: &pigeonhole::Pigeonhole, token: &[u8]) -> Result<Drops, ApiError> {
             }
         }
     }
-    Ok(out)
+}
+
+/// A feed event's seqno (0 for a kind this build doesn't know, which the caller refuses).
+fn event_seqno(event: &pigeonhole::FeedEvent) -> u64 {
+    match event {
+        pigeonhole::FeedEvent::Commit(c) => c.seqno(),
+        pigeonhole::FeedEvent::Catalog(c) => c.seqno(),
+        pigeonhole::FeedEvent::RangeDrop(d) => d.seqno(),
+        _ => 0,
+    }
+}
+
+/// Where the old file's tail ends (cli692's M-b on #2265): at the durable frontier its open
+/// recovered, which no later write moves (the source takes none). The tail has ended only
+/// once the feed's position, or the last event it delivered, reaches it: a quiet read alone
+/// isn't the end, since a cold file or a stalled disk can be quiet with history left.
+struct End {
+    frontier: u64,
+    seen: u64,
+    quiet_since: Option<Instant>,
+}
+
+impl End {
+    fn new(db: &pigeonhole::Pigeonhole) -> Self {
+        Self {
+            frontier: db.replication_frontier(),
+            seen: 0,
+            quiet_since: None,
+        }
+    }
+
+    /// An event at `seqno` was delivered.
+    fn saw(&mut self, seqno: u64) {
+        self.seen = self.seen.max(seqno);
+        self.quiet_since = None;
+    }
+
+    /// After a quiet read: whether `feed` has reached the end. A feed quiet below it for
+    /// [`TAIL_SOURCE_IDLE`] is an error, and the replay resumes from its mark on a rerun.
+    fn reached(&mut self, feed: &pigeonhole::Feed) -> Result<bool, ApiError> {
+        let at = feed.position().seqno().max(self.seen);
+        if at >= self.frontier {
+            return Ok(true);
+        }
+        let since = *self.quiet_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= TAIL_SOURCE_IDLE {
+            return Err(ApiError::unavailable(format!(
+                "the old file's feed stopped at seqno {at}, below its end at {}: the replay \
+                 resumes from its mark when run again",
+                self.frontier
+            )));
+        }
+        Ok(false)
+    }
 }
 
 /// The source's loop: each event past `after` in order, by name, then the end. Ends early,
@@ -507,19 +630,24 @@ fn pump(
     // The old file's schema records as they end: what a table that the tail doesn't drop
     // was made as. A table with none (made by hand) is no table the map places: 0.
     let records = super::schema::records(db).map_err(ApiError::internal)?;
+    let mut end = End::new(db);
     loop {
         if tx.is_closed() {
             return Ok(());
         }
         let Some(event) = feed.next_event(QUIET).map_err(engine)? else {
-            let end = proto::ReadTailEvent {
+            if !end.reached(&feed)? {
+                continue;
+            }
+            let msg = proto::ReadTailEvent {
                 event: Some(Event::End(proto::TailEnd {
-                    last_seqno: db.replication_frontier(),
+                    last_seqno: end.frontier,
                 })),
             };
-            send_within(tx, end)?;
+            send_within(tx, msg)?;
             return Ok(());
         };
+        end.saw(event_seqno(event));
         let mut commit = proto::TailCommit::default();
         match event {
             F::Commit(c) => {

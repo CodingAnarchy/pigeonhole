@@ -1184,8 +1184,9 @@ Any node still takes any call, before, during and after.
 - **Refused whole** (named, the mark moves past it): a commit that writes a text or vector index's or a memory store's tables. Put those rows again through the index's or the store's API.
 - **Transactions across partitions** (D329):
   - A partition's share of a transaction is replayed once its home's decision row says COMMITTED (asked read-only: nothing is recorded there). A share the home records aborted is refused as `conflict`.
-  - If the home has no decision for it, or doesn't answer, the replay stops with `in_doubt` and the tail stays PENDING. Decide the transaction (`phdb cluster txn decide`), then run `replay-tail` again; or discard the tail.
-  - A home's commit point is replayed only if the new owner has no decision for it yet and each branch that hadn't acked it still holds its share in doubt; otherwise it's refused.
+  - If the home doesn't answer, the replay stops with `in_doubt` and the tail stays PENDING: run `replay-tail` again once it does.
+  - If the home has no decision row for it, the replay stops with `in_doubt` too. For a share the old owner applied, that means the home collected the row past `--txn-outcome-retention`, so the replay can't tell whether the transaction committed. Discard the tail, and if you know the transaction committed, put its rows again yourself.
+  - A home's commit point is replayed only if the new owner has no decision for it yet and each branch that hadn't acked it still holds its share in doubt; otherwise it's refused. A branch's owner that doesn't answer stops the replay with `in_doubt`, and a rerun asks again.
   - An abort marker is replayed only over no decision.
 - **The feed:** a replayed commit is a new commit on the new owner, at a new seqno, and carries `replayed` (its origin: the old history's epoch and its seqno there). A subscriber grouping a transaction's shares by `xid` gets a replayed share alone.
 - **Clock skew:** cells keep the old owner's timestamps. A cell written on the new owner after the failover with an earlier timestamp (its clock behind the old owner's) is overwritten by the replayed one.

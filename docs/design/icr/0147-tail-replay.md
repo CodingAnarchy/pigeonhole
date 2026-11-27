@@ -104,6 +104,7 @@ impl Feed {
   - The write gate (D326): each commit enters it, and the drop of (b) below does too.
 - **Amendment 5's (b), drop then apply:** a share the new owner's copy holds in doubt is first dropped (`Pigeonhole::decide(xid, false)`), then applied with the mark in one commit. The drop writes no data, no decision row and no feed event: an external share's abort delivers nothing (the engine's feed reader). A crash between the two leaves the share decided nowhere here and the mark unmoved, and the rerun asks the home (a).
   - **When D335 PR 4 lands,** a replicated prepare can be in doubt on the new owner, and "a branch keeps no record of a share it decided" stops being enough: deciding a replicated prepare that a PENDING tail names must then go through the replay's gate and write the mark in the same commit. Whichever of D336 and D335 PR 4 lands second wires it.
+    - **The race it closes** (simp724's N2 on #2265): the resolver can decide X between the replay's in-doubt check and its drop. The drop then fails, and the rerun takes (a), finds COMMITTED, and applies the share a second time. In 3a a copy holds no replicated prepare, so nothing reaches it.
 
 ## Not in this ICR
 
