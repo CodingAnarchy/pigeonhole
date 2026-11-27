@@ -526,6 +526,8 @@ async fn operation(sh: &Shared, rng: &mut Rng, node: usize, conn: usize) -> (boo
             .mutate(proto::MutateRequest {
                 writes: Some(put_row(&a.table, home_row, value(a.value_bytes))),
                 durability: a.durability.proto() as i32,
+                // The server's default: wait for the map's replica_acks (D335).
+                replication: 0,
             })
             .await;
         return (
@@ -580,6 +582,7 @@ async fn operation(sh: &Shared, rng: &mut Rng, node: usize, conn: usize) -> (boo
         .commit(proto::TxnCommitRequest {
             txn_id: id.clone(),
             rows,
+            replication: 0,
         })
         .await
         .map(|r| r.into_inner().parts.iter().filter(|p| !p.applied).count() as u64);
