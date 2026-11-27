@@ -202,7 +202,7 @@ The network API (`pigeonhole.v1`), additive, all in `cluster.proto`:
   - An owner that opens a partition whose own grantor record is `FLAGGED` at the current epoch and history resumes the fallback from that start.
   - It takes every write up to the partition's visible seqno at open as possibly answered uncovered, so it leaves only once the replicas hold them all.
   - The start is recorded again by the next round, which starts at once.
-  - A replica's new stream acknowledges only once something new is applied, so a reopened partition that stays idle stays in the fallback until its next write. That write waits for its acknowledgement as usual, and covers the rest.
+  - A replica acknowledges its stored token's position (durable) as soon as a `FollowAcked` stream opens, not only after its next apply. So a reopened partition that stays idle still ends its fallback once its replicas reattach, without waiting for a write (simp724).
 - **Spanning transactions:**
   - The commit-time refusal is 2a's, whatever the policy.
   - A writing `BranchPrepare` carries the commit's opt-down (`replication`).

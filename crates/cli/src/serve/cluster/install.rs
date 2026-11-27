@@ -252,7 +252,7 @@ impl Node {
                  seqno {}): it ends once its replicas hold every write up to seqno {visible}",
                 from.seqno
             );
-            acks.resume(from, visible);
+            let _ = acks.resume(from, visible);
         }
     }
 

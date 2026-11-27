@@ -1116,8 +1116,17 @@ impl Node {
             }
         }
         for (id, from) in flagged {
-            if let (Some(acks), Some(visible)) = (self.acks_of(id), self.visible_of(id)) {
-                acks.resume(from, visible);
+            if let (Some(acks), Some(visible)) = (self.acks_of(id), self.visible_of(id))
+                && acks.resume(from, visible)
+            {
+                // Once per resume (simp724): a grantor whose record writes keep failing
+                // shows here as one line per round.
+                eprintln!(
+                    "phdb serve: partition {id}: a grantor still records its replica-ack \
+                     fallback (from seqno {}): resumed it here, to end it once its replicas \
+                     hold every write up to seqno {visible}",
+                    from.seqno
+                );
             }
         }
         if marks.is_empty() {

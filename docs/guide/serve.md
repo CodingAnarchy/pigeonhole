@@ -669,6 +669,20 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 
 **Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label. Each partition also has its unpinned engine threads (`pigeonhole_serve_partition_unpinned_shard_threads`, `…_unpinned_compaction_threads`) and its engine memory (`pigeonhole_serve_partition_memtable_bytes`, `…_block_cache_bytes`, `…_row_cache_bytes`).
 
+### What a node keeps in its directory
+Beside its partitions, a cluster node's `DIR` holds the files below. **Leave them to the node unless the line says otherwise**: most hold state a restart, a failover or a lease relies on. Delete nothing while the node runs, unless its line says so.
+- **`cluster-map.json`:** the newest cluster map the node took. Don't delete it: a node started without it is a node of no cluster yet.
+- **`cluster-writer-term`:** the highest writer term this node voted for (D330), synced before the vote is answered. Don't delete it: it's what keeps a node that voted from taking an older writer's map after a restart.
+- **`fenced.json`:** the operator's fences, and those of partitions closed here. Don't delete it: the fences would lift at the next start.
+- **`cluster-degraded.json` (from 1.4.0):** this node's records, as a lease grantor, of `replica_acks` partitions' `ASYNC` fallbacks ([Waiting for replicas](#waiting-for-replicas-replica_acks-140-in-progress)). Don't delete it: a failover reads it, and a node whose copy doesn't parse refuses to start.
+- **`P.phdb` and its files** (`P.phdb-wal-N`, the change feed's files and the rest of the database's): partition `P`, or a replica copy of it. Don't delete them; drop a partition with `phdb cluster drop-partition`.
+- **`P.phdb.promoting` and `P.phdb.promoting.fork`:** a promote of this node's copy of `P` that hasn't finished (#2156), and the copy's fork token (D336). The promote removes them when it finishes. Don't delete them: they're how the promote, run again, finishes rather than starting over. `drop-partition` moves them aside with the partition's files.
+- **`P.phdb…replaced-TIME`:** files an install or a restore moved aside rather than deleted. Safe to delete once you've checked you don't need them.
+- **`.phdb-dropped/`:** what `drop-partition` moved aside, one directory per drop (`P-EPOCH-TIME`). The node never deletes it. Safe to delete once checked.
+- **`.phdb-incoming/`:** uploads in progress (`ID.part`) and an install's marker (`P.installing`). Don't delete it while an upload or an install runs; the node removes what it's done with.
+- **`.lock`:** held while a server or a `phdb cluster` command uses `DIR`. Don't delete it while one runs.
+- **`NAME.tmp`:** a synced write that was interrupted, such as `cluster-map.json.tmp`. Safe to delete while the node is stopped; the next write replaces it anyway.
+
 ### How calls are routed
 - **Any node takes any call.** It serves the call if it holds the row's partition, and otherwise forwards it to the node that does. A client needs no map. One that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
 - **Served by row:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.

@@ -391,7 +391,9 @@ fn a_refuse_partition_refuses_and_records_no_fallback() {
 
 /// simp724's P1: an owner that restarts in its fallback resumes it from its own grantor
 /// record, with every write it had taken as possibly answered uncovered, and ends it only
-/// once its replica holds them all, through a recorded clear.
+/// once its replica holds them all, through a recorded clear. With p3 idle after the
+/// restart: the reattached replica's first acknowledgement is what it already held, so the
+/// clear needs no write (simp724 on #2256).
 #[test]
 fn an_owner_restarted_in_its_fallback_resumes_it_and_ends_it_once_covered() {
     let client = node_runtime();
@@ -438,19 +440,10 @@ fn an_owner_restarted_in_its_fallback_resumes_it_and_ends_it_once_covered() {
             },
         )
         .await;
-        // a counts again. Its new stream acknowledges once something new is applied: the
-        // next write waits for that, as any write once a is healthy, and covers every
-        // write c had. Then the clear lands everywhere.
+        // a counts again. Its stream to the restarted c acknowledged what a already held
+        // as soon as it opened, so with p3 idle (no write from here on) c learns a covers
+        // every write it had, and the clear lands everywhere.
         hold(&c_dir, false);
-        let n = std::sync::atomic::AtomicUsize::new(0);
-        eventually_why(FOLLOW, "a write on c to be covered again", async || {
-            let i = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match write(format!("x{i}")).await {
-                Ok(c) if c.replica_acks == 1 => Ok(()),
-                other => Err(format!("{other:?}")),
-            }
-        })
-        .await;
         eventually_why(
             FOLLOW,
             "c to leave its fallback",

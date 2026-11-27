@@ -1326,6 +1326,11 @@ impl Replica {
             Err(halt) => return halt,
         };
         self.set_state(State::Following);
+        // D335 PR 2b: what the copy already holds, at once (its stored token's position,
+        // durable), so an owner that reopened, with nothing new to apply here, still learns
+        // this replica covers it and can end a fallback without waiting for a write
+        // (simp724 on #2256).
+        self.ack(&mut acker);
         let mut run = Run::default();
         let mut peeked = None;
         // When a read last had to wait: the queue was empty then, so a message read without

@@ -582,10 +582,11 @@ impl ReplicaAcks {
     /// (simp724's P1): the fallback resumes, with every position up to `visible` (its
     /// visible seqno at open) taken as possibly answered uncovered, so it ends only once
     /// the replicas hold them all. Recorded again by the next round, which is asked now.
-    pub(crate) fn resume(&self, from: Pos, visible: u64) {
+    /// Whether it resumed (not already in it, k ≥ 1, open).
+    pub(crate) fn resume(&self, from: Pos, visible: u64) -> bool {
         let mut inner = self.lock();
         if inner.config.k == 0 || inner.degraded.is_some() || inner.closed {
-            return;
+            return false;
         }
         inner.degraded = Some(Degraded {
             from,
@@ -595,6 +596,7 @@ impl ReplicaAcks {
         });
         drop(inner);
         self.kick();
+        true
     }
 
     /// Partition `partition`'s lines of the metrics [`render_all`](Self::render_all) heads:
