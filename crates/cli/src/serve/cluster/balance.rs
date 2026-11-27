@@ -617,16 +617,6 @@ pub(crate) fn decide(
             .map(|(n, _, _)| n.id.clone())
     };
     let mut skip: Option<String> = None;
-    // D336 (ai1249 on #2239): a partition with an old owner's tail pending is no source or
-    // target of anything (`eligible`), and the pass names it, as a merge into it would be
-    // refused at its first move.
-    if let Some(p) = parts.iter().find(|p| p.tail_pending) {
-        skip = Some(format!(
-            "{} has an old owner's tail pending: no split, move or merge names it until the \
-             tail is replayed or discarded",
-            p.id
-        ));
-    }
 
     // 1. Splits.
     for p in parts.iter().filter(|p| eligible(p)) {
@@ -917,8 +907,21 @@ pub(crate) fn decide(
             );
         }
     }
+    // D336 (ai1249 on #2239): a partition with an old owner's tail pending is no source or
+    // target of anything (`eligible`), and the pass names it, as a merge into it would be
+    // refused at its first move. Named last, so it masks no other reason (cli692 on #2239).
+    let tail = || {
+        parts.iter().find(|p| p.tail_pending).map(|p| {
+            format!(
+                "{} has an old owner's tail pending: no split, move or merge names it until \
+                 the tail is replayed or discarded",
+                p.id
+            )
+        })
+    };
     Decision::Skip(
         skip.or(incomplete)
+            .or_else(tail)
             .unwrap_or_else(|| "within bounds".into()),
     )
 }
@@ -1003,6 +1006,37 @@ mod tests {
         let (mut c, mut t) = (Counters::default(), 0);
         let d = run(&nodes, &[small, held], &b, &mut c, &mut t, 10);
         assert!(matches!(d, Decision::Act(Action::Merge { .. }, _)), "{d:?}");
+    }
+
+    /// cli692 on #2239: a pending tail is the fallback reason, so it masks no other one (here
+    /// a node that answered without its numbers).
+    #[test]
+    fn a_pending_tail_names_itself_only_when_nothing_else_does() {
+        let mut c3 = node("c");
+        c3.fresh = false;
+        c3.incomplete = Some("c gave no numbers for p3".into());
+        let nodes = [node("a"), node("b"), c3];
+        let mut held = part("p2", "b", 0.2, 1 << 30);
+        held.tail_pending = true;
+        let parts = [
+            part("p1", "a", 0.2, 1 << 30),
+            held,
+            part("p3", "c", 0.2, 1 << 30),
+        ];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 1);
+        let Decision::Skip(why) = d else {
+            panic!("{d:?}");
+        };
+        assert!(why.contains("c gave no numbers for p3"), "{why}");
+        // With every node complete, the tail is named.
+        let nodes = [node("a"), node("b"), node("c")];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 1);
+        let Decision::Skip(why) = d else {
+            panic!("{d:?}");
+        };
+        assert!(why.contains("p2 has an old owner's tail pending"), "{why}");
     }
 
     #[test]
