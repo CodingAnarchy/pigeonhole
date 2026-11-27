@@ -16,7 +16,9 @@
 //!    weight, against the mean of the nodes that answered), to the coldest node: the one
 //!    whose move brings both nodes closest to the mean without pushing the target over the
 //!    bound; ties go to the smaller partition. Its copy must fit in the dwell at
-//!    `--move-rate-bytes` (perf287's should-fix 2).
+//!    `--move-rate-bytes` (perf287's should-fix 2). On load, a node is over its bound only
+//!    when its load is also over [`LOAD_GATE`] of `partition_max_load`, and a target
+//!    whose load stays under that is within it (#2208): an idle cluster's loads are noise.
 //! 3. **Merge** a partition under `partition_min_bytes` and a tenth of its node's mean load
 //!    into a neighbour, one holding a range next to one of its own (only those: ai1249's S2
 //!    on #2103, so placements don't fragment),
@@ -50,6 +52,15 @@
 //! The counters live in the writer's memory only, and start again with each writer (S3).
 
 use std::collections::HashMap;
+
+/// The share of `partition_max_load` a node's load per unit of weight must also be over for
+/// the node to be over its load bound (#2208): 0.1, so 0.05 at the default bound, about
+/// 1.6 MiB/s on a node at `load::CEILING_FLOOR`. An idle cluster's loads (its map, lease
+/// and Status traffic) are tiny but not 0, and their ratios to a tiny mean are noise: 20
+/// KiB/s against 5 KiB/s is 1.6× the mean. Under the gate, a node isn't over on load, and a
+/// target isn't pushed over by a move. A threshold in the decision only: `Status` and the
+/// load-ratio metric show the loads and ratios as measured.
+pub(crate) const LOAD_GATE: f64 = 0.1;
 
 /// The balancer's bounds (`ClusterMap.balance`), each with its default where the map has 0.
 #[derive(Clone, Debug, PartialEq)]
@@ -703,8 +714,11 @@ pub(crate) fn decide(
 
     // 2. Whole moves off a node over a bound.
     let line = |r: f64| 1.0 + 0.4 * (r - 1.0);
+    // Under the gate, a node's load ratio is noise (#2208): it's over on load, or above the
+    // line, only over the gate too.
+    let gate = b.partition_max_load * LOAD_GATE;
     for (n, load, size) in &stats {
-        let lr = if mean_load > 0.0 {
+        let lr = if mean_load > 0.0 && *load > gate {
             load / mean_load
         } else {
             1.0
@@ -785,6 +799,8 @@ pub(crate) fn decide(
             // reverse, and once the dwell ended a move would take the partition back.
             let nw = if n.weight > 0.0 { n.weight } else { 1.0 };
             let within = |after: f64, mean: f64, bound: f64| mean <= 0.0 || after / mean <= bound;
+            // A target's load under the gate after the move is within on load (#2208): else
+            // an idle cluster's noise would refuse it a size move.
             let mut targets: Vec<&(&NodeView, f64, f64)> = stats
                 .iter()
                 .filter(|(t, _, _)| {
@@ -801,7 +817,7 @@ pub(crate) fn decide(
             let Some((to, to_load, to_size)) = targets.into_iter().find_map(|(t, tl, ts)| {
                 let tw = if t.weight > 0.0 { t.weight } else { 1.0 };
                 let (load_after, size_after) = (tl + p.load / tw, ts + p.bytes as f64 / tw);
-                (within(load_after, mean_load, b.load_ratio)
+                ((load_after <= gate || within(load_after, mean_load, b.load_ratio))
                     && within(size_after, mean_size, b.size_ratio))
                 .then(|| (t.id.clone(), load_after, size_after))
             }) else {
@@ -988,6 +1004,94 @@ mod tests {
         c.took(&a, t, &b);
         let d = run(&nodes, &parts, &b, &mut c, &mut t, 20);
         assert!(matches!(d, Decision::Skip(_)), "{d:?}");
+    }
+
+    /// #2208: an idle cluster whose trickles are uneven (about 20 KiB/s on a, 3 KiB/s on b
+    /// and c, over the ceiling floor) has load ratios of noise, a at 2.25x the mean, and p2
+    /// would land on b within both bounds: under [`LOAD_GATE`], nothing moves however many
+    /// passes run.
+    #[test]
+    fn an_idle_clusters_uneven_trickles_move_nothing() {
+        let nodes = [node("a"), node("b"), node("c")];
+        let parts = [
+            part("p1", "a", 0.0004, 896 << 20),
+            part("p2", "a", 0.0002, 128 << 20),
+            part("p3", "b", 0.0001, 1 << 30),
+            part("p4", "c", 0.0001, 1 << 30),
+        ];
+        let (mut c, mut t) = (Counters::default(), 0);
+        for _ in 0..10 {
+            let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
+            assert!(matches!(&d, Decision::Skip(_)), "{d:?}");
+        }
+    }
+
+    /// #2208: a node over the gate and over its load bound still moves, as before: at 0.09
+    /// it's real load, 2.1x the mean, and p2 lands on b within its bounds.
+    #[test]
+    fn a_node_over_the_gate_and_its_bound_still_moves() {
+        let nodes = [node("a"), node("b"), node("c")];
+        let parts = [
+            part("p1", "a", 0.06, 1 << 30),
+            part("p2", "a", 0.03, 1 << 28),
+            part("p3", "b", 0.02, 1 << 30),
+            part("p4", "c", 0.02, 1 << 30),
+        ];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
+        let Decision::Act(
+            Action::Move {
+                partition, from, ..
+            },
+            why,
+        ) = &d
+        else {
+            panic!("{d:?}")
+        };
+        assert_eq!((partition.as_str(), from.as_str()), ("p2", "a"));
+        assert!(why.contains("the mean load"), "{why}");
+    }
+
+    /// #2208, the target's mirror: on an idle cluster, a node over on size moves a partition
+    /// though the target's load after it is over 1.25x a mean of noise; under the gate, the
+    /// target's load is within. Before, every target was refused, and a stayed over.
+    #[test]
+    fn a_size_move_on_an_idle_cluster_isnt_refused_for_its_targets_load_noise() {
+        let nodes = [node("a"), node("b"), node("c")];
+        let parts = [
+            part("p1", "a", 0.0001, 1 << 30),
+            part("p2", "a", 0.0001, 1 << 30),
+            part("p3", "a", 0.0001, 1 << 30),
+            part("p4", "b", 0.0004, 1 << 30),
+            part("p5", "c", 0.0004, 1 << 30),
+        ];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
+        let Decision::Act(Action::Move { from, .. }, why) = &d else {
+            panic!("{d:?}")
+        };
+        assert_eq!(from, "a");
+        assert!(why.contains("the mean size"), "{why}");
+    }
+
+    /// #2208: the hysteresis line doesn't keep a node acted on going while its load is
+    /// under the gate: a at 1.2x the mean, under its bound but above the line, and p2
+    /// would land on c within both bounds.
+    #[test]
+    fn a_node_acted_on_under_the_gate_isnt_kept_going_by_the_line() {
+        let nodes = [node("a"), node("b"), node("c")];
+        let parts = [
+            part("p1", "a", 0.00022, 896 << 20),
+            part("p2", "a", 0.0001, 128 << 20),
+            part("p3", "b", 0.00025, 1 << 30),
+            part("p4", "c", 0.00023, 1 << 30),
+        ];
+        let mut c = Counters {
+            acting_on: Some("a".into()),
+            ..Counters::default()
+        };
+        let d = decide(&nodes, &parts, &bounds(), &mut c, 30_000, 64 << 20);
+        assert!(matches!(&d, Decision::Skip(_)), "{d:?}");
     }
 
     /// Node a holds four partitions at 0.1 each; b and c 0.1 each: a is at 2x the mean, and
