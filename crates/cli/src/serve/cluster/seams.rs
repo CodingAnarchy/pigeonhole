@@ -165,3 +165,39 @@ pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
             .iter()
             .any(|(d, a)| d == dir && a == address)
 }
+
+/// A hold seam (tests): the node in each listed directory holds every `Forward` it serves,
+/// once past the caller check, until its directory leaves the list, as a forward does
+/// behind a slow branch (#2258). Each held call is in [`HELD_FORWARDS`] while it waits.
+#[cfg(test)]
+pub(crate) static HOLD_FORWARDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The node directory of each `Forward` that [`HOLD_FORWARDS`] holds now.
+#[cfg(test)]
+pub(crate) static HELD_FORWARDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Waits while [`HOLD_FORWARDS`] lists `dir`.
+#[cfg(test)]
+pub(crate) async fn hold_forward(dir: &Path) {
+    let held = || {
+        HOLD_FORWARDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|d| d == dir)
+    };
+    if !held() {
+        return;
+    }
+    HELD_FORWARDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(dir.to_owned());
+    while held() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut h = HELD_FORWARDS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(i) = h.iter().position(|d| d == dir) {
+        h.remove(i);
+    }
+}

@@ -1,4 +1,5 @@
 use super::*;
+use tower::Layer as _;
 
 /// The `Cluster` service over gRPC.
 #[derive(Debug, Clone)]
@@ -319,6 +320,8 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::ForwardRequest>,
     ) -> Result<tonic::Response<proto::ForwardResponse>, Status> {
         let peer = self.caller(&req, &[Scope::Cluster], "forward a call")?;
+        #[cfg(test)]
+        seams::hold_forward(&self.0.dir).await;
         let Some(shared) = &self.1 else {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
@@ -591,10 +594,26 @@ async fn http_status(State(node): State<Arc<Node>>, headers: HeaderMap) -> Respo
 }
 
 /// The `Cluster` service's routes, gRPC and HTTP, which the data listener mounts beside the
-/// data routes (D317 ticket 2). Outside the server's load shedding, with a small limit of
-/// their own: a node busy with data must still take a map, or a re-forward's pull fails
-/// exactly when it matters (cli692's 3). `Forward` itself is a data call: an owner that
-/// sheds it answers `Overloaded`, which the forwarding node passes back.
+/// data routes (D317 ticket 2). Outside the server's load shedding, in lanes of their own
+/// (#2258): a node busy with data must still take a map, or a re-forward's pull fails
+/// exactly when it matters (cli692's 3), and must still answer its peers' lease rounds, or
+/// every owner that asks it loses its lease while its runtime sits idle.
+///
+/// - `Lease` and `Release` (and so the votes, which `Lease` carries): a lane of their own,
+///   since an answer that's late fences an owner.
+/// - `Forward` and `ForwardScan`, the data calls (a spanning transaction's branch calls
+///   among them): a lane of their own. An owner that sheds one answers `Overloaded`, which
+///   the forwarding node passes back.
+/// - Every other call (map reads, pushes and installs, status, fences): the control lane.
+///
+/// Each lane's limit is shared by its routes. Before #2258 one limit took every call, and
+/// a few dozen forwards in flight left a lease round's calls queued until they timed out.
+/// The `Cluster` paths routed apart from the control lane (#2258).
+const LEASE: &str = "/pigeonhole.v1.Cluster/Lease";
+const RELEASE: &str = "/pigeonhole.v1.Cluster/Release";
+const FORWARD: &str = "/pigeonhole.v1.Cluster/Forward";
+const FORWARD_SCAN: &str = "/pigeonhole.v1.Cluster/ForwardScan";
+
 pub(crate) fn routes(
     node: Arc<Node>,
     shared: Option<Arc<super::super::Shared>>,
@@ -637,11 +656,22 @@ pub(crate) fn routes(
     // an envelope (audit120's S-C2).
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
         .max_decoding_message_size(max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE));
+    let control = tower::limit::GlobalConcurrencyLimitLayer::new(CLUSTER_CALLS);
+    let leases = tower::limit::GlobalConcurrencyLimitLayer::new(LEASE_CALLS);
+    let data = tower::limit::GlobalConcurrencyLimitLayer::new(CLUSTER_CALLS);
     let mut app = axum::Router::new()
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))
         .route("/v1/cluster/status", get(http_status))
         .with_state(node)
-        .route_service("/pigeonhole.v1.Cluster/{*method}", grpc);
+        .layer(control.clone())
+        .route_service(
+            "/pigeonhole.v1.Cluster/{*method}",
+            control.layer(grpc.clone()),
+        )
+        .route_service(LEASE, leases.layer(grpc.clone()))
+        .route_service(RELEASE, leases.layer(grpc.clone()))
+        .route_service(FORWARD, data.layer(grpc.clone()))
+        .route_service(FORWARD_SCAN, data.layer(grpc));
     // A forwarded read's charge (#1567) moves into its reply's body, as the data routes'
     // `prepay` does, so it's held until the reply is written (cli692's F1 on ticket 2).
     if let Some(idle) = idle {
@@ -652,7 +682,6 @@ pub(crate) fn routes(
                 },
             ));
     }
-    let app = app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS));
     match streams {
         Some((feeds, watches, loads)) => app
             .route_service(feed::FORWARD_SUBSCRIBE, feeds)
