@@ -21,6 +21,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     ADOPTED_FEATURES_FEATURE,
     REPLICA_ACKS_FEATURE,
     REPLICA_ACK_WAIT_FEATURE,
+    REPLICA_ACK_POLICY_FEATURE,
 ];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.adopted_features` itself: a node without it (1.3)
@@ -41,6 +42,18 @@ pub(crate) const REPLICA_ACK_WAIT_FEATURE: &str = "replica_ack_wait";
 /// [`REPLICA_ACK_WAIT_FEATURE`] on every node.
 pub(crate) fn uses_replica_acks(map: &ClusterMap) -> bool {
     map.partitions.iter().any(|p| p.replica_acks > 0)
+}
+
+/// [`MAP_FEATURES`]' name for D335 PR 2b's map field, `Partition.replica_ack_policy`, and
+/// the lease's `degraded_from`/`degraded_clear` records behind its `ASYNC`: a node without
+/// it would drop the field and read as divergent, so a map sets it only once every node
+/// reports it.
+pub(crate) const REPLICA_ACK_POLICY_FEATURE: &str = "replica_ack_policy";
+
+/// Whether `map` sets any partition's `replica_ack_policy` (even to `REFUSE`, which an older
+/// node would drop as well): what needs [`REPLICA_ACK_POLICY_FEATURE`] on every node.
+pub(crate) fn uses_ack_policy(map: &ClusterMap) -> bool {
+    map.partitions.iter().any(|p| p.replica_ack_policy != 0)
 }
 
 /// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,

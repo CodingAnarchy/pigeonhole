@@ -192,6 +192,15 @@ impl Node {
             // D335: each partition's replica acks as the map has them (k, its replicas),
             // still under the install lock, as an open arms them.
             self.apply_acks(m);
+            // D335 PR 2b: this grantor's fallback records of partitions the map no longer
+            // has, or of an older history than its, go; one of a newer history stays (this
+            // map may lag the owner's).
+            if let Err(e) = self.degraded.retain(m) {
+                eprintln!(
+                    "phdb serve: pruning {}: {e}",
+                    super::degraded::DEGRADED_FILE
+                );
+            }
         }
         self.wake_copies(&moved);
         Ok(version)
@@ -215,6 +224,35 @@ impl Node {
                     self.peers.replica_ack_timeout,
                 ));
             }
+        }
+    }
+
+    /// D335: partition `id`'s replica acks as `map` has them, at its open here, before it
+    /// serves; with PR 2b's kick, and its fallback resumed if this node's own grantor record
+    /// says it was in one at this epoch (simp724's P1): every write up to `visible` (its
+    /// visible seqno now) is then taken as possibly answered uncovered.
+    pub(crate) fn arm_acks(
+        &self,
+        acks: &crate::serve::acks::ReplicaAcks,
+        map: &ClusterMap,
+        id: &str,
+        visible: u64,
+    ) {
+        acks.configure(crate::serve::acks::AckConfig::of(
+            map,
+            id,
+            self.peers.replica_ack_timeout,
+        ));
+        acks.set_kick(Arc::clone(&self.fences.kick));
+        if let Some(p) = map.partitions.iter().find(|p| p.id == id)
+            && let Some(from) = self.degraded.flagged(id, p.epoch, p.history_epoch)
+        {
+            eprintln!(
+                "phdb serve: partition {id} reopens in its replica-ack fallback (recorded from \
+                 seqno {}): it ends once its replicas hold every write up to seqno {visible}",
+                from.seqno
+            );
+            acks.resume(from, visible);
         }
     }
 
@@ -402,6 +440,14 @@ impl Node {
                 self.every_node_keeps(&map, REPLICA_ACK_WAIT_FEATURE, "a partition's replica_acks")
                     .await?;
             }
+            if !uses_ack_policy(&current) && uses_ack_policy(&map) {
+                self.every_node_keeps(
+                    &map,
+                    REPLICA_ACK_POLICY_FEATURE,
+                    "a partition's replica_ack_policy",
+                )
+                .await?;
+            }
             // A node the map adds must report each adopted feature, and the writer adopts
             // what every node reports now.
             self.new_nodes_keep_adopted(&current, &map).await?;
@@ -450,6 +496,14 @@ impl Node {
             if uses_replica_acks(&map) {
                 self.every_node_keeps(&map, REPLICA_ACK_WAIT_FEATURE, "a partition's replica_acks")
                     .await?;
+            }
+            if uses_ack_policy(&map) {
+                self.every_node_keeps(
+                    &map,
+                    REPLICA_ACK_POLICY_FEATURE,
+                    "a partition's replica_ack_policy",
+                )
+                .await?;
             }
             if map::uses_failover(&map) || map.writer_term > 0 {
                 self.every_node_keeps(&map, WRITER_TERMS_FEATURE, "failover or a writer term")

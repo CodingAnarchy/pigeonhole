@@ -333,6 +333,7 @@ fn a_spanning_transaction_is_its_tokens_and_a_client_cant_call_the_branch_arms()
         // A client token can't prepare or decide a branch itself.
         for op in [
             forward_request::Op::BranchPrepare(BranchPrepare {
+                replication: 0,
                 xid: id.clone(),
                 read_only: false,
             }),

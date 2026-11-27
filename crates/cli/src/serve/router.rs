@@ -74,6 +74,7 @@ impl Cluster {
             _ => "",
         };
         Ok(spanning::Driver {
+            replication: 0,
             node: Arc::clone(&self.node),
             parts: Arc::clone(&self.parts),
             forwarder: Arc::clone(&self.forwarder),
@@ -99,6 +100,7 @@ impl Cluster {
     ) -> spanning::Driver {
         let round = home_service.request_timeout();
         spanning::Driver {
+            replication: 0,
             node: Arc::clone(&self.node),
             parts: Arc::clone(&self.parts),
             forwarder: Arc::clone(&self.forwarder),

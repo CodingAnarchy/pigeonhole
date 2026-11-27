@@ -388,6 +388,9 @@ impl Grants {
             term,
             in_doubt_xids,
             in_doubt_count,
+            // D335 PR 2b: recorded by the Lease handler (`Node::record_degraded`), never here.
+            degraded_from: _,
+            degraded_clear: _,
         } in &req.parts
         {
             let given = if partition == WRITER_LEASE {

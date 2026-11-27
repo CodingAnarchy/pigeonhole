@@ -622,11 +622,19 @@ pub(crate) async fn serve_branch(
             service.begin_branch(&b.xid, caller, b.renew)?;
             Reply::Empty(proto::Empty {})
         }
-        Op::BranchPrepare(b) => Reply::BranchPrepare(
-            service
-                .prepare_branch(&b.xid, b.read_only, spanning, partition)
-                .await?,
-        ),
+        Op::BranchPrepare(b) => {
+            // D335 PR 2b: by this owner's own map too, which may set replica_acks a map push
+            // before the driver's does (simp724's note 1 on #2238). Before the prepare is
+            // written, so the transaction stays open.
+            if !b.read_only && b.replication != proto::ReplicationMode::Async as i32 {
+                refuse_uncovered(node, std::slice::from_ref(&partition.to_owned()))?;
+            }
+            Reply::BranchPrepare(
+                service
+                    .prepare_branch(&b.xid, b.read_only, spanning, partition)
+                    .await?,
+            )
+        }
         // A share in doubt elsewhere asks this home what was decided (D329's resolver).
         Op::ResolveTxn(r) => {
             if !r.acked.is_empty() {
@@ -713,6 +721,10 @@ pub(crate) struct Driver {
     /// The budget of a round that must reach every branch whatever the client's deadline
     /// (decides, aborts, releases): the request timeout (audit120's S1 on #2062).
     pub(crate) round: Duration,
+    /// D335 PR 2b: the commit's `ReplicationMode`, `ASYNC` once it opted down (by field or
+    /// header): its writing prepares say so, and a branch's owner refuses one that didn't
+    /// on a `replica_acks` partition.
+    pub(crate) replication: i32,
 }
 
 /// One partition's prepared share, as the home's release or decide round needs it.
@@ -947,6 +959,7 @@ impl Driver {
                     let op = Op::BranchPrepare(proto::BranchPrepare {
                         xid: d.xid.to_string(),
                         read_only,
+                        replication: d.replication,
                     });
                     d.send(&p, op, !read_only).await
                 })

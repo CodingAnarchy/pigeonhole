@@ -13,6 +13,15 @@
 //! write waits follows the map's k ([`ReplicaAcks::configure`], at open and on every map
 //! install), never whether a stream is attached at that instant (simp724 on #2236).
 //!
+//! **The fallback (PR 2b, §7's ASYNC):** with the map's `replica_ack_policy` at ASYNC, a
+//! short partition takes writes instead, and its owner enters [`Degraded`] from the position
+//! just past the frontier. It answers a write without its k acknowledgements only once a
+//! majority of the lease's grantors durably recorded that position (`LeasePart.
+//! degraded_from`, echoed once synced: [`ReplicaAcks::marked`]), and only while still short.
+//! It leaves once k replicas are healthy and acknowledged every write answered uncovered,
+//! through a recorded clear (`LeasePart.degraded_clear`); in between, writes wait for their
+//! acknowledgements as usual.
+//!
 //! **Who counts:** only the map's replicas of the partition. An install that drops a node
 //! from `replicas`, or changes the partition's history, uncounts its stream (feed1248's A1):
 //! the stream's later acks are ignored until the node follows again.
@@ -25,7 +34,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use super::errors::ApiError;
 use super::gate::WriteGate;
@@ -113,12 +122,19 @@ pub(crate) struct AckConfig {
     pub(crate) version: u64,
     /// `--cluster-replica-ack-timeout-ms`: how long a write waits.
     pub(crate) timeout: Duration,
+    /// `Partition.replica_ack_policy` is ASYNC (PR 2b): a short partition falls back rather
+    /// than refusing writes.
+    pub(crate) fallback: bool,
+    /// The map's node ids, sorted: the set a fallback's record is counted against
+    /// (simp724's P2 on the 2b plan).
+    pub(crate) nodes: Vec<String>,
 }
 
 impl AckConfig {
     /// Partition `id`'s, as `map` has it, with the node's `timeout`: k = 0 and no
     /// replicas when `map` doesn't name it.
     pub(crate) fn of(map: &proto::ClusterMap, id: &str, timeout: Duration) -> Self {
+        let nodes = node_set(map);
         match map.partitions.iter().find(|p| p.id == id) {
             Some(p) => Self {
                 k: p.replica_acks,
@@ -126,14 +142,49 @@ impl AckConfig {
                 history: p.history_epoch,
                 version: map.map_version,
                 timeout,
+                fallback: p.replica_ack_policy == proto::ReplicaAckPolicy::Async as i32,
+                nodes,
             },
             None => Self {
                 version: map.map_version,
                 timeout,
+                nodes,
                 ..Self::default()
             },
         }
     }
+}
+
+/// `map`'s node ids, sorted: what a lease round's majority is counted over.
+pub(crate) fn node_set(map: &proto::ClusterMap) -> Vec<String> {
+    let mut nodes: Vec<String> = map.nodes.iter().map(|n| n.id.clone()).collect();
+    nodes.sort_unstable();
+    nodes
+}
+
+/// What a lease round carries for a degraded partition (PR 2b): the position its fallback
+/// starts at, or that it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mark {
+    From(Pos),
+    Clear,
+}
+
+/// A partition's fallback on its owner (§7's ASYNC), from entering until a majority
+/// recorded its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Degraded {
+    /// The first position that may be answered without k acknowledgements: just past the
+    /// frontier when it began, so every write not covered then is at or past it.
+    from: Pos,
+    /// The node set a majority of whose grantors echoed `from` (synced), if one has: writes
+    /// are answered uncovered only while it's the map's (P2).
+    recorded: Option<Vec<String>>,
+    /// The highest position answered uncovered, or at a reopen every position up to the
+    /// partition's visible seqno (simp724's P1): the frontier must pass it before the clear.
+    last_uncovered: Option<Pos>,
+    /// Leaving: the rounds carry the clear, and writes wait for their acknowledgements.
+    clearing: bool,
 }
 
 /// One partition's acknowledgements, on its owner.
@@ -144,6 +195,9 @@ pub(crate) struct ReplicaAcks {
     /// The map's k, for a write's check without the lock.
     k: AtomicU32,
     inner: Mutex<Inner>,
+    /// The node's lease rounds' kick (PR 2b): entering the fallback asks for a round now
+    /// rather than at the next third of a lease. Set once at open.
+    kick: std::sync::OnceLock<Arc<Notify>>,
 }
 
 #[derive(Debug, Default)]
@@ -172,6 +226,10 @@ struct Inner {
     uncovered: BTreeMap<Pos, Instant>,
     /// The partition closed here: no write waits any more.
     closed: bool,
+    /// The fallback (PR 2b), while in it.
+    degraded: Option<Degraded>,
+    /// Times the fallback began: `/metrics`' `_degraded_total`.
+    degraded_total: u64,
     /// The wait histogram: per bucket (not cumulative; the last is past the last bound),
     /// the sum in microseconds, and the commits not timed for `PENDING_CAP`.
     waits: [u64; BUCKETS_US.len() + 1],
@@ -212,7 +270,10 @@ impl ReplicaAcks {
     /// the partition's history changed, every entry's acknowledgement is forgotten (its
     /// positions were the old history's) but the streams stay attached, so each counts
     /// again from its next acknowledgement, without a reconnect (feed1248's Q1 and Q2 on
-    /// #2238).
+    /// #2238). The waiters, the uncovered writes and a fallback are kept across that
+    /// change: a swap of P's file reopens it here, with a new table, so a history change on
+    /// the same table keeps the owner's feed numbering, and their positions stay true
+    /// (simp724's note 2 on #2238).
     pub(crate) fn configure(&self, config: AckConfig) {
         let mut inner = self.lock();
         if config.version < inner.config.version {
@@ -225,9 +286,29 @@ impl ReplicaAcks {
                 e.moved = now;
             }
         }
+        // A record counted over another node set may share no node with a majority of
+        // this one (3 nodes to 5): it's counted again (simp724's P2).
+        if let Some(d) = inner.degraded.as_mut()
+            && d.recorded.as_ref().is_some_and(|set| *set != config.nodes)
+        {
+            d.recorded = None;
+        }
         self.k.store(config.k, Ordering::Relaxed);
         inner.config = config;
         inner.refresh(Instant::now());
+    }
+
+    /// The node's lease rounds' kick, at open (PR 2b).
+    pub(crate) fn set_kick(&self, kick: Arc<Notify>) {
+        let _ = self.kick.set(kick);
+    }
+
+    fn kick(&self) {
+        // `notify_one` keeps a permit, so a kick while a round runs sends the next one at
+        // once (simp724).
+        if let Some(n) = self.kick.get() {
+            n.notify_one();
+        }
     }
 
     /// The map's k: whether a write here waits for replicas (0: it doesn't).
@@ -281,6 +362,15 @@ impl ReplicaAcks {
         inner.track_short(now);
         let healthy = inner.healthy(now);
         if healthy >= inner.config.k {
+            return Ok(());
+        }
+        if inner.config.fallback {
+            // §7's ASYNC: taken, and answered once the fallback is recorded.
+            let kick = inner.enter();
+            drop(inner);
+            if kick {
+                self.kick();
+            }
             return Ok(());
         }
         inner.refused += 1;
@@ -338,8 +428,11 @@ impl ReplicaAcks {
             if inner.frontier.is_some_and(|f| f >= pos) {
                 return Ok(inner.acked_at(pos));
             }
-            let (tx, rx) = oneshot::channel();
             let now = Instant::now();
+            if inner.fallback_now(pos, now) {
+                return Ok(inner.answer_uncovered(pos, now));
+            }
+            let (tx, rx) = oneshot::channel();
             inner.waiters.entry(pos).or_default().push((tx, now));
             if inner.uncovered.len() < PENDING_CAP {
                 inner.uncovered.entry(pos).or_insert(now);
@@ -419,6 +512,91 @@ impl ReplicaAcks {
         (inner.frontier, u32::try_from(healthy).unwrap_or(u32::MAX))
     }
 
+    /// `LocalPartition.degraded_from`: where the fallback began, while in it.
+    pub(crate) fn degraded_from(&self) -> Option<Pos> {
+        self.lock().degraded.as_ref().map(|d| d.from)
+    }
+
+    /// What this lease round carries for the partition (PR 2b), if it's in the fallback:
+    /// its start, or once k replicas are healthy and the frontier passed every write
+    /// answered uncovered, its end.
+    pub(crate) fn lease_mark(&self) -> Option<Mark> {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let healthy = inner.healthy(now) >= inner.config.k;
+        let frontier = inner.frontier;
+        let d = inner.degraded.as_mut()?;
+        if !d.clearing
+            && healthy
+            && d.last_uncovered
+                .is_none_or(|l| frontier.is_some_and(|f| f >= l))
+        {
+            d.clearing = true;
+        }
+        Some(if d.clearing {
+            Mark::Clear
+        } else {
+            Mark::From(d.from)
+        })
+    }
+
+    /// A lease round over `nodes` (the round's map's, sorted) carried `mark`, and a majority
+    /// of them echoed it, synced. A start: writes at or past it are answered uncovered from
+    /// now while short, those waiting first. An end: the fallback is over. Ignored when the
+    /// partition has moved on since (another start, or no longer leaving), or when `nodes`
+    /// isn't the map's node set now (P2).
+    pub(crate) fn marked(&self, mark: Mark, nodes: &[String]) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        if inner.config.nodes != nodes {
+            return;
+        }
+        let Some(d) = inner.degraded.as_mut() else {
+            return;
+        };
+        match mark {
+            Mark::From(from) if from == d.from && !d.clearing => {
+                d.recorded = Some(nodes.to_vec());
+                inner.wake_uncovered(now);
+            }
+            Mark::Clear if d.clearing => inner.degraded = None,
+            _ => {}
+        }
+    }
+
+    /// A grantor echoed a recorded start below this owner's (one it recorded before: a
+    /// restart here lost it): this owner starts there instead, which only covers more, and
+    /// counts the record again.
+    pub(crate) fn lower_from(&self, from: Pos) {
+        let mut inner = self.lock();
+        if let Some(d) = inner.degraded.as_mut()
+            && !d.clearing
+            && from < d.from
+        {
+            d.from = from;
+            d.recorded = None;
+        }
+    }
+
+    /// The partition reopened here while its own grantor record says FLAGGED from `from`
+    /// (simp724's P1): the fallback resumes, with every position up to `visible` (its
+    /// visible seqno at open) taken as possibly answered uncovered, so it ends only once
+    /// the replicas hold them all. Recorded again by the next round, which is asked now.
+    pub(crate) fn resume(&self, from: Pos, visible: u64) {
+        let mut inner = self.lock();
+        if inner.config.k == 0 || inner.degraded.is_some() || inner.closed {
+            return;
+        }
+        inner.degraded = Some(Degraded {
+            from,
+            recorded: None,
+            last_uncovered: Some(Pos::commit(visible)),
+            clearing: false,
+        });
+        drop(inner);
+        self.kick();
+    }
+
     /// Partition `partition`'s lines of the metrics [`render_all`](Self::render_all) heads:
     /// `waits` the histogram, `acked` the per-replica gauge, and `counters` the four
     /// counters (only for a partition at k ≥ 1, or one that counted something).
@@ -467,14 +645,17 @@ impl ReplicaAcks {
         }
         let short = inner.short_total.as_secs_f64();
         if inner.config.k > 0
-            || inner.timeouts + inner.lease_lost + inner.refused > 0
+            || inner.timeouts + inner.lease_lost + inner.refused + inner.degraded_total > 0
             || short > 0.0
         {
+            let degraded = u8::from(inner.degraded.is_some());
             for (lines, value) in [
                 (&mut out.timeouts, inner.timeouts.to_string()),
                 (&mut out.lease_lost, inner.lease_lost.to_string()),
                 (&mut out.short, short.to_string()),
                 (&mut out.refused, inner.refused.to_string()),
+                (&mut out.degraded, degraded.to_string()),
+                (&mut out.degraded_total, inner.degraded_total.to_string()),
             ] {
                 let _ = writeln!(lines, "{{partition=\"{partition}\"}} {value}");
             }
@@ -526,11 +707,28 @@ impl ReplicaAcks {
                 "Writes refused because the partition had fewer healthy replicas than \
                  replica_acks (D335).",
             ),
+            (
+                &out.degraded,
+                "pigeonhole_cluster_replica_ack_degraded",
+                "1 while the partition's owner is in its replica_ack_policy ASYNC fallback, \
+                 and may answer writes without replica_acks acknowledgements (D335).",
+            ),
+            (
+                &out.degraded_total,
+                "pigeonhole_cluster_replica_ack_degraded_total",
+                "Times the partition's owner entered its replica_ack_policy ASYNC fallback \
+                 (D335).",
+            ),
         ] {
             if lines.is_empty() {
                 continue;
             }
-            text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+            let kind = if name.ends_with("_degraded") {
+                "gauge"
+            } else {
+                "counter"
+            };
+            text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
             for line in lines.lines() {
                 text.push_str(name);
                 text.push_str(line);
@@ -559,6 +757,8 @@ pub(crate) struct Rendered {
     lease_lost: String,
     short: String,
     refused: String,
+    degraded: String,
+    degraded_total: String,
 }
 
 /// Why a write's wait ended without its acknowledgements.
@@ -576,6 +776,73 @@ fn closed(partition: &str) -> ApiError {
 }
 
 impl Inner {
+    /// Enters the fallback, or stays in it (short again while leaving: the clear is given
+    /// up, the start and its record kept). Whether a lease round should go now.
+    fn enter(&mut self) -> bool {
+        match self.degraded.as_mut() {
+            Some(d) => {
+                d.clearing = false;
+                d.recorded.is_none()
+            }
+            None => {
+                let from = self.frontier.map_or(Pos::default(), |f| Pos {
+                    seqno: f.seqno,
+                    n: f.n.saturating_add(1),
+                });
+                self.degraded = Some(Degraded {
+                    from,
+                    recorded: None,
+                    last_uncovered: None,
+                    clearing: false,
+                });
+                self.degraded_total += 1;
+                true
+            }
+        }
+    }
+
+    /// Whether a write at `pos` may be answered without its acknowledgements now: the
+    /// policy is ASYNC, the partition is short, and a majority of this map's node set
+    /// recorded a start at or below `pos`. Never while leaving, so the frontier can catch
+    /// up with the last write answered uncovered.
+    fn fallback_now(&self, pos: Pos, now: Instant) -> bool {
+        self.config.fallback
+            && self.degraded.as_ref().is_some_and(|d| {
+                !d.clearing && pos >= d.from && d.recorded.as_ref() == Some(&self.config.nodes)
+            })
+            && self.healthy(now) < self.config.k
+    }
+
+    /// Answers a write at `pos` without its acknowledgements: the count it has. It stays
+    /// uncovered for health (N1) until the frontier passes it.
+    fn answer_uncovered(&mut self, pos: Pos, now: Instant) -> u32 {
+        if let Some(d) = self.degraded.as_mut() {
+            d.last_uncovered = Some(d.last_uncovered.map_or(pos, |l| l.max(pos)));
+        }
+        if self.uncovered.len() < PENDING_CAP {
+            self.uncovered.entry(pos).or_insert(now);
+        }
+        self.acked_at(pos)
+    }
+
+    /// The start just recorded: every write waiting at or past it is answered uncovered,
+    /// if the partition is still short.
+    fn wake_uncovered(&mut self, now: Instant) {
+        let Some(from) = self.degraded.as_ref().map(|d| d.from) else {
+            return;
+        };
+        if !self.fallback_now(from, now) {
+            return;
+        }
+        let waiting: Vec<Pos> = self.waiters.range(from..).map(|(p, _)| *p).collect();
+        for pos in waiting {
+            let n = self.answer_uncovered(pos, now);
+            for (tx, _) in self.waiters.remove(&pos).unwrap_or_default() {
+                let _ = tx.send(n);
+            }
+        }
+    }
+
     /// The entries that count: those of the map's replicas now.
     fn counted(&self) -> impl Iterator<Item = &Entry> {
         self.nodes
@@ -748,6 +1015,8 @@ mod tests {
 
     fn config(k: u32, of: &[&str], version: u64) -> AckConfig {
         AckConfig {
+            fallback: false,
+            nodes: Vec::new(),
             k,
             replicas: replicas(of),
             history: 1,
@@ -1043,5 +1312,135 @@ mod tests {
         assert_eq!(inner.healthy(Instant::now()), 1, "a alone: b still stalled");
         drop(inner);
         drop(b);
+    }
+
+    fn nodes(of: &[&str]) -> Vec<String> {
+        replicas(of)
+    }
+
+    /// An ASYNC partition at k = 1 of replica `a`, in a map of nodes n1..n3.
+    fn fallback(k: u32) -> Arc<ReplicaAcks> {
+        let acks = Arc::new(ReplicaAcks::default());
+        acks.configure(AckConfig {
+            fallback: true,
+            nodes: nodes(&["n1", "n2", "n3"]),
+            ..config(k, &["a"], 1)
+        });
+        acks
+    }
+
+    async fn pending(acks: &Arc<ReplicaAcks>, gate: &Arc<WriteGate>, pos: Pos) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), acks.wait(pos, gate))
+            .await
+            .is_err()
+    }
+
+    /// PR 2b: a short ASYNC partition takes the write, and answers it without its
+    /// acknowledgement only once a round's majority recorded the start, of this map's node
+    /// set (simp724's P2); then it leaves through a recorded clear.
+    #[tokio::test]
+    async fn an_async_partition_answers_uncovered_only_once_its_start_is_recorded() {
+        let acks = fallback(1);
+        let gate = leased_gate();
+        acks.admit("p1").unwrap();
+        assert_eq!(acks.degraded_from(), Some(Pos::default()));
+        assert_eq!(acks.lease_mark(), Some(Mark::From(Pos::default())));
+        // Not recorded: the write waits.
+        assert!(pending(&acks, &gate, Pos::commit(5)).await);
+        // Recorded over another node set: still not.
+        acks.marked(Mark::From(Pos::default()), &nodes(&["n1", "n2"]));
+        assert!(pending(&acks, &gate, Pos::commit(5)).await);
+        // A waiting write is answered the moment the record lands.
+        let waiting = {
+            let (acks, gate) = (Arc::clone(&acks), Arc::clone(&gate));
+            tokio::spawn(async move { acks.wait(Pos::commit(5), &gate).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        acks.marked(Mark::From(Pos::default()), &nodes(&["n1", "n2", "n3"]));
+        assert_eq!(waiting.await.unwrap().unwrap(), 0);
+        // And a later one at once.
+        assert_eq!(acks.wait(Pos::commit(6), &gate).await.unwrap(), 0);
+        // A node-set change: counted again before anything else is answered uncovered.
+        acks.configure(AckConfig {
+            fallback: true,
+            nodes: nodes(&["n1", "n2", "n3", "n4", "n5"]),
+            ..config(1, &["a"], 2)
+        });
+        assert!(pending(&acks, &gate, Pos::commit(7)).await);
+        // The replica is back, but hasn't acknowledged 6: no clear yet, and a write waits
+        // for its acknowledgement as usual.
+        let a = acks.attach("a");
+        a.ack(Pos::commit(4));
+        assert_eq!(acks.lease_mark(), Some(Mark::From(Pos::default())));
+        a.ack(Pos::commit(6));
+        assert_eq!(acks.lease_mark(), Some(Mark::Clear));
+        assert!(pending(&acks, &gate, Pos::commit(8)).await);
+        // The clear recorded: out of the fallback.
+        acks.marked(Mark::Clear, &nodes(&["n1", "n2", "n3", "n4", "n5"]));
+        assert_eq!(acks.degraded_from(), None);
+        assert_eq!(acks.lease_mark(), None);
+        let mut out = Rendered::default();
+        acks.render("p1", &mut out);
+        assert_eq!(out.degraded, "{partition=\"p1\"} 0\n");
+        assert_eq!(out.degraded_total, "{partition=\"p1\"} 1\n");
+    }
+
+    /// Short again while leaving: the clear is given up, the start and its record kept.
+    #[tokio::test]
+    async fn short_again_while_leaving_keeps_the_start_and_its_record() {
+        let acks = fallback(1);
+        let gate = leased_gate();
+        let a = acks.attach("a");
+        a.ack(Pos::commit(3));
+        // a stalls: a write waited past STALL for a position it never acknowledged.
+        {
+            let long_ago = Instant::now() - STALL - Duration::from_millis(1);
+            let mut inner = acks.lock();
+            inner.nodes.get_mut("a").unwrap().moved = long_ago;
+            inner.uncovered.insert(Pos::commit(4), long_ago);
+        }
+        acks.admit("p1").unwrap();
+        let from = Pos { seqno: 3, n: 1 };
+        assert_eq!(acks.degraded_from(), Some(from), "just past the frontier");
+        acks.marked(Mark::From(from), &nodes(&["n1", "n2", "n3"]));
+        assert_eq!(acks.wait(Pos::commit(4), &gate).await.unwrap(), 0);
+        a.ack(Pos::commit(4));
+        assert_eq!(acks.lease_mark(), Some(Mark::Clear));
+        drop(a);
+        acks.admit("p1").unwrap();
+        assert_eq!(acks.lease_mark(), Some(Mark::From(from)));
+        assert_eq!(acks.wait(Pos::commit(5), &gate).await.unwrap(), 0);
+        let mut out = Rendered::default();
+        acks.render("p1", &mut out);
+        assert_eq!(out.degraded_total, "{partition=\"p1\"} 1\n", "one entry");
+    }
+
+    /// A grantor's earlier start lowers the owner's (it lost its own); a reopen resumes
+    /// the fallback until the replicas hold every write up to the visible seqno (P1).
+    #[tokio::test]
+    async fn a_lower_echo_and_a_reopen_cover_more() {
+        let acks = fallback(1);
+        acks.admit("p1").unwrap();
+        let a = acks.attach("a");
+        a.ack(Pos::commit(9));
+        drop(a);
+        // Entered at (0, 0) before the ack; a lower echo can't go below it.
+        acks.lower_from(Pos::default());
+        assert_eq!(acks.degraded_from(), Some(Pos::default()));
+
+        let reopened = fallback(1);
+        reopened.resume(Pos::commit(3), 10);
+        assert_eq!(reopened.lease_mark(), Some(Mark::From(Pos::commit(3))));
+        reopened.lower_from(Pos::commit(2));
+        assert_eq!(reopened.degraded_from(), Some(Pos::commit(2)));
+        let a = reopened.attach("a");
+        a.ack(Pos::commit(9));
+        assert_eq!(reopened.lease_mark(), Some(Mark::From(Pos::commit(2))));
+        a.ack(Pos::commit(10));
+        assert_eq!(reopened.lease_mark(), Some(Mark::Clear));
+        // REFUSE (no fallback) never resumes at k = 0.
+        let plain = configured(0, &["a"]);
+        plain.resume(Pos::commit(3), 10);
+        assert_eq!(plain.lease_mark(), None);
     }
 }

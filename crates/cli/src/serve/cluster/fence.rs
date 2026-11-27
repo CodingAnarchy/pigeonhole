@@ -133,6 +133,9 @@ pub(crate) struct Fences {
     /// Peers that report `leases` but whose `Cluster.Lease` answers `Unimplemented`
     /// (audit120's S1 on #2048): counted as nothing, and logged once per peer.
     unrouted: Mutex<BTreeSet<String>>,
+    /// D335 PR 2b: a partition entering its fallback asks for a lease round now
+    /// ([`crate::serve::acks::ReplicaAcks::set_kick`]); the renewal loop wakes on it.
+    pub(crate) kick: Arc<tokio::sync::Notify>,
 }
 
 /// [`Node::confirm_soon`]'s state.
@@ -888,6 +891,9 @@ impl Node {
                 p.in_doubt_xids = xids;
             }
         }
+        // D335 PR 2b: a partition in its fallback asks the round to record where it began,
+        // or that it ended; counted from the grantors' synced echoes below.
+        let marks = self.lease_marks(&mut parts);
         // The writer lease (D330): the map's writer asks for it at the map's term; a
         // candidate, at the term it was voted, until its map lands.
         if let Some(term) = self.writer_term_to_ask(&round.map) {
@@ -968,11 +974,17 @@ impl Node {
                                 // Never the writer lease (D330, simp724's N1 on the PR 1
                                 // plan): a 1.2 node grants no such thing, so a phantom
                                 // grant mustn't count toward it.
+                                // Nor a record of a fallback (D335 PR 2b): it echoes only
+                                // what a grantor synced, and this one synced nothing.
                                 let granted = req
                                     .parts
                                     .iter()
                                     .filter(|p| p.partition != super::lease::WRITER_LEASE)
-                                    .cloned()
+                                    .map(|p| LeasePart {
+                                        degraded_from: None,
+                                        degraded_clear: false,
+                                        ..p.clone()
+                                    })
                                     .collect();
                                 Some((
                                     peer,
@@ -1008,11 +1020,15 @@ impl Node {
         let mut answers: Vec<(String, super::proto::LeaseResponse)> = Vec::new();
         if round.map.nodes.iter().any(|n| n.id == self.id) {
             match self.grants.grant(&round.map, &req) {
-                Ok(r) => answers.push((self.id.clone(), r)),
+                Ok(r) => answers.push((
+                    self.id.clone(),
+                    self.record_degraded(&round.map, &req, r).await,
+                )),
                 Err(e) => eprintln!("phdb serve: this node's own lease grant: {}", e.message),
             }
         }
         answers.extend(asks.join_all().await.into_iter().flatten());
+        self.count_marks(&round.map, &marks, &answers);
         for (_, r) in answers {
             for g in r.granted {
                 *round.granted.entry(g.partition).or_default() += 1;
@@ -1023,6 +1039,155 @@ impl Node {
                     .map(|w| (w.partition, w.holder, w.remaining_ms)),
             );
             round.grace_ms = round.grace_ms.max(r.grace_remaining_ms);
+        }
+    }
+
+    /// The open partition `id`'s replica acknowledgements here, if it's open.
+    pub(crate) fn acks_of(&self, id: &str) -> Option<Arc<crate::serve::acks::ReplicaAcks>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        let cluster = shared.router.cluster.as_ref()?;
+        let parts = cluster.parts.load();
+        let service = parts.get(id)?;
+        service.part_opt().map(|p| Arc::clone(&p.acks))
+    }
+
+    /// The open partition `id`'s visible seqno here, if it's open.
+    fn visible_of(&self, id: &str) -> Option<u64> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        let cluster = shared.router.cluster.as_ref()?;
+        let parts = cluster.parts.load();
+        let service = parts.get(id)?;
+        service.part_opt().map(|p| p.db.visible_seqno())
+    }
+
+    /// D335 PR 2b: each of `parts` in its fallback carries its mark (its start, or its end);
+    /// the marks, for [`Node::count_marks`].
+    fn lease_marks(
+        &self,
+        parts: &mut [LeasePart],
+    ) -> Vec<(
+        String,
+        crate::serve::acks::Mark,
+        Arc<crate::serve::acks::ReplicaAcks>,
+    )> {
+        use crate::serve::acks::Mark;
+        let mut marks = Vec::new();
+        for p in parts.iter_mut() {
+            let Some(acks) = self.acks_of(&p.partition) else {
+                continue;
+            };
+            let Some(mark) = acks.lease_mark() else {
+                continue;
+            };
+            match mark {
+                Mark::From(from) => p.degraded_from = Some(from.into()),
+                Mark::Clear => p.degraded_clear = true,
+            }
+            marks.push((p.partition.clone(), mark, acks));
+        }
+        marks
+    }
+
+    /// D335 PR 2b: a mark a majority of `map`'s nodes echoed (each echo is of a synced
+    /// record) is recorded, counted over `map`'s node set; a grantor that echoed an earlier
+    /// start than the one asked (recorded before this owner lost its own) lowers it.
+    fn count_marks(
+        &self,
+        map: &ClusterMap,
+        marks: &[(
+            String,
+            crate::serve::acks::Mark,
+            Arc<crate::serve::acks::ReplicaAcks>,
+        )],
+        answers: &[(String, super::proto::LeaseResponse)],
+    ) {
+        use crate::serve::acks::{Mark, Pos};
+        // A grantor's FLAGGED record of a partition not in its fallback here: this owner
+        // lost it (a restart without its own record), or left on a majority's clear that
+        // grantor missed. It resumes, taking every write it has as possibly answered
+        // uncovered, and clears it the usual way.
+        let mut flagged: BTreeMap<&str, Pos> = BTreeMap::new();
+        for g in answers.iter().flat_map(|(_, r)| r.granted.iter()) {
+            if let Some(f) = g.degraded_from.as_ref().map(Pos::from)
+                && !marks.iter().any(|(id, _, _)| *id == g.partition)
+            {
+                let e = flagged.entry(g.partition.as_str()).or_insert(f);
+                *e = (*e).min(f);
+            }
+        }
+        for (id, from) in flagged {
+            if let (Some(acks), Some(visible)) = (self.acks_of(id), self.visible_of(id)) {
+                acks.resume(from, visible);
+            }
+        }
+        if marks.is_empty() {
+            return;
+        }
+        let nodes = crate::serve::acks::node_set(map);
+        for (id, mark, acks) in marks {
+            let mut echoed = 0usize;
+            let mut lower: Option<Pos> = None;
+            for g in answers
+                .iter()
+                .flat_map(|(_, r)| r.granted.iter())
+                .filter(|g| g.partition == *id)
+            {
+                match mark {
+                    Mark::From(from) => match g.degraded_from.as_ref().map(Pos::from) {
+                        Some(e) if e == *from => echoed += 1,
+                        Some(e) if e < *from => lower = Some(lower.map_or(e, |l| l.min(e))),
+                        _ => {}
+                    },
+                    Mark::Clear => echoed += usize::from(g.degraded_clear),
+                }
+            }
+            if let Some(l) = lower {
+                acks.lower_from(l);
+            } else if echoed * 2 > map.nodes.len() {
+                acks.marked(*mark, &nodes);
+            }
+        }
+    }
+
+    /// D335 PR 2b: grant `r`'s records ([`super::degraded::Records::record`]) on a blocking
+    /// thread (the fsync), and its echoes, when it grants a partition whose map sets
+    /// `replica_acks`. A failed write is logged, and `r` goes without echoes.
+    pub(crate) async fn record_degraded(
+        self: &Arc<Self>,
+        mine: &ClusterMap,
+        req: &super::proto::LeaseRequest,
+        r: super::proto::LeaseResponse,
+    ) -> super::proto::LeaseResponse {
+        let acked = |id: &str| {
+            mine.partitions
+                .iter()
+                .any(|p| p.id == id && p.replica_acks > 0)
+        };
+        if !r.granted.iter().any(|g| acked(&g.partition)) {
+            return r;
+        }
+        let (node, mine, asked) = (Arc::clone(self), mine.clone(), req.parts.clone());
+        let fallback = r.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let mut r = r;
+            let res = node.degraded.record(&mine, &asked, &mut r.granted);
+            (r, res)
+        })
+        .await;
+        match done {
+            Ok((r, Ok(()))) => r,
+            Ok((_, Err(e))) => {
+                eprintln!(
+                    "phdb serve: recording replica-ack fallbacks in {}: {e}; this grant \
+                     confirms none",
+                    super::degraded::DEGRADED_FILE
+                );
+                fallback
+            }
+            Err(e) => {
+                eprintln!("phdb serve: recording replica-ack fallbacks: {e}");
+                fallback
+            }
         }
     }
 
@@ -1309,7 +1474,16 @@ impl Node {
                     wait = RETRY_FIRST;
                     started + period
                 };
-                tokio::time::sleep_until(next).await;
+                // Or at once for a partition entering its fallback (D335 PR 2b). Its
+                // `notify_one` keeps a permit, so one that came during the round isn't lost.
+                let kick = match me.upgrade() {
+                    Some(node) => Arc::clone(&node.fences.kick),
+                    None => return,
+                };
+                tokio::select! {
+                    () = tokio::time::sleep_until(next) => {}
+                    () = kick.notified() => {}
+                }
             }
         });
     }

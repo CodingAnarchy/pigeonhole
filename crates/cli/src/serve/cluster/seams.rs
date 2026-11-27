@@ -165,3 +165,17 @@ pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
             .iter()
             .any(|(d, a)| d == dir && a == address)
 }
+
+/// A fault seam (tests, D335 PR 2b): the grantor in each directory fails its writes of
+/// `cluster-degraded.json`, so it echoes no record.
+#[cfg(test)]
+pub(crate) static FAIL_DEGRADED_WRITES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn fail_degraded_writes(dir: &Path) -> bool {
+    FAIL_DEGRADED_WRITES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}

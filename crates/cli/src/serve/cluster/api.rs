@@ -209,6 +209,8 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
         }
         let r = self.0.grants.grant(&mine, &req)?;
+        // D335 PR 2b: the grant's fallback records, synced before the answer echoes them.
+        let r = self.0.record_degraded(&mine, &req, r).await;
         // The writer notes an asker it answers with its newer map (#2073): one that stays
         // behind may be stranded by the term fence.
         if schema::writer(&mine) == self.0.id {

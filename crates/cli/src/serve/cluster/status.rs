@@ -273,6 +273,8 @@ impl Node {
                         let (acked, healthy) = part.acks.status(&p.replicas);
                         lp.acked_position = acked.map(Into::into);
                         lp.healthy_replicas = healthy;
+                        // PR 2b: its fallback, while in it.
+                        lp.degraded_from = part.acks.degraded_from().map(Into::into);
                     }
                     // D331 PR 6: an owner's partition the map places nothing on (a merge
                     // emptied it): what still keeps it listed.
@@ -367,6 +369,7 @@ impl Node {
             grace_remaining_ms: millis(self.grants.grace_remaining()),
             lease_ms: millis(self.grants.lease()),
             map_features: build_features(&self.dir),
+            degraded: self.degraded.list(),
         }
     }
 }

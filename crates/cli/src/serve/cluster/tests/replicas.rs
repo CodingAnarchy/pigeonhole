@@ -9,7 +9,7 @@ use crate::serve::proto::{
 };
 
 /// Node `port`'s status entry for its replica copy of `p`, if it reports one.
-async fn copy_of(port: u16, p: &str) -> Option<LocalPartition> {
+pub(super) async fn copy_of(port: u16, p: &str) -> Option<LocalPartition> {
     client(port)
         .await
         .status(StatusRequest::default())
@@ -57,7 +57,7 @@ pub(super) async fn set_replicas(a: u16, p: &str, replicas: &[&str]) {
 
 /// Table `r` on p3 alone, through the writer at `port`: retried while a node that just
 /// started is still taking its peers' maps (the restarted-node rig).
-async fn table_on_p3(port: u16) {
+pub(super) async fn table_on_p3(port: u16) {
     for _ in 0..100 {
         match try_table_on_p3(port).await {
             Ok(()) => return,
@@ -108,10 +108,10 @@ fn bootstraps_in(dir: &Path) -> usize {
 /// Windows CI: 5 s wasn't enough on a loaded runner). A dial to a port that isn't listening
 /// yet takes about 2 s on Windows' runners, and a follow that fails pauses before its next
 /// try, doubling up to the follower's MAX_BACKOFF (10 s).
-const FOLLOW: Duration = Duration::from_secs(30);
+pub(super) const FOLLOW: Duration = Duration::from_secs(30);
 
 /// A replica copy's row as a wait's reason: its state, owner, progress and last error.
-fn copy_why(lp: Option<&LocalPartition>) -> String {
+pub(super) fn copy_why(lp: Option<&LocalPartition>) -> String {
     lp.map_or_else(
         || "no copy row".to_owned(),
         |lp| {
@@ -130,7 +130,7 @@ fn copy_why(lp: Option<&LocalPartition>) -> String {
 
 /// Three nodes in fresh directories, with `r` on p3 (c's), a row in it, and a's replica
 /// copy of p3 following c past that row: the directories, ports and stop handles.
-fn following(
+pub(super) fn following(
     rt: &tokio::runtime::Runtime,
 ) -> (
     [PathBuf; 3],
@@ -200,7 +200,7 @@ async fn put_after_move(port: u16, table: &str, row: &str) -> u64 {
     }
 }
 
-async fn put_in(port: u16, table: &str, row: &str) -> u64 {
+pub(super) async fn put_in(port: u16, table: &str, row: &str) -> u64 {
     let mut w = put_row(row, "v");
     w.row.as_mut().unwrap().table = table.into();
     data(port)
@@ -355,7 +355,7 @@ fn a_stamp_onto_a_node_holding_the_partitions_replica_is_refused() {
 /// Three nodes as [`three_nodes_in`] makes them, each started as a restarted node (D326), so
 /// their partitions hold real leases of [`TEST_LEASE`], renewed by their rounds, rather than
 /// a standing one.
-fn three_leased(
+pub(super) fn three_leased(
     rt: &tokio::runtime::Runtime,
     dirs: &[PathBuf; 3],
 ) -> (Vec<tokio::sync::oneshot::Sender<()>>, Vec<u16>) {
@@ -1956,7 +1956,7 @@ fn a_targets_copy_reports_its_moves_progress_from_its_own_rows() {
 }
 
 /// Node `port`'s own row for `p` (not a replica copy's), if it reports one.
-async fn owned_row(port: u16, p: &str) -> Option<LocalPartition> {
+pub(super) async fn owned_row(port: u16, p: &str) -> Option<LocalPartition> {
     client(port)
         .await
         .status(StatusRequest::default())
@@ -1969,7 +1969,7 @@ async fn owned_row(port: u16, p: &str) -> Option<LocalPartition> {
 }
 
 /// Node `port`'s `/metrics` text, through `Admin.Metrics`.
-async fn metrics_at(port: u16) -> String {
+pub(super) async fn metrics_at(port: u16) -> String {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
         .connect()
@@ -2128,7 +2128,7 @@ pub(super) async fn set_acks(a: u16, p: &str, k: u32) -> Result<(), tonic::Statu
 
 /// A write of row `row` in table `r` through node `port`, with the request's `replication`
 /// and `durability`, and `x-pigeonhole-replication` set to `header` if any: its commit.
-async fn write_acked(
+pub(super) async fn write_acked(
     port: u16,
     row: &str,
     replication: crate::serve::proto::ReplicationMode,
@@ -2154,7 +2154,7 @@ async fn write_acked(
 }
 
 /// The API error code a status carries.
-fn code_of(s: &tonic::Status) -> String {
+pub(super) fn code_of(s: &tonic::Status) -> String {
     crate::serve::errors::ApiError::from_status(s).map_or_else(|| format!("{s:?}"), |e| e.code)
 }
 

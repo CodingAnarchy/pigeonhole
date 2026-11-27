@@ -125,6 +125,7 @@ pub(crate) fn run(
         voted,
     );
     node.load_fences().map_err(|e| Failure::usage(&e))?;
+    node.load_degraded().map_err(|e| Failure::usage(&e))?;
     // The partitions the map gives this node, in id order, with their epochs: none before
     // a first map, or when the map gives none (the node only routes).
     let mine: Vec<(String, u64)> = {
@@ -273,11 +274,7 @@ pub(crate) fn run(
             // D335: its replica acks from the map, before anything serves (an install
             // arrives only once the node serves, and then finds the partition).
             if let (Some(p), Ok(map)) = (part.part_opt(), node.get_map()) {
-                p.acks.configure(super::super::acks::AckConfig::of(
-                    &map,
-                    &o.id,
-                    node.peers.replica_ack_timeout,
-                ));
+                node.arm_acks(&p.acks, &map, &o.id, o.db.visible_seqno());
             }
             // A text index rebuild a fence or a shutdown stopped carries on once the
             // partition takes writes (#1756).

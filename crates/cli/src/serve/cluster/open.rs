@@ -768,11 +768,7 @@ impl Node {
                     .and_then(|s| s.part_opt().map(|p| Arc::clone(&p.acks)));
                 node.arm_ranges(&gate, &id, epoch, &db, || {
                     if let (Some(acks), Ok(map)) = (acks, node.get_map()) {
-                        acks.configure(crate::serve::acks::AckConfig::of(
-                            &map,
-                            &id,
-                            node.peers.replica_ack_timeout,
-                        ));
+                        node.arm_acks(&acks, &map, &id, db.visible_seqno());
                     }
                     slot.store(parts)
                 })
