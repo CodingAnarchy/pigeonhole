@@ -1,0 +1,2 @@
+### Fixed
+- **Change feed: a decided cross-shard commit with a share the reader doesn't hold is passed over only when recovery dropped it** (#2191). A feed read a round whose share was missing, decided in an earlier session, as one recovery dropped and passed over it silently, whatever the reason the share was missing. It now does so only for a round prepared in its decision's own session (where a missing share means recovery dropped the round); any other missing share expires the feed (`FeedExpired`) rather than skipping a commit.
