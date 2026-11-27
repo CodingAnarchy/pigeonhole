@@ -2261,11 +2261,15 @@ impl FeedReader {
     ///
     /// Dropped only for a round prepared in its Decision's own session (#2191, option B:
     /// [`prepared_in`](Self::prepared_in)). Every share of such a round was logged in that
-    /// session, which this reader reads from its first segments, so a share it doesn't hold
-    /// is really gone: recovery dropped the round. A round prepared earlier (an external one
-    /// decided after a reopen, D329) may have shares before this reader's start, so one
-    /// missing is a gap: the feed expires rather than passing the commit over (audit120 on
-    /// #2193).
+    /// session, after its id was allocated. A reader that started in an earlier session read
+    /// all of it; one that started in that session (a token, `Now`, `After`) started at or
+    /// before each share in doubt there, so it read the shares too (feed1248 on #2250). That
+    /// start is trusted here, as `feed_model` checks it: a start between a share and its
+    /// Decision would still pass the round over (audit120). Either way a share the reader
+    /// doesn't hold is really gone: recovery dropped the round. A round prepared earlier (an
+    /// external one decided after a reopen, D329) may have shares before this reader's
+    /// start, so one missing is a gap: the feed expires rather than passing the commit over
+    /// (audit120 on #2193), with [`round_gap`]'s reason.
     fn take_round(&mut self, id: Seqno, participants: &[StreamId], session: u64) -> Round {
         let shares = self.remove_held(id);
         // A round rule C dropped a share of: never passed over silently.
@@ -2411,7 +2415,7 @@ impl FeedReader {
                             // `take_round`), and its stream's end delivered goes back.
                             self.streams[stream].delivered_end = was;
                             self.ahead.skip(stream, start);
-                            self.expired = Some(gap(key));
+                            self.expired = Some(round_gap(key));
                             return Ok(Emitted::Nothing);
                         }
                     }
@@ -2572,6 +2576,16 @@ impl FeedReader {
     }
 }
 
+/// A cross-shard commit with a share the feed doesn't hold ([`FeedReader::take_round`]'s
+/// gap; audit120 on #2250: not [`gap`]'s reason, which names one cause it may not be).
+fn round_gap(key: Seqno) -> Expiry {
+    expiry(format!(
+        "history has a gap before seqno {key}: a share of the cross-shard commit there isn't \
+         in the feed's history (a power loss took part of it, or it was logged before the \
+         feed's start or by a session that did not feed these tables)"
+    ))
+}
+
 fn gap(key: Seqno) -> Expiry {
     expiry(format!(
         "history has a gap before seqno {key}: a session that did not feed these tables wrote the database"
@@ -2675,7 +2689,8 @@ impl FeedReader {
     fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>, u64)> {
         let open = |s: usize, at: Lsn| self.cursor_at(db_id, s, at);
         // Each stream's first retained segment of every earlier session in the history.
-        let firsts = self.session_firsts(db_id, |s| s != self.current && self.history.holds(s))?;
+        let firsts =
+            self.session_firsts(db_id, true, |s| s != self.current && self.history.holds(s))?;
         let mut sessions: Vec<(u32, u64)> = firsts
             .first()?
             .iter()
@@ -2709,7 +2724,8 @@ impl FeedReader {
         for (_, session) in sessions {
             // A session that logged nothing, or whose first records can't be read: a later
             // one decides.
-            let Some(SessionHead { first, alloc }) = self.session_head(db_id, &firsts, session)
+            let Some(SessionHead { first, alloc }) =
+                self.session_head(db_id, &firsts, session, true)
             else {
                 continue;
             };
@@ -2759,12 +2775,14 @@ impl FeedReader {
     }
 
     /// Each stream's first retained segment (at or past its floor) of every session `keep`
-    /// takes, by session id. A session's first segment is the one an open started
-    /// (`prev_epoch` 0, or an epoch more than one above it: FORMAT §10.1 rule 2), so one partly
-    /// recycled at a floor has none. `None` when a stream's segments can't be listed.
+    /// takes, by session id. With `opened`, only a session's first segment counts, the one
+    /// an open started (`prev_epoch` 0, or an epoch more than one above it: FORMAT §10.1
+    /// rule 2), so one partly recycled at a floor has none; without, the first of it still
+    /// retained. `None` when a stream's segments can't be listed.
     fn session_firsts(
         &self,
         db_id: [u8; 16],
+        opened: bool,
         keep: impl Fn(u64) -> bool,
     ) -> Option<Vec<HashMap<u64, u32>>> {
         let mut firsts = Vec::with_capacity(self.shared.shards);
@@ -2772,8 +2790,8 @@ impl FeedReader {
             let floor = self.floor(s);
             let mut f = HashMap::new();
             for (epoch, prev, session) in self.cursor_at(db_id, s, Lsn::default())?.segments() {
-                let opened = prev == 0 || epoch != prev.wrapping_add(1);
-                if opened && epoch >= floor && keep(session) {
+                let first = prev == 0 || epoch != prev.wrapping_add(1);
+                if (first || !opened) && epoch >= floor && keep(session) {
                     f.entry(session).or_insert(epoch);
                 }
             }
@@ -2782,24 +2800,40 @@ impl FeedReader {
         Some(firsts)
     }
 
-    /// `session`'s first records, one per stream at its first segment in `firsts`: the
-    /// smallest key among them (a single's seqno, a round's id, a decision's id or apply
-    /// seqno, the lower) and the smallest seqno one of them was allocated in the session at
-    /// (`alloc`; a round's id may be older). `None` when the session logged nothing, a stream
-    /// has no first segment of it, or a record can't be read or keyed: the segment gone
-    /// (recycled since the headers were read) or cut, another session's record there, a read
-    /// that failed, or a kind this build doesn't know (simp724's B1 on #1316). Either caller
-    /// then fails safe: `earlier_start` takes a later session, `prepared_in` answers no.
+    /// `session`'s records at the start of each stream's segment of it in `firsts` (its
+    /// first, or its first retained: [`session_firsts`](Self::session_firsts)): the smallest
+    /// key among them (a single's seqno, a round's id, a decision's id or apply seqno, the
+    /// lower) and the smallest seqno one of them was allocated in the session at (`alloc`; a
+    /// round's id may be older). With `every`, each stream must have a segment of the
+    /// session; without, a stream with none is passed over. `None` when the session logged
+    /// nothing there, or a record can't be read or keyed: the segment gone (recycled since
+    /// the headers were read) or cut, another session's record there, a read that failed,
+    /// or a kind this build doesn't know (simp724's B1 on #1316). Either caller then fails
+    /// safe: `earlier_start` takes a later session, `prepared_in` answers no.
     fn session_head(
         &self,
         db_id: [u8; 16],
         firsts: &[HashMap<u64, u32>],
         session: u64,
+        every: bool,
     ) -> Option<SessionHead> {
         let mut first = None::<Seqno>;
         let mut alloc = Seqno::MAX;
         for (s, f) in firsts.iter().enumerate() {
-            let mut c = self.cursor_at(db_id, s, Lsn::new(*f.get(&session)?, 0))?;
+            let epoch = match f.get(&session) {
+                Some(&e) => e,
+                None if every => return None,
+                None => continue,
+            };
+            // A stream that can't be read here: `earlier_start` can't start in the session
+            // (`every`); `prepared_in` passes it over, which only raises `alloc` (a torn
+            // share is often its stream's first record in the session, #2250's sweeps).
+            let Some(mut c) = self.cursor_at(db_id, s, Lsn::new(epoch, 0)) else {
+                if every {
+                    return None;
+                }
+                continue;
+            };
             let (id, own) = match c.step() {
                 // The stream logged nothing in the session: no key from it.
                 Ok(Step::End) => continue,
@@ -2819,9 +2853,11 @@ impl FeedReader {
                         seqno, abort_seqno, ..
                     } => (seqno.min(abort_seqno), abort_seqno),
                     WalRecord::RangeDrop { seqno, .. } => (seqno, seqno),
-                    _ => return None,
+                    _ if every => return None,
+                    _ => continue,
                 },
-                _ => return None,
+                _ if every => return None,
+                _ => continue,
             };
             first = Some(first.map_or(id, |f| f.min(id)));
             alloc = alloc.min(own);
@@ -2835,21 +2871,29 @@ impl FeedReader {
     /// Whether round `id`, whose Decision earlier session `session` wrote, was prepared in
     /// that session (#2191, option B): its id at or above `session_head`'s `alloc` there.
     ///
-    /// `alloc` is the smallest seqno the session's first records were allocated at, each
-    /// allocated in the session, so it is at or above the allocator's start at the session's
-    /// open: an id below the start is below `alloc` too, and is never taken for one prepared
-    /// in the session. The other way is possible: a round prepared in the session whose id is
-    /// below every stream's first record (each stream logged a later-allocated record first)
-    /// reads as prepared earlier. That costs an expiry where recovery dropped such a round,
-    /// never a skip. `false` when the head can't be read. Cached per session, bounded.
+    /// `alloc` is the smallest seqno allocated by the session's records at the start of each
+    /// stream's first **retained** segment of it (audit120 on #2250: a session that outlives
+    /// the feed's retention has lost its first segments, for most of its life). Every record
+    /// a session logs was allocated in it, so `alloc` is at or above the allocator's start at
+    /// its open: an id below the start is below `alloc` too, and is never taken for one
+    /// prepared in the session. The other way is possible: a round prepared in the session
+    /// whose id is below every stream's first retained record (each logged a later-allocated
+    /// record first, or retention has passed the round's own records) reads as prepared
+    /// earlier. That costs an expiry where recovery dropped such a round, never a skip.
+    /// `false` when no stream retains a segment of the session, or a record can't be read.
+    /// Cached per session, bounded: a session the reader meets is sealed, its records fixed.
+    /// Out of line and cold: only a decided round with a share missing reaches it, so the
+    /// delivery path keeps its codegen (the `feed-drain-all` callgrind shape, D193).
+    #[cold]
+    #[inline(never)]
     fn prepared_in(&mut self, id: Seqno, session: u64) -> bool {
         let alloc = if let Some(&(_, a)) = self.session_allocs.iter().find(|(s, _)| *s == session) {
             a
         } else {
             let db_id = self.shared.pager.db_id();
             let a = self
-                .session_firsts(db_id, |s| s == session)
-                .and_then(|firsts| self.session_head(db_id, &firsts, session))
+                .session_firsts(db_id, false, |s| s == session)
+                .and_then(|firsts| self.session_head(db_id, &firsts, session, false))
                 .map(|h| h.alloc);
             if self.session_allocs.len() >= SESSION_ALLOCS {
                 self.session_allocs.remove(0);
