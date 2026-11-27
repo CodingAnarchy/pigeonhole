@@ -317,6 +317,29 @@ impl Node {
                  drop-partition {p} here), then run the move, relocate or restore again"
             )));
         }
+        // D336 (cli692's M1, the node's safety net): this node's file of P is an old owner's
+        // tail while a PENDING event names it, which a stamp would take over or move aside
+        // as `.replaced`, out of the replay's reach. The writer refuses such a map already.
+        if self.tail_sources.holds(&p) {
+            return Err(ApiError::failed_precondition(format!(
+                "this node's file of partition {p:?} is open as the source of a tail replay"
+            )));
+        }
+        if let Ok(map) = self.get_map()
+            && let Some(e) = map.failovers.iter().find(|e| {
+                e.partition == p
+                    && e.from == self.id
+                    && e.tail_state() == crate::serve::proto::TailState::Pending
+            })
+            && main_file(&self.dir, &p).exists()
+        {
+            return Err(ApiError::failed_precondition(format!(
+                "this node's file of partition {p:?} holds its old owner's tail, PENDING since \
+                 the failover to node {:?} at epoch {}: replay it or discard it (phdb cluster \
+                 replay-tail {p} [--discard]) before installing over it",
+                e.to, e.to_epoch
+            )));
+        }
         let dir = self.dir.clone();
         let restore = req.restore;
         let (installed, fork) =

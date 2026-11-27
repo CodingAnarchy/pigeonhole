@@ -1053,7 +1053,7 @@ A node writes a partition only while its newest map names it for the partition a
     - **With `--old-unreachable`,** it can't ask the old owner, so `lost_commits` says the loss is unknown.
   - **Refused:** a copy from before P's current history (it copies P again first; promote it once it follows), and an owner that still serves P.
   - **Run it again** to finish one that stopped: it carries on from the closed or stamped copy. That includes a stop between making the copy a primary and stamping it: ID's node keeps the promote's intent beside the file (`P.phdb.promoting`) until the stamp is done, and the rerun only stamps it. With failover on, the map's writer finishes such a promote itself. If the map changed in between (a `set-map`, relocate or another promote), the rerun is refused, so it can't replace what the partition took since. Check the map, then move ID's file aside (`phdb cluster drop-partition P --node <ID>`).
-  - **The old owner afterwards** keeps its files, and serves nothing for P once it holds the new map. Leases (D326) keep it from serving P once ID does. To have it follow ID as a replica: `phdb cluster drop-partition P --node <old owner>` (its files go aside, so copy off anything you want from its tail first), then add it to P's `replicas` with `set-map`. Its unreplicated commits are gone either way.
+  - **The old owner afterwards** keeps its files, and serves nothing for P once it holds the new map. Leases (D326) keep it from serving P once ID does. To have it follow ID as a replica: `phdb cluster drop-partition P --node <old owner>` (its files go aside), then add it to P's `replicas` with `set-map`. From 1.4.0, when the promote recorded its tail PENDING, replay or discard the tail first ([Replaying an old owner's tail](#replaying-an-old-owners-tail)): until then the old node can't be placed back. Before 1.4.0 its unreplicated commits are gone.
 - **Moving P onto a node that holds its replica** (`move`, `relocate`, `restore --partition`): the command first sets a map without that node in P's replicas and waits for it to close its copy. The copy's file goes aside when P's files are installed there.
 
 ### Automatic failover
@@ -1157,7 +1157,7 @@ Any node still takes any call, before, during and after.
   - Either way, no write the owner acknowledges is lost to the promote.
 - **During a rolling upgrade to 1.3.1,** a 1.3.0 node grants the lease whatever the map's pending promotes. Until every node runs 1.3.1, an owner that comes back after the promote's checks and before its last map can still take writes the promote then loses.
 - **If it comes back after,** it takes the newer map, finds P on another node and serves nothing for it. Its file stays at the old epoch.
-  - It doesn't rejoin on its own. Copy off anything you need from its unreplicated tail, drop the file (`phdb cluster drop-partition P --node <old owner>`), then add the node to P's `replicas` with `set-map`. It copies P again from the new owner.
+  - It doesn't rejoin on its own. From 1.4.0, if its tail is PENDING, replay it or discard it first ([Replaying an old owner's tail](#replaying-an-old-owners-tail)): until then no map can place P on it. Then drop the file (`phdb cluster drop-partition P --node <old owner>`), and add the node to P's `replicas` with `set-map`. It copies P again from the new owner.
 - **An old writer that comes back** takes the elected map, which has a higher term, and follows it. The nodes that voted refuse every map and writer lease below the new term, so the old writer can't change the map at its old one.
 
 #### Seeing it
@@ -1168,6 +1168,31 @@ Any node still takes any call, before, during and after.
 - **The old owner's tail (from 1.4.0, D336):** a partition's event also records whether its old owner may hold commits the new owner lacks: its `tail_state`, PENDING after a failover, after a promote with `--old-unreachable`, or after one whose owner had made durable more than the copy applied. With it, the event keeps the fork point (`fork_token`) and the old file's epochs, so a replay can bring those commits in later. While a partition's tail is PENDING, it keeps its node, history and ranges: a relocate, a restore and every range move into or out of it are refused, and the balancer leaves it alone.
   - **At most 4 tails stay PENDING per partition** (the owner's ruling): a fifth failover marks the oldest DISCARDED, and the failover is never refused for it. **A discarded tail's commits are given up for good:** writes its old owner acknowledged and no replica had, which no later replay brings back. The event shows `tail_state` DISCARDED, and `/metrics` counts it (below). A partition that fails over that often without a replay has a bigger problem than its tails.
   - The tail is recorded only once the cluster adopted `tail_replay` (see the adopted features above); before that, a promote warns and records none.
+  - While it's PENDING, no map places P on the old node, as owner or replica, and a map that drops the node from the cluster is refused unless it's forced. A forced map that drops it records the tail DISCARDED. The old node also refuses to install anything over its file (a move's or restore's stamp).
+
+#### Replaying an old owner's tail
+**New in 1.4.0 (D336, PR 3a).** `phdb cluster replay-tail P --node <URL>` replays P's PENDING tail into its current owner: each commit the old owner made after the fork point becomes one new commit there, with its cells' timestamps kept, so a newer write to the same cell still wins.
+1. **Close P on the old node.** Once the old owner holds the newer map it serves nothing for P, but its file stays open, fenced, until closed: `phdb cluster close P --node <old owner>`. A replay before that stops and says so. Don't drop the file: it's the tail.
+2. **Look first:** `phdb cluster replay-tail P --dry-run` judges every commit and reports what it would apply, skip and refuse, and changes nothing.
+3. **Replay:** `phdb cluster replay-tail P`. It waits up to `--timeout` (60 s by default) and reports the owner's progress. The replay goes on past the timeout; run the command again to wait for it. Once the owner reports the whole tail replayed, the command sets the tail DONE through the map's writer, which asks the owner again first. A tail is set DONE only this way: a hand-made map that sets it is refused.
+   - `--event EPOCH` picks a tail by the epoch its failover gave P, when P has more than one PENDING (oldest first otherwise).
+   - Each replayed commit carries its mark (`replay/<history epoch>` in `__phdb_cluster`) in the same commit, so a stop at any point (a crash, a lost lease, a move of P) resumes from the mark with nothing applied twice.
+4. **Or give it up:** `phdb cluster replay-tail P --discard` sets DISCARDED with no replay. Its commits are lost for good.
+
+**What's replayed and what isn't:**
+- **Skipped,** each named in the report: a commit to a table dropped since (in the tail or after the failover: a table dropped and made again is another table), rows P no longer holds after a range move, the old owner's own internal rows, catalog changes (the map's schema already reached the new owner), and a range move's copy and cleanup.
+- **Refused whole** (named, the mark moves past it): a commit that writes a text or vector index's or a memory store's tables. Put those rows again through the index's or the store's API.
+- **Transactions across partitions** (D329):
+  - A partition's share of a transaction is replayed once its home's decision row says COMMITTED (asked read-only: nothing is recorded there). A share the home records aborted is refused as `conflict`.
+  - If the home has no decision for it, or doesn't answer, the replay stops with `in_doubt` and the tail stays PENDING. Decide the transaction (`phdb cluster txn decide`), then run `replay-tail` again; or discard the tail.
+  - A home's commit point is replayed only if the new owner has no decision for it yet and each branch that hadn't acked it still holds its share in doubt; otherwise it's refused.
+  - An abort marker is replayed only over no decision.
+- **The feed:** a replayed commit is a new commit on the new owner, at a new seqno, and carries `replayed` (its origin: the old history's epoch and its seqno there). A subscriber grouping a transaction's shares by `xid` gets a replayed share alone.
+- **Clock skew:** cells keep the old owner's timestamps. A cell written on the new owner after the failover with an earlier timestamp (its clock behind the old owner's) is overwritten by the replayed one.
+
+**The old node's file:** the replay reads it through `Cluster.ReadTail`, opened as a tail source (`phdb cluster status` shows the role and `tail_kept`). It closes 60 s after the last read. While it's open, `drop-partition` refuses it.
+
+**Seeing it:** `phdb cluster status` shows each owner's `replay`: its mark, the source's end, applied, skipped and refused counts, the last 32 commits named with their reasons, and `last_error`. `/metrics` has `pigeonhole_cluster_tail_replay_commits_total{partition,outcome}` (`applied`, `skipped`, `refused`), counted on the owner since its start.
 - **`/metrics`:** `pigeonhole_cluster_failovers_total{partition}`, `pigeonhole_cluster_writer_term`, and `pigeonhole_cluster_old_owner_tails{partition,state}` (each partition's tails by state, `pending` or `discarded`). Every node shows the same values, since they come from the map.
 - **The writer's log** has a line for each failover and election.
 

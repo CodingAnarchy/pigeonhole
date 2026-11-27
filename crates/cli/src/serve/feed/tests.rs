@@ -1920,3 +1920,30 @@ fn a_client_rejoins_only_where_the_ring_covers_it_and_has_passed_it() {
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_replayed_commits_tag_gives_its_origin_and_xid_and_a_corrupt_one_is_corruption() {
+    // D336 PR 3a: a commit the new owner replayed carries its origin in its tag, before any
+    // D329 xid; the feed hands both out. A tag that starts as a replay's and doesn't parse
+    // is the file's corruption, not a plain xid.
+    use crate::serve::cluster::replay_tag::{Origin, encode};
+    let commit = || crate::serve::proto::FeedCommit {
+        seqno: 7,
+        ..Default::default()
+    };
+    let origin = Origin {
+        history_epoch: 3,
+        seqno: 41,
+    };
+    let tag = encode(origin, b"p1:h0-x").unwrap();
+    let e = commit_event(Bytes::new(), commit(), &tag).unwrap();
+    assert_eq!(&e.xid[..], b"p1:h0-x");
+    let r = e.replayed.expect("the origin");
+    assert_eq!((r.history_epoch, r.seqno), (3, 41));
+    // A plain spanning commit's tag is its xid alone.
+    let e = commit_event(Bytes::new(), commit(), b"p1:h0-y").unwrap();
+    assert_eq!((&e.xid[..], e.replayed), (&b"p1:h0-y"[..], None));
+    // Cut short after the version byte: corrupt.
+    let err = commit_event(Bytes::new(), commit(), &tag[..4]).unwrap_err();
+    assert_eq!(err.code, "Corruption", "{err:?}");
+}

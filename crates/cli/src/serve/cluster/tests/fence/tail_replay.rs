@@ -158,8 +158,20 @@ fn fail_over_to_b(t: &Rig) -> crate::serve::proto::FailoverEvent {
         .retain(|d| *d != t.dirs[1]);
     cut(t, 2, false);
     // c, back, keeps p3 open as a fenced owner until it's closed: its file is the tail's
-    // source only once closed.
+    // source only once closed (M2), and a replay until then stops on that, naming the close.
     let c = t.ports[2];
+    t.rt.block_on(eventually_within(
+        Duration::from_secs(20),
+        "a replay to stop on c's open p3",
+        async || {
+            replay_tail(a, false).await.is_ok_and(|r| {
+                r["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("phdb cluster close p3")
+            })
+        },
+    ));
     t.rt.block_on(eventually_within(
         Duration::from_secs(20),
         "c to close its p3",
@@ -287,6 +299,16 @@ fn a_tail_replays_into_the_new_owner_and_skips_tables_dropped_inside_or_after_it
         );
         assert!(done.replayed_through > 0, "{done:?}");
         assert!(done.fork_token.is_empty(), "{done:?}");
+        // The owner's fork row for the event goes once no PENDING tail names it.
+        let b_dir = t.dirs[1].clone();
+        eventually("b to prune p3's fork row", async || {
+            crate::serve::cluster::tail_replay::seams::PRUNED
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(d, p, gone)| *d == b_dir && p == "p3" && gone.contains(&e.to_epoch))
+        })
+        .await;
         // Nothing PENDING is left to replay.
         let again = replay_tail(a, false).await.unwrap_err();
         assert!(again.contains("no PENDING"), "{again}");
@@ -516,4 +538,107 @@ fn a_crash_after_a_dropped_prepares_apply_reruns_without_asking_the_home() {
 #[test]
 fn a_crash_after_a_homes_share_applies_reruns_without_asking_the_home_again() {
     share_tail(false, StopAt::AfterApply);
+}
+
+/// The map at the writer (`a`), a version on and changed by `f`, set there.
+async fn edited(
+    a: u16,
+    f: &dyn Fn(&mut crate::serve::proto::ClusterMap),
+) -> Result<u64, tonic::Status> {
+    let mut m = map_of(a).await;
+    m.map_version += 1;
+    f(&mut m);
+    set_at(a, m).await
+}
+
+/// The writer's checks while c's tail is PENDING: a hand-made DONE is refused, with no mark
+/// (map validation) or with one the owner never reported (C4); a map placing p3 on c, as
+/// replica or owner, is refused (M1); a map dropping c is refused (C3). Once the replay sets
+/// it DONE, c may hold a copy of p3 again.
+#[test]
+fn a_pending_tail_refuses_a_hand_made_done_and_maps_that_place_its_partition_on_the_old_node() {
+    use crate::serve::proto::ClusterMap;
+    let t = tail_rig(&["t0"]);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        put_in(a, "t0", "k1", "v1").await;
+    });
+    let e = fail_over_to_b(&t);
+    t.rt.block_on(async {
+        let done = |through: u64| {
+            move |m: &mut ClusterMap| {
+                for f in m
+                    .failovers
+                    .iter_mut()
+                    .filter(|f| f.partition == "p3" && f.to_epoch == e.to_epoch)
+                {
+                    f.set_tail_state(TailState::Done);
+                    f.fork_token = Default::default();
+                    f.replayed_through = through;
+                }
+            }
+        };
+        let err = edited(a, &done(0)).await.unwrap_err();
+        assert!(err.message().contains("without a replay's mark"), "{err:?}");
+        let err = edited(a, &done(1_000)).await.unwrap_err();
+        assert!(
+            err.message().contains("reports no finished replay"),
+            "{err:?}"
+        );
+        let on_c = |replica: bool| {
+            move |m: &mut ClusterMap| {
+                for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+                    if replica {
+                        p.replicas.push("c".into());
+                    } else {
+                        p.node = "c".into();
+                        p.epoch += 1;
+                    }
+                }
+            }
+        };
+        for replica in [true, false] {
+            let err = edited(a, &on_c(replica)).await.unwrap_err();
+            assert!(
+                err.message().contains("old owner's tail pending"),
+                "replica {replica}: {err:?}"
+            );
+        }
+        let err = edited(a, &|m: &mut ClusterMap| {
+            m.nodes.retain(|n| n.id != "c");
+            for p in &mut m.partitions {
+                p.replicas.retain(|r| r != "c");
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.message()
+                .contains("holds partition \"p3\"'s old owner's tail"),
+            "{err:?}"
+        );
+        // The node's own net (M1): a stamp sent to c over its kept file, as a move's or a
+        // restore's would be, is refused there whatever map its sender read.
+        let err = client(t.ports[2])
+            .await
+            .stamp(crate::serve::proto::StampRequest {
+                cluster_id: map_of(a).await.cluster_id,
+                partition: "p3".into(),
+                from_epoch: e.from_epoch,
+                to_epoch: e.to_epoch + 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains("holds its old owner's tail"),
+            "{err:?}"
+        );
+        let still = p3_event(&map_of(a).await).unwrap();
+        assert_eq!(still.tail_state(), TailState::Pending, "{still:?}");
+        // The replay's DONE lifts M1.
+        replay_until_done(a).await;
+        assert_eq!(get_in(a, "t0", "k1").await.unwrap(), Some(b"v1".to_vec()));
+        edited(a, &on_c(true)).await.unwrap();
+    });
 }

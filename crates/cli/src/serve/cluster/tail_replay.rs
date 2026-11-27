@@ -660,6 +660,15 @@ impl Node {
         // dropped first, writing no data, no decision and no feed event; the share then
         // lands below with the mark, in one commit. A crash between the two finds the share
         // no longer in doubt and the mark unmoved, and the rerun asks the home (path (a)).
+        // D331's range gate (ICR 0147): a row a move fences, moved away or doesn't serve here
+        // yet stops the run before anything is dropped or written; a rerun resumes from the
+        // mark.
+        if let Some(ranges) = &*cx.gate.ranges().load() {
+            ranges.check_rows(
+                kept.iter()
+                    .map(|&i| (c.changes[i].table.as_str(), &c.changes[i].row[..])),
+            )?;
+        }
         if drop_first {
             let (db, x) = (cx.db.clone(), xid.clone());
             let held = cx.gate.enter()?;
@@ -1186,7 +1195,8 @@ impl Node {
             }) else {
                 continue;
             };
-            if n.tail_state() != T::Done {
+            // A DONE with no mark: the map's validation refuses it, naming what's missing.
+            if n.tail_state() != T::Done || n.replayed_through == 0 {
                 continue;
             }
             let Some(p) = current.partitions.iter().find(|p| p.id == e.partition) else {
@@ -1269,6 +1279,8 @@ impl Node {
                 continue;
             }
             let (db, id) = (part.db.clone(), id.clone());
+            #[cfg(test)]
+            let dir = self.dir.clone();
             handle.spawn(async move {
                 let Ok(held) = gate.enter() else { return };
                 let pruned = tokio::task::spawn_blocking(move || {
@@ -1276,12 +1288,21 @@ impl Node {
                         .into_iter()
                         .filter(|e| !keep.contains(e))
                         .collect();
-                    identity::drop_forks(&db, &gone)
+                    identity::drop_forks(&db, &gone).map(|()| gone)
                 })
                 .await;
                 match pruned {
-                    Ok(Ok(())) => {
+                    Ok(Ok(gone)) => {
                         let _ = held.committed();
+                        #[cfg(test)]
+                        if !gone.is_empty() {
+                            seams::PRUNED
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((dir, id, gone));
+                        }
+                        #[cfg(not(test))]
+                        let _ = gone;
                     }
                     Ok(Err(e)) => {
                         eprintln!("phdb serve: partition {id}'s fork rows weren't pruned: {e}")
@@ -1308,6 +1329,10 @@ pub(crate) mod seams {
     /// Cluster directories whose next applied tail commit stops the run right after its
     /// commit, as a crash after the apply would.
     pub(crate) static STOP_AFTER_APPLY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// The inspection seam: each fork row prune that removed any, by cluster directory,
+    /// partition and the epochs it removed.
+    pub(crate) static PRUNED: Mutex<Vec<(PathBuf, String, Vec<u64>)>> = Mutex::new(Vec::new());
 
     /// The inspection seam: each read-only ask of a home (Amendment 5's (a)), by cluster
     /// directory and xid.
