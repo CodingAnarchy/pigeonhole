@@ -16,11 +16,13 @@
 # Shapes (serve_span_load's presets, crates/cli/examples/serve_span_load.rs):
 #   t256  256 callers, closed loop, single-partition Mutates (throughput; D335's base)
 #   l     64 callers paced at RATE_L, single-partition Mutates (latency; D335's p99 base)
-#   m     64 callers paced at RATE_L, 10% spanning x2, 1% conflicts, 16 subscribers
+#   m     64 callers paced at RATE_M, 10% spanning x2, 1% conflicts, 16 subscribers
 #   s     64 callers paced at RATE_L/3, every op spanning x3, 1% conflicts, 16 subscribers
 #   h     m, with n2 stopped (SIGSTOP) 30 s into the measured phase for 5 s (reported only)
 # RATE_L, unless set: half the first t256 (k=0) run's ops/s, then fixed for every later run.
 # RATE_S, unless set: RATE_L / 6 (each s operation is three partitions' writes and a 2PC).
+# RATE_M (m and h), unless set: RATE_L. 2026-11-27's box run delivered 43.6k ops/s for m at
+# RATE_L 72,816, so set it under m's capacity for m's latency row.
 # D335=1 (one SHA only): t256 and l run k0 k1 k1 k0 per repeat, k being every partition's
 # replica_acks in the map (D335, #2238): its bar is k=1 p99 <= k=0 p99 + 1 ms (l) and k=1
 # ops/s >= 0.9 x k=0 (t256). The other shapes run at k=0 (spanning transactions on a k >= 1
@@ -32,8 +34,10 @@
 # SCALE=small: no pinning, --shards 2, --change-feed 64 MiB, 20 s measured, 5 s warm-up.
 # FUNCTIONAL per run: each node's cmdline names the arm's phdb; every node up until the client
 # ends (h: n2 resumes); 3 partitions serving and 3 replicas following before the load; the
-# client's RESULT line, and no FUNCTIONAL FAILED from it; m, s, h: ext_prepares > 0; l: ops/s
-# at least 90% of RATE_L. Diagnostics per run: each node's stderr, and each node's /metrics
+# client's RESULT line, and no FUNCTIONAL FAILED from it; l, m, s: ops/s at least 90% of the
+# shape's rate (h: 85%, n2 is stopped 5 of the 90 s); m, s, h: ext_prepares > 0, no share in
+# doubt at the end, no subscriber stream dropped; every replica following in the last metrics
+# sample. Diagnostics per run: each node's stderr, and each node's /metrics
 # lines naming flush, compaction, stall, commit, external, in_doubt, feed or replica, every
 # 1 s, timestamped (<run>.mx).
 # Output: OUT (default $S/out-2221-span): <rep>-<arm>-<shape>-k<k>.*, summary.txt (RESULT
@@ -170,9 +174,9 @@ run() { local rep=$1 arm=$2 shape=$3 k=$4 o=$1-$2-$3-k$4 sha=$A
     case $shape in
       t256) cargs+=(--shape t256) ;;
       l) cargs+=(--shape l --rate $RATE_L) ;;
-      m) cargs+=(--shape m --rate $RATE_L) ;;
+      m) cargs+=(--shape m --rate ${RATE_M:-$RATE_L}) ;;
       s) cargs+=(--shape s --rate ${RATE_S:-$((RATE_L / 6))}) ;;
-      h) cargs+=(--shape m --rate $RATE_L --stall-pid ${pids[1]} --stall-at $((SECS / 3)) --stall-for 5) ;;
+      h) cargs+=(--shape m --rate ${RATE_M:-$RATE_L} --stall-pid ${pids[1]} --stall-at $((SECS / 3)) --stall-for 5) ;;
     esac
     $LOAD "${cargs[@]}" > $OUT/$o.txt 2> $OUT/$o.client.err || echo "  RUN ERROR $o: the client exited non-zero (see $o.client.err)"
     kill $sampler 2>/dev/null; wait $sampler 2>/dev/null
@@ -183,14 +187,34 @@ run() { local rep=$1 arm=$2 shape=$3 k=$4 o=$1-$2-$3-k$4 sha=$A
     if [ -z "$res" ]; then echo "  FUNCTIONAL FAILED $o: no RESULT line"; else
       echo "$res" | tee -a $OUT/summary.txt
       grep -q "FUNCTIONAL FAILED" $OUT/$o.txt && echo "  FUNCTIONAL FAILED $o: $(grep 'FUNCTIONAL FAILED' $OUT/$o.txt)"
-      local prep ops; prep=$(sed -n 's/.* ext_prepares=\([0-9]*\).*/\1/p' <<< "$res"); ops=$(sed -n 's/.* ops_per_s=\([0-9]*\).*/\1/p' <<< "$res"); prep=${prep:-0}; ops=${ops:-0}
+      field() { local v; v=$(sed -n "s/.* $1=\([0-9]*\).*/\1/p" <<< "$res"); echo "${v:-0}"; }
+      local prep ops doubt drops rate pct
+      prep=$(field ext_prepares); ops=$(field ops_per_s); doubt=$(field in_doubt_end); drops=$(field dropped)
       case $shape in
-        m|s|h) [ "${prep:-0}" -gt 0 ] && echo "    functional $o: $prep external prepares" ||
-                 echo "  FUNCTIONAL FAILED $o: no external prepare counted" ;;
-        l) [ $((ops * 10)) -ge $((RATE_L * 9)) ] && echo "    functional $o: $ops ops/s at rate $RATE_L" ||
-             echo "  FUNCTIONAL FAILED $o: $ops ops/s under 90% of $RATE_L" ;;
+        l) rate=$RATE_L pct=90 ;;
+        m) rate=${RATE_M:-$RATE_L} pct=90 ;;
+        s) rate=${RATE_S:-$((RATE_L / 6))} pct=90 ;;
+        h) rate=${RATE_M:-$RATE_L} pct=85 ;;
+        *) rate= ;;
+      esac
+      if [ -n "$rate" ]; then
+        [ $((ops * 100)) -ge $((rate * pct)) ] && echo "    functional $o: $ops ops/s at rate $rate" ||
+          echo "  FUNCTIONAL FAILED $o: $ops ops/s under $pct% of $rate"
+      fi
+      case $shape in
+        m|s|h)
+          [ "$prep" -gt 0 ] && echo "    functional $o: $prep external prepares" ||
+            echo "  FUNCTIONAL FAILED $o: no external prepare counted"
+          [ "$doubt" -eq 0 ] && echo "    functional $o: no share in doubt at the end" ||
+            echo "  FUNCTIONAL FAILED $o: $doubt shares in doubt at the end"
+          [ "$drops" -eq 0 ] && echo "    functional $o: no subscriber stream dropped" ||
+            echo "  FUNCTIONAL FAILED $o: $drops subscriber streams dropped" ;;
         t256) [ -z "$RATE_L" ] && [ $k = 0 ] && RATE_L=$((ops / 2)) && echo "    RATE_L set to $RATE_L (half of $o's $ops ops/s)" ;;
       esac
+      # The last sample of each node's replica_following (one replica per node).
+      local notf; notf=$(awk '$3 ~ /^pigeonhole_replica_following/ {v[$2] = $4} END {n = 0; for (k in v) if (v[k] + 0 != 1) n++; print n + 0}' $OUT/$o.mx)
+      [ "$notf" -eq 0 ] && echo "    functional $o: every replica following in the last sample" ||
+        echo "  FUNCTIONAL FAILED $o: $notf replicas not following in the last sample"
       if [ $k -gt 0 ]; then
         local waits; waits=$(grep 'pigeonhole_cluster_replica_ack_wait_seconds_count' $OUT/$o.mx | tail -3 | awk '{s += $NF} END {print s + 0}')
         [ "${waits%.*}" -gt 0 ] && echo "    functional $o: replica-ack waits counted ($waits in the last samples)" ||
