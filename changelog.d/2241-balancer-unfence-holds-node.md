@@ -1,0 +1,2 @@
+### Changed
+- **A failed unfence after a balancer abort no longer stops balancing cluster-wide** (#2240). When the balancer aborts a move and can't tell the partition's node to serve it again, it keeps retrying each pass, as before. Meanwhile only that node sits out the balancing: it isn't a source or a target and its numbers stay out of the means, while the rest of the cluster is balanced as usual. In 1.3.1 every balancer decision waited for that unfence. `state` still names the waiting partition.
