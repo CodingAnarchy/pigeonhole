@@ -794,6 +794,31 @@ static SPECS: &[Spec] = &[
         "Cross-shard commits that failed with Conflict without another round.",
         |s, out| one(out, s.e.cross_failed_fast)
     ),
+    // Transactions across partitions on a cluster (D329, ICR 0148).
+    spec!(
+        "pigeonhole.txn.external.prepares",
+        Counter,
+        false,
+        "{share}",
+        [],
+        "Shares of transactions across partitions prepared and logged here, each in doubt until its home decides it; 0 outside a cluster.",
+        |s, out| one(out, s.e.external_prepares)
+    ),
+    spec!(
+        "pigeonhole.txn.external.decides",
+        Counter,
+        false,
+        "{share}",
+        [attr::OUTCOME],
+        "Decisions taken here on shares of transactions across partitions: to commit them (outcome committed) or abort them (outcome aborted), the resolver's included. A share found in doubt at open is decided without a prepare count, so after a reopen these can exceed pigeonhole.txn.external.prepares.",
+        |s, out| {
+            out.push((
+                Value::U(s.e.external_commits),
+                kv(attr::OUTCOME, "committed"),
+            ));
+            out.push((Value::U(s.e.external_aborts), kv(attr::OUTCOME, "aborted")));
+        }
+    ),
     // Write stalls and background work.
     spec!(
         "pigeonhole.write_stalls",
@@ -1210,6 +1235,28 @@ static SPECS: &[Spec] = &[
         }
     ),
     spec!(
+        "pigeonhole.feed.external.holds",
+        Counter,
+        false,
+        "{share}",
+        [],
+        "Shares of transactions across partitions that change-feed readers held from their PREPARE until they read the decision; a share read again after a rewind counts again; only while the feed is on.",
+        |s, out| if s.feed_on() {
+            one(out, s.e.feed_external_held);
+        }
+    ),
+    spec!(
+        "pigeonhole.feed.external.evictions",
+        Counter,
+        false,
+        "{share}",
+        [],
+        "Held shares of transactions across partitions that a change-feed reader let go of at its read-ahead limit, to read again later; only while the feed is on.",
+        |s, out| if s.feed_on() {
+            one(out, s.e.feed_external_evicted);
+        }
+    ),
+    spec!(
         "pigeonhole.feed.retained.size",
         Gauge,
         false,
@@ -1424,6 +1471,11 @@ counters!(EngineRest {
     reader_slots_reclaimed: |r: &Raw| r.m.reader_slots_reclaimed,
     cross_rounds: |r: &Raw| r.m.cross_shard.rounds,
     cross_failed_fast: |r: &Raw| r.m.cross_shard.failed_fast,
+    external_prepares: |r: &Raw| r.m.external_prepares,
+    external_commits: |r: &Raw| r.m.external_commits,
+    external_aborts: |r: &Raw| r.m.external_aborts,
+    feed_external_held: |r: &Raw| r.m.feed_external_held,
+    feed_external_evicted: |r: &Raw| r.m.feed_external_evicted,
     group_syncs: |r: &Raw| r.m.group_syncs,
     group_sync_nanos: |r: &Raw| r.m.group_sync_nanos,
     feed_background_syncs: |r: &Raw| r.m.feed_background_syncs,

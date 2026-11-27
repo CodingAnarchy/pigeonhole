@@ -400,6 +400,20 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_failover_max_lag_ms: u64,
+    /// How long a write on a partition whose map sets `replica_acks` waits for that many
+    /// replicas to acknowledge it, in milliseconds (D335): one still waiting answers
+    /// `OutcomeUnknown` (it's committed on the owner, and may become covered later). How
+    /// long a client is kept waiting, not a safety bound: a write whose lease ends first
+    /// answers at once.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 5000,
+        value_parser = clap::value_parser!(u64).range(1..),
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub cluster_replica_ack_timeout_ms: u64,
     /// The window a partition's load is averaged over (an exponential average, each 30 s
     /// reading weighing `1 − e^(−30/window)`), and the node's device ceiling taken across,
     /// in seconds, 30 to 86400 (D332): what the cluster balancer compares. Measured on every
@@ -688,6 +702,7 @@ mod tests {
             ["--cluster-lease-ms", "21"],
             ["--cluster-failover-after-ms", "40"],
             ["--cluster-failover-max-lag-ms", "500"],
+            ["--cluster-replica-ack-timeout-ms", "2000"],
             ["--balance-window", "60"],
         ] {
             if flag[0] != "--node-id" {

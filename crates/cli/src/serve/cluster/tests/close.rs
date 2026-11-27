@@ -409,6 +409,7 @@ fn a_reopening_partition_shows_open_only_once_its_writes_route() {
             let e = data(entry)
                 .await
                 .mutate(MutateRequest {
+                    replication: 0,
                     writes: Some(put_row("alice", "2")),
                     durability: 0,
                 })

@@ -11,6 +11,7 @@ async fn try_put(port: u16, row: &str, value: &str) -> Result<(), tonic::Status>
     data(port)
         .await
         .mutate(crate::serve::proto::MutateRequest {
+            replication: 0,
             writes: Some(put_row(row, value)),
             durability: 0,
         })
@@ -123,6 +124,7 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
             .await
             .commit(with(
                 crate::serve::proto::TxnCommitRequest {
+                    replication: 0,
                     txn_id: late,
                     rows: vec![put_row("d", "txn")],
                 },
@@ -380,6 +382,7 @@ fn an_opening_source_fences_a_handing_over_range() {
     n.arm_ranges(&gate, "p1", 1, &db, || ()).unwrap();
     let state = (*gate.ranges().load()).clone().expect("fenced");
     let put = crate::serve::service::ServiceOp::Mutate(crate::serve::proto::MutateRequest {
+        replication: 0,
         writes: Some(put_row("d", "x")),
         durability: 0,
     });
@@ -822,6 +825,7 @@ fn a_counter_moved_in_a_later_chunk_counts_each_increment_once() {
         data(c)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(incr_row(row, by)),
                 durability: 0,
             })
@@ -931,6 +935,7 @@ fn a_target_restarted_between_chunks_and_in_its_catch_up_resumes_and_counts_once
         data(c)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(incr_row(row, by)),
                 durability: 0,
             })
@@ -1809,6 +1814,7 @@ async fn mutate(port: u16, writes: crate::serve::proto::RowWrites) {
     data(port)
         .await
         .mutate(crate::serve::proto::MutateRequest {
+            replication: 0,
             writes: Some(writes),
             durability: 0,
         })
@@ -2468,6 +2474,7 @@ fn a_straddling_commit_brings_its_in_range_part_and_same_timestamp_increments_bo
         data(c)
             .await
             .batch(BatchRequest {
+                replication: 0,
                 rows: vec![put_row("e", "5"), put_row("g", "5")],
                 durability: 0,
             })

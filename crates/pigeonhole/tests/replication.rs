@@ -2055,15 +2055,19 @@ fn a_token_under_a_retention_hold_resumes_at_any_shard_count() {
         db.compact().unwrap();
         let mut feed = t.feed().resume(&token).open().unwrap();
         feed.include_silent();
+        // Every event up to the 30 writes, however long a loaded runner stalls between them
+        // (#2246: an empty 200 ms wait read as the end, and a stall before the first event
+        // as none). The whole deadline is generous; one pass takes milliseconds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut n = 0;
-        loop {
+        while n < 30 && std::time::Instant::now() < deadline {
             match feed.next_event(Duration::from_millis(200)) {
                 Ok(Some(_)) => n += 1,
-                Ok(None) => break,
+                Ok(None) => {}
                 Err(e) => panic!("{shards} shards (seed {seed}): after {n} events: {e}"),
             }
         }
-        assert!(n >= 30, "{shards} shards (seed {seed}): {n} events");
+        assert!(n >= 30, "{shards} shards (seed {seed}): {n} events in 20 s");
         drop((feed, hold, t));
         db.close().unwrap();
     }

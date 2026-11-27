@@ -9,6 +9,7 @@ use prost::Message;
 
 fn mutation() -> MutateRequest {
     MutateRequest {
+        replication: 0,
         writes: Some(RowWrites {
             row: Some(RowKey {
                 table: "jobs".into(),

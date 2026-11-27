@@ -115,6 +115,7 @@ pub(crate) fn run(
             }),
             failover_max_lag: (args.cluster_failover_max_lag_ms > 0)
                 .then(|| Duration::from_millis(args.cluster_failover_max_lag_ms)),
+            replica_ack_timeout: Duration::from_millis(args.cluster_replica_ack_timeout_ms),
             balance_window: Duration::from_secs(args.balance_window),
             load_interval: load::INTERVAL,
             prune_interval: super::range_prune::INTERVAL,
@@ -269,6 +270,15 @@ pub(crate) fn run(
                 engine_memory: Some(o.memory),
             };
             let part = service.for_partition(o.db.clone(), &o.id, gate, config);
+            // D335: its replica acks from the map, before anything serves (an install
+            // arrives only once the node serves, and then finds the partition).
+            if let (Some(p), Ok(map)) = (part.part_opt(), node.get_map()) {
+                p.acks.configure(super::super::acks::AckConfig::of(
+                    &map,
+                    &o.id,
+                    node.peers.replica_ack_timeout,
+                ));
+            }
             // A text index rebuild a fence or a shutdown stopped carries on once the
             // partition takes writes (#1756).
             part.resume_text_rebuilds();
