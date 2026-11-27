@@ -465,8 +465,15 @@ fn a_recall_across_partitions_is_the_steps_over_the_partitions_stores() {
     // a graph expansion and a byte budget. (Its fusion is RRF, which ranks recency, so the
     // server's clock and this one's give the same order.) The steps themselves equal one
     // store's recall: `pigeonhole-memory`'s `recall_steps` test.
+    //
+    // At the server's default request deadline (30 s), not the test servers' 5 s: this test
+    // isn't about deadlines, and one of its 60 forwarded writes outlasted 5 s on a stalled
+    // Windows runner (OutcomeUnknown, #2242). A write can't be retried here, as a second
+    // `remember` would store a second memory.
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_stops, [p1, p2], [a, b, c]) = three_nodes(&rt);
+    let mut limits = crate::serve::server_tests::limits();
+    limits.request_timeout = std::time::Duration::from_secs(30);
+    let (_stops, [p1, p2], [a, b, c], _) = three_nodes_with(&rt, "", &limits);
     let namespaces = ["alice", "bob", "yan", "zed"];
     rt.block_on(async {
         let mut x = 0x1915u64;

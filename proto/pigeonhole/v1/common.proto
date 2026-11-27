@@ -150,6 +150,19 @@ message AggregateQuery {
 message CommitInfo {
   uint64 seqno = 1;
   Durability durability = 2;
+  // D335: how many of the partition's replicas acknowledged the commit before it was
+  // answered: at least the map's `replica_acks` for a covered commit, 0 for an asynchronous
+  // one (a partition at 0, or a write that asked for `REPLICATION_MODE_ASYNC`).
+  uint32 replica_acks = 3;
+}
+
+// D335: whether a write waits for its partition's replica acknowledgements.
+enum ReplicationMode {
+  // The partition's map decides (`Partition.replica_acks`).
+  REPLICATION_MODE_DEFAULT = 0;
+  // Answer once the commit is durable on the owner, without waiting for replicas: for
+  // writes that can be redone, such as bulk loads. Not covered against a failover.
+  REPLICATION_MODE_ASYNC = 1;
 }
 
 // A column of a row: a family and a qualifier.

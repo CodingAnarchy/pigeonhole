@@ -520,13 +520,13 @@ impl Router {
             .collect();
         super::replica::Replica::render_copies(&followers, &mut text);
         // D335: each owned partition's replica acknowledgements.
-        let (mut waits, mut acked) = (String::new(), String::new());
+        let mut acks = super::acks::Rendered::default();
         for (id, service) in open.iter() {
             if let Some(part) = service.part_opt() {
-                part.acks.render(id, &mut waits, &mut acked);
+                part.acks.render(id, &mut acks);
             }
         }
-        super::acks::ReplicaAcks::render_all(&mut text, &waits, &acked);
+        super::acks::ReplicaAcks::render_all(&mut text, &acks);
         // The map's failover counts and writer term (D330).
         cluster.node.render_failover_metrics(&mut text);
         // D331 PR 4b: the range moves followed here, and copies refused for the cap.

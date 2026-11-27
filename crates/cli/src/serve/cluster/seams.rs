@@ -61,6 +61,12 @@ pub(crate) static OLD_BULK_LOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static OLD_FOLLOW: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// A hold seam (tests): owners, by cluster directory, that hold back the acknowledgements
+/// their replicas send (D335 PR 2), as a replica that stopped acknowledging would. While
+/// listed, a stream keeps only its latest; once lifted, that one counts within a tick.
+#[cfg(test)]
+pub(crate) static HOLD_ACKS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// A fault seam (tests): nodes acting as a build before `ClusterMap.indexes` (#1722), by
 /// cluster directory: their `Status` leaves `indexes` out.
 #[cfg(test)]

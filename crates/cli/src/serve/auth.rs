@@ -106,6 +106,10 @@ pub(crate) struct Caller {
     /// The reply goes back as HTTP/JSON, larger than its protobuf: a read reserves twice its
     /// cap for it (#1567, cli692's D2). Set by the HTTP front-end.
     pub json: bool,
+    /// D335: the call asked not to wait for its partition's replica acknowledgements
+    /// (`x-pigeonhole-replication: async`), on a cluster node; a forward carries it
+    /// (`ForwardedCaller.replication`).
+    pub replication_async: bool,
 }
 
 impl Caller {
@@ -125,6 +129,7 @@ impl Caller {
             scope: Scope::Admin,
             namespaces: None,
             json: false,
+            replication_async: false,
         }
     }
 }
@@ -238,6 +243,7 @@ impl Tokens {
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                     json: false,
+                    replication_async: false,
                 });
             }
         }
@@ -257,6 +263,7 @@ impl Tokens {
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                     json: false,
+                    replication_async: false,
                 });
             }
         }

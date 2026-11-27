@@ -575,6 +575,7 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
     let drop_c = || ServiceOp::DropTable(proto::DropTableRequest { name: "c".into() });
     let put_c = || {
         ServiceOp::Mutate(proto::MutateRequest {
+            replication: 0,
             writes: serde_json::from_value(json!({"row": {"table": "c", "row": b64(b"r")},
                 "writes": [{"put": {"family": "f", "qualifier": b64(b"q"), "value": {"bytes": b64(b"v")}}}]}))
             .unwrap(),

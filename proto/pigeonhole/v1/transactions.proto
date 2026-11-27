@@ -82,6 +82,8 @@ message TxnCommitRequest {
   string txn_id = 1;
   // More writes, committed with the buffered ones.
   repeated RowWrites rows = 2;
+  // D335: ASYNC answers without waiting for the partition's replica acks.
+  ReplicationMode replication = 3;
 }
 
 message TxnCommitResponse {

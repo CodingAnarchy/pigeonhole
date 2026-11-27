@@ -97,6 +97,14 @@ env:
   # 0.77% apart (11029-11114), from #320's cross-thread free of a commit's batch buffer, which
   # glibc 2.43 serves at a cost varying with the heap's state. The ceilings file says more.
   THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8 serve-mutate=1.0 commit-incr=1.0
+  # Shapes whose noise only lowers a count, `name=percent`: identical code mostly counts one
+  # exact value (the mode) and otherwise lands below it, almost never above. A shape here whose
+  # base and head differ by more than its percent either way is counted again on both sides,
+  # and each side is judged on the higher of its two counts, which is the mode unless both
+  # draws were low. One base against one head otherwise reads at or past the threshold
+  # whenever base draws low and head draws the mode (#2241 +1.0%, #2219 +0.8%, neither in the
+  # engine). See the ceilings file's commit-incr note for its counts.
+  RECOUNT_MAX: commit-incr=0.5
 
 jobs:
   # Valgrind's .debs, cached so the callgrind jobs don't need the Ubuntu archive (down for
@@ -460,13 +468,26 @@ jobs:
           # judges the retry's counts: a real change fails twice. Loud either way: a warning
           # per shape, a section in the summary, and both runs' callgrind outputs uploaded
           # (the callgrind-retry artifact), so an outlier can be diffed by function.
-          retry=$(
+          # A RECOUNT_MAX shape is also counted again past its own percent. When that is the
+          # only reason it is retried, its retry doesn't replace the first count: each side
+          # keeps the higher of its two (`maxed`). Retried as an outlier or for its ceiling, it
+          # takes the retry's count like any other shape (perf287's N1 on #2244), so a high
+          # outlier can still be retried away.
+          outliers=$(
             {
               python3 scripts/instruction-ceilings.py check /tmp/head.txt |
                 sed -n 's/^| \([^ |]*\) | [0-9]* | [0-9]* | \*\*above the ceiling\*\* |$/\1/p' || true
               awk '$2 != "-" && $4 != "x" && ($3 > $2 * 1.02 || $3 < $2 * 0.98) { print $1 }' /tmp/pairs.txt
             } | sort -u | tr '\n' ' '
           )
+          maxed=$(
+            awk -v recount="$RECOUNT_MAX" -v outliers=" $outliers " '
+              BEGIN { n = split(recount, kv, " "); for (i = 1; i <= n; i++) { split(kv[i], p, "="); r[p[1]] = p[2] } }
+              ($1 in r) && !index(outliers, " " $1 " ") && $2 != "-" && $4 != "x" &&
+                ($3 > $2 * (1 + r[$1] / 100) || $3 < $2 * (1 - r[$1] / 100)) { print $1 }' /tmp/pairs.txt |
+              tr '\n' ' '
+          )
+          retry="$outliers$maxed"
           if [ -n "${retry// }" ]; then
             cp /tmp/base.txt /tmp/base-first.txt
             cp /tmp/head.txt /tmp/head-first.txt
@@ -482,10 +503,13 @@ jobs:
             fi
             # The retry's counts replace the first run's for the retried shapes only: a retried
             # hotrow state reruns all three, and the other two keep their first counts
-            # (simp724's R1 on #2037).
+            # (simp724's R1 on #2037). A shape in `maxed` keeps the higher of its two counts.
             for side in base head; do
-              awk -v names=" $retry " 'FILENAME == ARGV[1] { if (index(names, " " $1 " ")) r[$1] = $2; next }
-                   { print $1, ($1 in r) ? r[$1] : $2 }' \
+              awk -v names=" $retry " -v maxed=" $maxed " '
+                   FILENAME == ARGV[1] { if (index(names, " " $1 " ")) r[$1] = $2; next }
+                   { v = $2
+                     if ($1 in r) v = (index(maxed, " " $1 " ") && $2 + 0 > r[$1] + 0) ? $2 : r[$1]
+                     print $1, v }' \
                 "/tmp/$side-retry.txt" "/tmp/$side-first.txt" > "/tmp/$side.txt"
             done
             pairs
@@ -501,7 +525,7 @@ jobs:
             {
               echo "### RETRIED: an outlier's shapes were counted twice"
               echo
-              echo "The gate below judges the retry. Both runs' callgrind outputs are in this job's \`callgrind-retry\` artifact."
+              echo "The gate below judges the retry, except that each side of a shape retried only by RECOUNT_MAX (${maxed:-none}) is judged on the higher of its two counts. Both runs' callgrind outputs are in this job's \`callgrind-retry\` artifact."
               echo
               echo "| shape | first base | first head | retry base | retry head |"
               echo "|---|--:|--:|--:|--:|"

@@ -163,6 +163,11 @@ pub struct CommitInfo {
     pub seqno: u64,
     #[prost(enumeration = "Durability", tag = "2")]
     pub durability: i32,
+    /// D335: how many of the partition's replicas acknowledged the commit before it was
+    /// answered: at least the map's `replica_acks` for a covered commit, 0 for an asynchronous
+    /// one (a partition at 0, or a write that asked for `REPLICATION_MODE_ASYNC`).
+    #[prost(uint32, tag = "3")]
+    pub replica_acks: u32,
 }
 /// A column of a row: a family and a qualifier.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -558,6 +563,36 @@ impl Metric {
         }
     }
 }
+/// D335: whether a write waits for its partition's replica acknowledgements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReplicationMode {
+    /// The partition's map decides (`Partition.replica_acks`).
+    Default = 0,
+    /// Answer once the commit is durable on the owner, without waiting for replicas: for
+    /// writes that can be redone, such as bulk loads. Not covered against a failover.
+    Async = 1,
+}
+impl ReplicationMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Default => "REPLICATION_MODE_DEFAULT",
+            Self::Async => "REPLICATION_MODE_ASYNC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REPLICATION_MODE_DEFAULT" => Some(Self::Default),
+            "REPLICATION_MODE_ASYNC" => Some(Self::Async),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Ordering {
@@ -788,6 +823,9 @@ pub struct MutateRequest {
     pub writes: ::core::option::Option<RowWrites>,
     #[prost(enumeration = "Durability", tag = "2")]
     pub durability: i32,
+    /// D335: ASYNC answers without waiting for the partition's replica acks.
+    #[prost(enumeration = "ReplicationMode", tag = "3")]
+    pub replication: i32,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MutateResponse {
@@ -802,6 +840,9 @@ pub struct CheckAndMutateRequest {
     pub condition: ::core::option::Option<Condition>,
     #[prost(enumeration = "Durability", tag = "3")]
     pub durability: i32,
+    /// D335: ASYNC answers without waiting for the partition's replica acks.
+    #[prost(enumeration = "ReplicationMode", tag = "4")]
+    pub replication: i32,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CheckAndMutateResponse {
@@ -818,6 +859,9 @@ pub struct BatchRequest {
     pub rows: ::prost::alloc::vec::Vec<RowWrites>,
     #[prost(enumeration = "Durability", tag = "2")]
     pub durability: i32,
+    /// D335: ASYNC answers without waiting for the partition's replica acks.
+    #[prost(enumeration = "ReplicationMode", tag = "3")]
+    pub replication: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutateReturningResponse {
@@ -4995,6 +5039,9 @@ pub struct TxnCommitRequest {
     /// More writes, committed with the buffered ones.
     #[prost(message, repeated, tag = "2")]
     pub rows: ::prost::alloc::vec::Vec<RowWrites>,
+    /// D335: ASYNC answers without waiting for the partition's replica acks.
+    #[prost(enumeration = "ReplicationMode", tag = "3")]
+    pub replication: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnCommitResponse {
@@ -7589,6 +7636,12 @@ pub struct Partition {
     /// D332: the balancer's last 8 actions on P (moves, splits, merges, its pins).
     #[prost(message, repeated, tag = "10")]
     pub moves_history: ::prost::alloc::vec::Vec<MoveHistory>,
+    /// D335: how many of `replicas` must acknowledge a write before its owner answers it
+    /// (semi-synchronous replication, ICR 0146). 0, the default, is asynchronous. At most
+    /// `len(replicas)`; set only once every node keeps it (`map_features`: `replica_ack_wait`).
+    /// With too few healthy replicas the owner refuses writes (`Unavailable`).
+    #[prost(uint32, tag = "12")]
+    pub replica_acks: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -8330,6 +8383,11 @@ pub struct ForwardedCaller {
     /// to; empty on a cluster without tokens. The node it's sent to must list the same token.
     #[prost(bytes = "bytes", tag = "4")]
     pub token_digest: ::prost::bytes::Bytes,
+    /// D335: the caller asked not to wait for the partition's replica acks
+    /// (`x-pigeonhole-replication: async`, on the node that took the call). An older forwarder
+    /// leaves it DEFAULT, so such a write waits as the map says: the safe direction.
+    #[prost(enumeration = "ReplicationMode", tag = "5")]
+    pub replication: i32,
 }
 /// A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 /// call's own status.

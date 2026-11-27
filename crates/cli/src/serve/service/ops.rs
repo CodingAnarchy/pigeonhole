@@ -331,6 +331,36 @@ impl ServiceOp {
     /// on #1583): every write-scope RPC writes, and `DropTable` is the one admin-scope
     /// write. A transaction's `Commit` is read scope; one with writes is refused by the
     /// engine's gate (R6).
+    /// D335: whether the request asked not to wait for its partition's replica acks
+    /// (`replication: REPLICATION_MODE_ASYNC`). The calls without the field opt down only
+    /// by the header ([`Caller::replication_async`]).
+    pub(crate) fn replication_async(&self) -> bool {
+        let mode = match self {
+            Self::Mutate(r) | Self::MutateReturning(r) => r.replication,
+            Self::CheckAndMutate(r) => r.replication,
+            Self::Batch(r) => r.replication,
+            Self::Commit(r) => r.replication,
+            _ => return false,
+        };
+        mode == proto::ReplicationMode::Async as i32
+    }
+
+    /// D335: raises the request's durability to `GroupSync` for a write that waits for
+    /// replica acks: the feed ships only what is durable on the owner, so a `None` or
+    /// `Buffered` commit would wait for a later sync anyway. The server's default
+    /// (`UNSPECIFIED`) is left alone. `CommitInfo.durability` reports what was applied.
+    pub(crate) fn raise_durability(&mut self) {
+        let d = match self {
+            Self::Mutate(r) | Self::MutateReturning(r) => &mut r.durability,
+            Self::CheckAndMutate(r) => &mut r.durability,
+            Self::Batch(r) => &mut r.durability,
+            _ => return,
+        };
+        if *d == proto::Durability::None as i32 || *d == proto::Durability::Buffered as i32 {
+            *d = proto::Durability::GroupSync as i32;
+        }
+    }
+
     pub(crate) fn writes(&self) -> bool {
         self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
     }

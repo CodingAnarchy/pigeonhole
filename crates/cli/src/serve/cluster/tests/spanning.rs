@@ -19,6 +19,7 @@ pub(super) async fn commit_parts(
     rows: Vec<super::super::proto::RowWrites>,
 ) -> Result<super::super::proto::TxnCommitResponse, tonic::Status> {
     let r = super::super::proto::TxnCommitRequest {
+        replication: 0,
         txn_id: id.into(),
         rows,
     };
@@ -354,6 +355,7 @@ fn a_spanning_transaction_is_its_tokens_and_a_client_cant_call_the_branch_arms()
             assert_eq!(code(&e), "PermissionDenied", "{e}");
         }
         let r = super::super::proto::TxnCommitRequest {
+            replication: 0,
             txn_id: id.clone(),
             rows: Vec::new(),
         };
@@ -809,6 +811,7 @@ fn a_spanning_transactions_outcome_is_its_tokens_alone_while_its_session_lasts()
         assert_eq!(o.state(), St::InProgress, "{o:?}");
         // The other token's asks changed nothing: the owner commits both partitions.
         let r = super::super::proto::TxnCommitRequest {
+            replication: 0,
             txn_id: id.clone(),
             rows: Vec::new(),
         };
@@ -1153,6 +1156,7 @@ fn a_token_cluster_settles_a_share_across_nodes(lose: bool) {
                     .await
                     .commit(with(
                         TxnCommitRequest {
+                            replication: 0,
                             txn_id: id,
                             rows: Vec::new(),
                         },
@@ -1307,5 +1311,69 @@ fn a_share_prepared_before_a_move_holds_it_until_the_home_decides() {
         assert_eq!(phase().await, None, "the move ended");
         // Read through the map, which gives "d05" to p2 now.
         assert_eq!(get_row(c, "d05").await.unwrap(), Some(b"1".to_vec()));
+    });
+}
+
+/// D335 PR 2a (the coordinator, after simp724's P1 on #2238): until PR 4 replicates
+/// prepares, a spanning transaction that writes and touches a partition whose map sets
+/// `replica_acks` is refused at its commit, before any prepare, and stays open; committed
+/// again opted down (`REPLICATION_MODE_ASYNC`), it's answered uncovered, `replica_acks` 0.
+/// A single-partition write there waits. PR 4 flips this test.
+#[test]
+fn a_spanning_transaction_on_a_partition_with_replica_acks_is_refused_unless_opted_down() {
+    let t = Three::start(["", "", ""]);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        // p2 (b's) gets a replica on c, and waits for one acknowledgement.
+        super::replicas::set_replicas(a, "p2", &["c"]).await;
+        super::replicas::set_acks(a, "p2", 1).await.unwrap();
+        // A write on p2 alone waits for c's copy: acknowledged once the copy follows.
+        eventually_within(
+            Duration::from_secs(30),
+            "a write on p2 to be acknowledged by its replica",
+            async || {
+                data(b)
+                    .await
+                    .mutate(super::super::proto::MutateRequest {
+                        writes: Some(put_row("yan", "1")),
+                        durability: 0,
+                        replication: 0,
+                    })
+                    .await
+                    .is_ok_and(|r| r.into_inner().commit.is_some_and(|c| c.replica_acks == 1))
+            },
+        )
+        .await;
+        // A spanning transaction homed on p2, writing p1 and p2: refused at its commit,
+        // nothing written, and still open.
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(a, &id, vec![put_row("alice", "1")], None)
+            .await
+            .unwrap();
+        let e = commit_parts(b, &id, vec![put_row("zoe", "2")])
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+        assert!(e.message().contains("D335 PR 4"), "{e:?}");
+        for row in ["alice", "zoe"] {
+            assert_eq!(get_row(c, row).await.unwrap(), None, "{row}");
+        }
+        // Committed again opted down: committed, and answered uncovered.
+        let reply = txns(b)
+            .await
+            .commit(super::super::proto::TxnCommitRequest {
+                txn_id: id,
+                rows: vec![put_row("zoe", "2")],
+                replication: super::super::proto::ReplicationMode::Async as i32,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let commit = reply.commit.unwrap();
+        assert!(commit.seqno > 0, "{commit:?}");
+        assert_eq!(commit.replica_acks, 0, "{commit:?}");
+        for (row, v) in [("alice", "1"), ("zoe", "2")] {
+            assert_eq!(get_row(c, row).await.unwrap(), Some(v.as_bytes().to_vec()));
+        }
     });
 }
