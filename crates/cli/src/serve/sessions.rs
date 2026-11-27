@@ -273,7 +273,9 @@ impl Table {
     /// Session `id` became a record (a tombstone or a marker, #2253): it gives its slot in
     /// the caps back and counts against [`MAX_RECORDS`]. Past that, this table drops its own
     /// oldest records, never `id` itself, so a node keeps at most the bound plus one record
-    /// per table, and no table reaches into another's lock.
+    /// per table, and no table reaches into another's lock. The table that pays is the one
+    /// committing, whichever filled the bound (cli692 on #2257): a busy partition drops its
+    /// own retries' answers sooner, and a quiet one's age out on their lease.
     fn become_record(&mut self, id: &Id) {
         let Some(e) = self.map.get_mut(id) else {
             return;
@@ -1369,6 +1371,44 @@ mod tests {
         assert_eq!(s.records_dropped(), 2);
         assert_eq!(s.stats(Instant::now()).tombstones, 4);
         drop(s);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// cli692's N2 on #2257: two tables sharing a node's caps (a cluster node's partitions).
+    /// Past the bound (2 here), the table committing drops its own oldest, never the other
+    /// table's records and never its newest: a node holds at most the bound plus one per
+    /// table.
+    #[test]
+    fn tables_sharing_caps_each_drop_only_their_own_records() {
+        let (db, dir) = db("shared");
+        let caps = Arc::new(Caps::with_max_records(2));
+        let a = Sessions::sharing(leases(), Some("pa".into()), Arc::clone(&caps));
+        let b = Sessions::sharing(leases(), Some("pb".into()), Arc::clone(&caps));
+        let a_ids: Vec<String> = (0..2).map(|_| committed(&a, &db, p(1))).collect();
+        // b's first: over the bound, but it's b's newest, so it stays.
+        let b1 = committed(&b, &db, p(1));
+        // b's second: b drops its own oldest (b1), not a's.
+        let b2 = committed(&b, &db, p(1));
+        for id in &a_ids {
+            assert!(
+                matches!(a.take(id, p(1)), Ok(Taken::Done(Ok(_)))),
+                "a's record {id} kept"
+            );
+        }
+        assert_eq!(
+            b.take(&b1, p(1)).err().map(|e| e.code),
+            Some("NotFound".into())
+        );
+        assert!(matches!(b.take(&b2, p(1)), Ok(Taken::Done(Ok(_)))));
+        let now = Instant::now();
+        assert_eq!(
+            a.stats(now).tombstones + b.stats(now).tombstones,
+            3,
+            "bound + 1"
+        );
+        assert_eq!(caps.records_dropped(), 1);
+        drop((a, b));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
