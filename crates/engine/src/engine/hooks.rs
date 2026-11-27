@@ -185,6 +185,11 @@ pub enum Fault {
     /// pump or an application thread), with the writer's exclusion and the writer held
     /// (#2129).
     NextManifestBeginPanic = 13,
+    /// While on, a feed reader takes every decided round as prepared before its Decision's
+    /// session (#2191): a share it doesn't hold is then a gap, never a round recovery
+    /// dropped. Forces the false expiry option B allows (an internal round dropped by
+    /// recovery whose id is below its session's first records), to show it expires cleanly.
+    FeedRoundsBeforeSession = 14,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).

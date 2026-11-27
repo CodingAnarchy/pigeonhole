@@ -902,6 +902,317 @@ fn oldest_never_starts_in_a_session_that_opened_with_a_share_in_doubt() {
     db.close().unwrap();
 }
 
+/// [`round_dropped_by_recovery`]'s database, its two tables, the round's seqno and the
+/// single after it.
+type Dropped = (Arc<Engine>, Arc<TableInfo>, Arc<TableInfo>, Seqno, Seqno);
+
+/// #2191: a `Buffered` external round on both streams, decided, then a `GroupSync` single
+/// on `sync`'s stream and a power loss. When that stream is the round's coordinator, its
+/// Decision survives and the other stream's PREPARE doesn't, so recovery drops the round
+/// whole (feed1248 on #2191: the engine takes an external share at `Buffered`). The
+/// database reopened, its tables, the round's seqno and the single after it; `None` when
+/// `sync`'s stream wasn't the coordinator's (the round is then in doubt, not dropped).
+fn round_dropped_by_recovery(
+    vfs: &Arc<SimVfs>,
+    sync_on_a: bool,
+    first: bool,
+) -> Option<(Dropped, Vec<u8>)> {
+    let db = open(vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    // A token from before the round, in its session.
+    let token = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap().token();
+    // With `first`, the round's PREPAREs are their streams' first records in the session,
+    // so the torn one is its stream's first (#2250's sweeps).
+    if !first {
+        single(&db, &a, b"before-a", Durability::GroupSync);
+        single(&db, &b, b"before-b", Durability::GroupSync);
+    }
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::Buffered).unwrap();
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    let after = single(
+        &db,
+        if sync_on_a { &a } else { &b },
+        b"after",
+        Durability::GroupSync,
+    );
+    assert!(decided < after);
+    vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+    drop(db);
+    let db = open(vfs, Some(feed(1 << 20)));
+    // Dropped: not in doubt (nothing to decide), and neither share's row there (a round
+    // whose other share was synced too, by a group of its own, committed whole).
+    if !matches!(db.decide(b"x1", false), Ok(None)) {
+        return None;
+    }
+    let snap = db.snapshot().unwrap();
+    let kept = [&a, &b].iter().any(|t| {
+        db.get(&snap, t.id, t.families[0].id, b"held", b"q")
+            .unwrap()
+            .is_some()
+    });
+    drop(snap);
+    if kept {
+        return None;
+    }
+    // The next session writes on both streams: on the torn one, the dropped session's
+    // segment holds nothing readable, so a cursor there reads on into these (#2250's
+    // sweeps: taken for an unreadable stream, which gave up the session).
+    single(&db, &a, b"next-a", Durability::GroupSync);
+    single(&db, &b, b"next-b", Durability::GroupSync);
+    Some(((db, a, b, decided, after), token))
+}
+
+/// The round [`round_dropped_by_recovery`] drops, from whichever stream coordinates it.
+fn a_round_dropped_by_recovery(seed: u64) -> Dropped {
+    dropped_round(seed, false).0
+}
+
+/// [`a_round_dropped_by_recovery`], its PREPAREs first in their streams with `first`, and a
+/// token taken in its session before it.
+fn dropped_round(seed: u64, first: bool) -> (Dropped, Vec<u8>) {
+    // Which stream coordinates, and whether the other one's PREPARE reached the disk before
+    // the power loss, varies from run to run: a few seeds and both streams.
+    for seed in seed..seed + 8 {
+        for sync_on_a in [true, false] {
+            if let Some(got) = round_dropped_by_recovery(&SimVfs::new(seed), sync_on_a, first) {
+                return got;
+            }
+        }
+    }
+    panic!("no run kept the Decision without the other share");
+}
+
+/// #2191 (option B): a round recovery dropped (its Decision kept, a `Buffered` share torn by
+/// a power loss) was prepared in its Decision's own session, so a feed that reads that
+/// session from its start passes it over as recovery did: the single after it arrives, the
+/// round doesn't, and nothing expires.
+#[test]
+fn a_round_recovery_dropped_is_passed_over() {
+    let (db, a, b, decided, after) = a_round_dropped_by_recovery(3212);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let got = drain_seqnos(&mut r);
+    assert!(got.contains(&after), "the single after the round: {got:?}");
+    assert!(!got.contains(&decided), "the dropped round: {got:?}");
+    drop(r);
+    db.close().unwrap();
+}
+
+/// #2250's `feed_model` sweeps: the torn share was its stream's first record in the
+/// session, so that stream's segment of the session holds nothing readable, and a cursor
+/// there reads on into the next session's records. The bound passes the stream over (it
+/// only raises `alloc`) rather than giving up on the session, and a reader resumed from a
+/// token in that session passes the round over as recovery dropped it. Mutation-checked:
+/// giving up on such a stream expires here.
+#[test]
+fn a_round_whose_torn_share_was_first_in_its_stream_is_passed_over() {
+    let ((db, a, b, decided, after), token) = dropped_round(3215, true);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Token(token))).unwrap();
+    let got = drain_seqnos(&mut r);
+    assert!(got.contains(&after), "the single after the round: {got:?}");
+    assert!(!got.contains(&decided), "the dropped round: {got:?}");
+    drop(r);
+    db.close().unwrap();
+}
+
+/// #2191 (option B), the coordinator's ask: the false expiry option B allows, forced. With
+/// `Fault::FeedRoundsBeforeSession` the reader takes the dropped round for one prepared
+/// before its session, so its missing share is a gap: the feed answers `FeedExpired`
+/// cleanly, having delivered nothing past the round, and never passes it over.
+#[test]
+fn a_dropped_round_taken_for_an_earlier_one_expires_cleanly() {
+    let (db, a, b, decided, after) = a_round_dropped_by_recovery(3212);
+    db.inject(Fault::FeedRoundsBeforeSession, true);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let mut got = Vec::new();
+    let expired = loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Commit(c) => got.push(c.seqno),
+            Next::Expired(e) => break e,
+            other => panic!("{other:?} after {got:?}"),
+        }
+    };
+    assert!(
+        got.iter().all(|&s| s < decided),
+        "nothing past the round before the expiry: {got:?} (round {decided}, single {after})"
+    );
+    assert!(
+        format!("{expired:?}").contains("before seqno"),
+        "a gap at the round: {expired:?}"
+    );
+    db.inject(Fault::FeedRoundsBeforeSession, false);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// [`round_dropped_by_recovery`], late in a session whose first segments retention has
+/// recycled (the smallest retention, and far more written first): with a token taken just
+/// before the round. `None` as there.
+fn round_dropped_late_in_a_long_session(
+    vfs: &Arc<SimVfs>,
+    sync_on_a: bool,
+) -> Option<(Dropped, Vec<u8>)> {
+    let db = open(vfs, Some(feed(1)));
+    let (a, b) = tables(&db);
+    // Far more than the retention on both streams, flushed as it goes so the checkpoints
+    // move on and the session's first segments are recycled.
+    let value = vec![7u8; 20_000];
+    for i in 0..400u32 {
+        let mut wb = WriteBatch::new();
+        put(
+            &mut wb,
+            if i % 2 == 0 { &a } else { &b },
+            &i.to_be_bytes(),
+            &value,
+        );
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+        if i % 40 == 39 {
+            db.flush().unwrap();
+        }
+    }
+    let token = {
+        let r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+        r.token()
+    };
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    txn.prepare(b"x1", Durability::Buffered).unwrap();
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    let after = single(
+        &db,
+        if sync_on_a { &a } else { &b },
+        b"after",
+        Durability::GroupSync,
+    );
+    vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+    drop(db);
+    let db = open(vfs, Some(feed(1)));
+    if !matches!(db.decide(b"x1", false), Ok(None)) {
+        return None;
+    }
+    let snap = db.snapshot().unwrap();
+    let kept = [&a, &b].iter().any(|t| {
+        db.get(&snap, t.id, t.families[0].id, b"held", b"q")
+            .unwrap()
+            .is_some()
+    });
+    drop(snap);
+    (!kept).then_some(((db, a, b, decided, after), token))
+}
+
+/// audit120 on #2250: a round recovery dropped late in a session whose first segments
+/// retention recycled (a session that outlives the feed's retention spends most of its life
+/// so) still passes over: the session's start is bounded from each stream's first retained
+/// segment of it, not only its first. A reader resumed from a token taken in that session
+/// gets the single after the round, and nothing expires. Mutation-checked: bounding from the
+/// first segments only expires here.
+#[test]
+fn a_round_dropped_late_in_a_long_session_is_passed_over() {
+    let mut found = None;
+    'seeds: for seed in 3214..3222 {
+        for sync_on_a in [true, false] {
+            if let Some(got) = round_dropped_late_in_a_long_session(&SimVfs::new(seed), sync_on_a) {
+                found = Some(got);
+                break 'seeds;
+            }
+        }
+    }
+    let ((db, a, b, decided, after), token) =
+        found.expect("no run kept the Decision without the other share");
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Token(token))).unwrap();
+    let got = drain_seqnos(&mut r);
+    assert!(got.contains(&after), "the single after the round: {got:?}");
+    assert!(!got.contains(&decided), "the dropped round: {got:?}");
+    drop(r);
+    db.close().unwrap();
+}
+
+/// #2191 (option B): the session-start bound, against real sessions. A round prepared in
+/// session 1 (an external one, decided in session 2) and a single of session 1 are never
+/// taken for ones prepared in session 2, so a share of such a round missing there is a gap,
+/// never a round recovery dropped. Session 2's own seqnos are, and session 1's are in
+/// session 1. Mutation-checked: `prepared_in` answering yes regardless fails here.
+#[test]
+fn a_round_from_an_earlier_session_is_never_taken_for_one_its_decisions_session_prepared() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3213);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    let s1 = single(&db, &a, b"s1", Durability::GroupSync);
+    let mut txn = db.begin().unwrap();
+    for t in [&a, &b] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                b"held",
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+    }
+    let id = txn.prepare(b"x1", Durability::GroupSync).unwrap().seqno;
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let s2 = single(&db, &b, b"s2", Durability::GroupSync);
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt").seqno;
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let sessions: Vec<u64> = sidecar_entries(&vfs)
+        .iter()
+        .filter_map(|e| match e {
+            FeedEntry::Session { session, .. } => Some(*session),
+            _ => None,
+        })
+        .collect();
+    let (one, two) = (sessions[0], sessions[1]);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    assert!(
+        !r.round_prepared_in(id, two),
+        "the round prepared in session 1"
+    );
+    assert!(!r.round_prepared_in(s1, two), "session 1's single");
+    assert!(r.round_prepared_in(s2, two), "session 2's single");
+    assert!(
+        r.round_prepared_in(decided, two),
+        "the decision's own seqno"
+    );
+    assert!(
+        r.round_prepared_in(id, one),
+        "the round, in its own session"
+    );
+    assert!(
+        r.round_prepared_in(s1, one),
+        "session 1's single, in session 1"
+    );
+    drop(r);
+    db.close().unwrap();
+}
+
 /// #2196: a feed that expired on a gap (here a round whose share was logged with the feed
 /// off, outside its history) keeps its position before the round: a token taken from it
 /// after the expiry resumes into the same gap and expires again, as one taken before does,
