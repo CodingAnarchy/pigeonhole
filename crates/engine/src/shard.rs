@@ -243,6 +243,12 @@ pub(crate) struct ShardMetrics {
     pub wal: std::sync::OnceLock<Arc<pigeonhole_wal::WalCounters>>,
     /// Cross-shard two-phase commit counters (ICR 0043).
     pub cross: CrossShardCounters,
+    /// Transactions across partitions (D329, ICR 0148), counted by the shard that
+    /// coordinates each one's shares: rounds prepared and logged (in doubt from then), and
+    /// decides taken, to commit and to abort (`Engine::decide`, the resolver's included).
+    pub external_prepares: AtomicU64,
+    pub external_commits: AtomicU64,
+    pub external_aborts: AtomicU64,
     /// Test-hook counters (`engine::hooks::ShardCounters`).
     #[cfg(feature = "test-hooks")]
     pub hooks: crate::engine::hooks::ShardCounters,
@@ -283,6 +289,9 @@ impl Default for ShardMetrics {
             commit_inflight_nanos: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
             cross: CrossShardCounters::default(),
+            external_prepares: AtomicU64::new(0),
+            external_commits: AtomicU64::new(0),
+            external_aborts: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
         }
@@ -479,6 +488,12 @@ pub(crate) struct Shared {
     pub view: ArcSwap<View>,
     /// Reads inside async calls that went to the file synchronously (D196; `Metrics`).
     pub async_sync_reads: AtomicU64,
+    /// Change-feed readers' external shares (D329, ICR 0148; `Metrics`): shares a reader
+    /// held until it read their decision (one read again after a rewind counts again), and
+    /// held shares evicted past a reader's read-ahead cutoff (#2185). Any reader thread adds
+    /// to them, `Relaxed`: counters only, nothing orders by them.
+    pub feed_external_holds: AtomicU64,
+    pub feed_external_evictions: AtomicU64,
     /// Blocking waits for a commit's reply that parked their thread (ICR 0027; `Metrics`).
     pub commit_parks: AtomicU64,
     /// Serializes view publishers (shards creating memtables, manifest commits) and holds
@@ -10288,6 +10303,9 @@ impl ShardState {
         // hears so, and the decision waits for `Engine::decide` (`on_external_decide`).
         if let Some(ext) = &c.external {
             c.awaiting = true;
+            self.shared.metrics[usize::from(self.id.0)]
+                .external_prepares
+                .fetch_add(1, Ordering::Relaxed);
             self.shared.external.install(
                 &ext.xid,
                 ExternalEntry {
@@ -10344,6 +10362,12 @@ impl ShardState {
         }
         let c = self.coord.get_mut(&id).expect("present");
         c.reply = Some(reply);
+        let m = &self.shared.metrics[usize::from(self.id.0)];
+        if commit {
+            m.external_commits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            m.external_aborts.fetch_add(1, Ordering::Relaxed);
+        }
         if commit {
             self.commit_round(id, ctx);
         } else {
