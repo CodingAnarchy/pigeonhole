@@ -641,15 +641,22 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
     t.stop(2);
     t.restart(0);
     t.restart(1);
-    // c only once b has settled: a restarted node asks its peers for their maps until its
-    // partitions are confirmed, and takes a newer one from any that answers. With c back
-    // before b's p2 was confirmed (by a's version 1), b's next round took version 2 from c,
-    // and "b missed the move too" no longer held (#1821's Linux run).
+    // a and b can't reach c once it's back (the one-way seam), so neither learns version 2
+    // from it: every lease round asks each peer for its map and takes a newer one, and a
+    // node serving a partition runs one every third of its lease. Waiting for b's p2 to be
+    // confirmed before c's restart (#1821's fix) left the next renewal to race the
+    // assertion below, which b's round won on Windows (#2259). c's map lists only itself, so
+    // it dials nobody.
     let b = t.ports[1];
-    t.rt.block_on(eventually(
-        "b's p2 to be confirmed by a, which ends b's asking",
-        async || state(b, "p2").await == LocalPartitionState::Serving,
-    ));
+    let away = |dir: &PathBuf| (dir.clone(), format!("127.0.0.1:{c}"));
+    let (a_c, b_c) = (away(&t.dirs[0]), away(&t.dirs[1]));
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap()
+        .extend([a_c.clone(), b_c.clone()]);
+    t.rt.block_on(eventually("b's p2 to be confirmed by a", async || {
+        state(b, "p2").await == LocalPartitionState::Serving
+    }));
     t.restart(2);
     t.rt.block_on(async {
         eventually("c to answer with its map", async || {
@@ -660,12 +667,26 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
                 .is_ok_and(|m| m.into_inner().map_version == 2)
         })
         .await;
-        assert_eq!(version(t.ports[1]).await, 1, "b missed the move too");
+        // Past a renewal of each, with c answering: neither took its map.
+        tokio::time::sleep(TEST_LEASE).await;
+        assert_eq!(version(b).await, 1, "b missed the move too");
+        assert_eq!(version(a).await, 1, "a missed the move");
         assert_eq!(reason(a, "p1").await, FenceReason::Operator);
+        // a reaches c again, for its unfence's round; b still doesn't, so its answer to
+        // that round is version 1, which names a. (A renewal of a's may take version 2
+        // first: the unfence is then refused on a's own map.)
+        super::super::CUT_BETWEEN
+            .lock()
+            .unwrap()
+            .retain(|x| *x != a_c);
         let e = unfence(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert_ne!(state(a, "p1").await, LocalPartitionState::Serving);
     });
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap()
+        .retain(|x| *x != b_c);
 }
 
 #[test]

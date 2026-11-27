@@ -286,6 +286,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .into_inner()
             .map
             .ok_or_else(|| ApiError::invalid("PushMap needs a map"))?;
+        // A push the cut overtook isn't taken (#2259): its dial passed before the cut.
+        #[cfg(test)]
+        if let Some(from) = &from
+            && self.0.cut_from(from)
+        {
+            return Err(ApiError::partition_unavailable(format!(
+                "node {from}'s push: cut off (a test's seam)"
+            ))
+            .into());
+        }
         Ok(tonic::Response::new(
             self.0.push_map_async(map, from).await?,
         ))

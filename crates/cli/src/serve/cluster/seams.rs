@@ -152,13 +152,24 @@ pub(crate) fn old_nearest(path: &Path, how: OldNearest) -> bool {
         .any(|(d, h)| *h == how && path.starts_with(d))
 }
 
+/// Whether [`CUT_OFF`] cuts the node in `dir` and the peer at `address` apart, both ways: a
+/// call's receiver asks it of its sender (#2259), where [`CUT_BETWEEN`]'s one-way entries,
+/// keyed by the dialing side's directory, don't apply.
 #[cfg(test)]
-pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
+pub(super) fn cut_apart(dir: &Path, address: &str) -> bool {
     CUT_OFF
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .any(|c| c.dir == dir || (c.address == address && c.cluster.iter().any(|d| d == dir)))
+}
+
+/// Whether the node in `dir` can't reach the peer at `address`. Checked before a dial, again
+/// once it connected, and when a fetched map arrives; a pushed map's receiver checks
+/// [`cut_apart`]. So a call that began before a cut delivers nothing after it (#2259).
+#[cfg(test)]
+pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
+    cut_apart(dir, address)
         || CUT_BETWEEN
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
