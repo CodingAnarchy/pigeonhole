@@ -561,7 +561,17 @@ memory-recall 11313482 0.3
 # (#2011). From main 7163a413b with #2011, run 44039764770 (ubuntu-26.04), base and head of
 # identical code: serve-get 58560 / 58547, serve-read-row 578061 / 577936. The highest of each
 # times 1.003. serve-mutate stays: identical code read 54350 / 54607 there (0.47%, #1900).
-serve-get 58736 0.3
+# Raised by D195 (standing approval of up to ~0.5% a shape; coordinator 2026-11-27):
+# serve-get 58736 -> 58921 (+0.31%). #2218 (a read's range checked again past its snapshot,
+# #2160) holds `touched: Option<Touched>` across the read's await in dispatch.rs: its three PR
+# runs (45680227214, 45697537197, 45739834399) counted heads 58709-58713 against bases
+# 58638-58668, about +50 (+0.09%), under the per-PR threshold. Main's base counts went from
+# 58626-58681 (2026-11-25, 2ecbc59c3..748d110f5) to 58698-58740 (4cc414b9b..040db3995), and
+# #2248's run 45932684328 counted 58722 and 58745, past the old ceiling. The
+# noise is two-sided, unlike commit-incr's: up to 48 apart on one main commit. Main's highest
+# count, 58745, times 1.003. Winning the 50 back by taking `touched` only in the gate branch
+# is #2251.
+serve-get 58921 0.3
 serve-read-row 579796 0.3
 serve-mutate 58700 0.3
 serve-scan 6766417 0.3
