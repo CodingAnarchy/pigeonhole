@@ -605,6 +605,8 @@ async fn http_status(State(node): State<Arc<Node>>, headers: HeaderMap) -> Respo
 ///   among them): a lane of their own. An owner that sheds one answers `Overloaded`, which
 ///   the forwarding node passes back.
 /// - Every other call (map reads, pushes and installs, status, fences): the control lane.
+///   So a forward's own map pull (`catch_up`, from the node that sent it) never waits
+///   behind forwards: two nodes forwarding to each other can't hold each other's pulls.
 ///
 /// Each lane's limit is shared by its routes. Before #2258 one limit took every call, and
 /// a few dozen forwards in flight left a lease round's calls queued until they timed out.
