@@ -148,12 +148,13 @@ run() { local rep=$1 arm=$2 shape=$3 k=$4 o=$1-$2-$3-k$4 sha=$A
       --shards $SHARDS --change-feed $FEED --backup-dir $W/backups-n$((i + 1)) "${SESSIONS[@]}" > $OUT/$o.n$((i + 1)).err 2>&1 &
     pids+=($!)
   done
-  for i in 0 1 2; do
-    tr '\0' ' ' < /proc/${pids[$i]}/cmdline > $OUT/$o.n$((i + 1)).cmdline 2>/dev/null
-    grep -q "$PHDB serve" $OUT/$o.n$((i + 1)).cmdline && echo "    functional $o: n$((i + 1)) is $arm's phdb" ||
-      echo "  FUNCTIONAL FAILED $o: n$((i + 1))'s cmdline isn't $arm's phdb: $(head -c 200 $OUT/$o.n$((i + 1)).cmdline)"
-  done
   if ready $o; then
+    # Checked once the nodes serve: right after the fork, taskset may not have exec'd phdb yet (empty cmdline).
+    for i in 0 1 2; do
+      tr '\0' ' ' < /proc/${pids[$i]}/cmdline > $OUT/$o.n$((i + 1)).cmdline 2>/dev/null
+      grep -q "$PHDB serve" $OUT/$o.n$((i + 1)).cmdline && echo "    functional $o: n$((i + 1)) is $arm's phdb" ||
+        echo "  FUNCTIONAL FAILED $o: n$((i + 1))'s cmdline isn't $arm's phdb: $(head -c 200 $OUT/$o.n$((i + 1)).cmdline)"
+    done
     ( while :; do
         ts=$(date +%s.%N)
         for i in 0 1 2; do
