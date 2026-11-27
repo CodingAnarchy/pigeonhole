@@ -106,11 +106,18 @@ impl Node {
     pub(super) async fn fetch_map(&self, address: &str) -> Result<ClusterMap, String> {
         let mut client = self.client(address).await?;
         let req = self.request(GetMapRequest {})?;
-        client
+        let map = client
             .get_map(req)
             .await
             .map(tonic::Response::into_inner)
-            .map_err(|s| s.message().to_owned())
+            .map_err(|s| s.message().to_owned())?;
+        // The answer of a call the cut overtook isn't taken (#2259): a cut node's fetch in
+        // flight would otherwise bring it a map its peers set after the cut.
+        #[cfg(test)]
+        if cut_off(&self.dir, address) {
+            return Err(format!("{address}'s map: cut off (a test's seam)"));
+        }
+        Ok(map)
     }
 
     /// [`Node::push_map`] on a blocking thread.
@@ -166,6 +173,20 @@ impl Node {
         Ok(version)
     }
 
+    /// A fault seam's check on receive (tests, #2259): whether node `from`, by its address
+    /// in this node's map, is cut apart from this node ([`cut_apart`]). A sender this node's
+    /// map doesn't list isn't.
+    #[cfg(test)]
+    pub(super) fn cut_from(&self, from: &str) -> bool {
+        let address = self.state().map.as_ref().and_then(|(m, _)| {
+            m.nodes
+                .iter()
+                .find(|n| n.id == from)
+                .map(|n| n.address.clone())
+        });
+        address.is_some_and(|a| cut_apart(&self.dir, &a))
+    }
+
     /// A peer at `address` (the map's `host:port`).
     pub(super) async fn client(
         &self,
@@ -180,6 +201,12 @@ impl Node {
             .connect()
             .await
             .map_err(|e| format!("connecting to {address}: {e}"))?;
+        // Again once connected (#2259): a dial that began before the cut and connected
+        // after it would carry a call past the cut.
+        #[cfg(test)]
+        if cut_off(&self.dir, address) {
+            return Err(format!("connecting to {address}: cut off (a test's seam)"));
+        }
         Ok(forward::peer_client(channel))
     }
 
@@ -193,11 +220,18 @@ impl Node {
         if cut_off(&self.dir, address) {
             return Err(format!("connecting to {address}: cut off (a test's seam)"));
         }
-        self.endpoint(address)?
+        let channel = self
+            .endpoint(address)?
             .http2_keep_alive_interval(Duration::from_secs(30))
             .connect()
             .await
-            .map_err(|e| format!("connecting to {address}: {e}"))
+            .map_err(|e| format!("connecting to {address}: {e}"))?;
+        // Again once connected, as `client` does (#2259).
+        #[cfg(test)]
+        if cut_off(&self.dir, address) {
+            return Err(format!("connecting to {address}: cut off (a test's seam)"));
+        }
+        Ok(channel)
     }
 
     /// How this node dials the peer at `address` (the map's `host:port`): its TLS settings,

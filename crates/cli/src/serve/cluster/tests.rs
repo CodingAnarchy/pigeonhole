@@ -2707,8 +2707,16 @@ fn a_cut_off_entry_cuts_only_its_own_clusters_dials() {
         !super::cut_off(&other, at),
         "another cluster's dial of the same address"
     );
+    // On receive (#2259): the cut node and its peer are apart whichever of them sent.
+    assert!(super::cut_apart(&mine, "127.0.0.1:2") && super::cut_apart(&peer, at));
+    assert!(!super::cut_apart(&other, at));
     super::cut_node(&mine, at, &[mine.clone(), peer.clone()], false);
     assert!(!super::cut_off(&peer, at), "joined again");
+    // A one-way cut is the dialing side's alone: it refuses nothing on receive.
+    let one_way = (mine.clone(), at.to_owned());
+    super::CUT_BETWEEN.lock().unwrap().push(one_way.clone());
+    assert!(super::cut_off(&mine, at) && !super::cut_apart(&mine, at));
+    super::CUT_BETWEEN.lock().unwrap().retain(|c| *c != one_way);
 }
 
 impl Drop for Three {
