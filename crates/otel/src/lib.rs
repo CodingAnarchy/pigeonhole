@@ -810,7 +810,7 @@ static SPECS: &[Spec] = &[
         false,
         "{share}",
         [attr::OUTCOME],
-        "Decisions taken here on shares of transactions across partitions: to commit them (outcome committed) or abort them (outcome aborted), the resolver's included.",
+        "Decisions taken here on shares of transactions across partitions: to commit them (outcome committed) or abort them (outcome aborted), the resolver's included. A share found in doubt at open is decided without a prepare count, so after a reopen these can exceed pigeonhole.txn.external.prepares.",
         |s, out| {
             out.push((
                 Value::U(s.e.external_commits),

@@ -215,9 +215,10 @@ pub struct EngineMetrics {
     /// this database prepared and logged for them, each held in doubt until its transaction's
     /// home decides it. 0 outside a cluster.
     pub external_prepares: u64,
-    /// Decisions on those shares taken here to commit them (the resolver's included).
-    /// `external_prepares` less both decision counts is about the shares in doubt now, give
-    /// or take shares found in doubt at open (prepared before it, decided after).
+    /// Decisions on those shares taken here to commit them (the resolver's included). A
+    /// share found in doubt at open isn't counted as prepared, but its decision is, so after
+    /// a reopen the decisions can exceed the prepares: for the shares in doubt now, read
+    /// `phdb serve`'s `pigeonhole_cluster_txn_in_doubt_shares` gauge, not a difference.
     pub external_commits: u64,
     /// Decisions on those shares taken here to abort them (the resolver's included).
     pub external_aborts: u64,

@@ -48,7 +48,7 @@ They read `Status`'s source, the engine's in-doubt registry, under its lock for 
 
 ## Semantics
 
-- The counts start at 0 at each open. Shares found in doubt at an open are neither prepared nor counted again, but their later decides are counted. So `external_prepares - external_commits - external_aborts` is the shares in doubt now only when none were found in doubt at the open.
+- The counts start at 0 at each open. Shares found in doubt at an open are reinstalled without a prepare count, but their later decides are counted, so after a reopen commits plus aborts can exceed prepares (simp724). For the shares in doubt now, read the `pigeonhole_cluster_txn_in_doubt_shares` gauge, never a difference of the counters.
 - A decide that finds its xid already decided (`None`) counts nothing.
 - A feed reader's hold counts each time a share is held. A rewind (#2185's eviction, a resume from a token) reads it again and counts it again.
 - On a single node with no spanning transactions, every count is 0 and the gauges aren't shown.
