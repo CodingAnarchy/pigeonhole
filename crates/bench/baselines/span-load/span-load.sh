@@ -9,7 +9,7 @@
 # One SHA: REPS repeats of each shape on it. Two: per shape and repeat, a b b a.
 # The cluster: nodes n1 n2 n3 on 127.0.0.1:7471-7473, each owning one partition (p1 p2 p3)
 # and holding a replica of the one before it (p1's replica on n2, p2's on n3, p3's on n1),
-# replica_acks 0 (D335's k=1 row is added once #2238 lands). The table `span` (family f) is
+# replica_acks 0, or with D335=1 1 for t256's and l's k1 rows. The table `span` (family f) is
 # split at "b" and "c": rows a* in p1, b* in p2, c* in p3. Every node has the change feed on.
 # A fresh cluster per run: files made with `phdb cluster init-partition`, the table made in
 # each partition's file with `phdb shell`, the same first map in each node's directory.
@@ -17,8 +17,8 @@
 #   t256  256 callers, closed loop, single-partition Mutates (throughput; D335's base)
 #   l     64 callers paced at RATE_L, single-partition Mutates (latency; D335's p99 base)
 #   m     64 callers paced at RATE_M, 10% spanning x2, 1% conflicts, 16 subscribers
-#   s     64 callers paced at RATE_L/3, every op spanning x3, 1% conflicts, 16 subscribers
-#   h     m, with n2 stopped (SIGSTOP) 30 s into the measured phase for 5 s (reported only)
+#   s     64 callers paced at RATE_S, every op spanning x3, 1% conflicts, 16 subscribers
+#   h     m, with n2 stopped (SIGSTOP) SECS/3 into the measured phase for 5 s
 # RATE_L, unless set: half the first t256 (k=0) run's ops/s, then fixed for every later run.
 # RATE_S, unless set: RATE_L / 6 (each s operation is three partitions' writes and a 2PC).
 # RATE_M (m and h), unless set: RATE_L. 2026-11-27's box run delivered 43.6k ops/s for m at
@@ -37,7 +37,8 @@
 # client's RESULT line, and no FUNCTIONAL FAILED from it; l, m, s: ops/s at least 90% of the
 # shape's rate (h: 85%, n2 is stopped 5 of the 90 s); m, s, h: ext_prepares > 0, no share in
 # doubt at the end, no subscriber stream dropped; every replica following in the last metrics
-# sample. Diagnostics per run: each node's stderr, and each node's /metrics
+# sample; every run: metrics read from 3/3 nodes before and after the phase (nodes_read), and
+# no caller lost at the join (callers_lost). Diagnostics per run: each node's stderr, and each node's /metrics
 # lines naming flush, compaction, stall, commit, external, in_doubt, feed or replica, every
 # 1 s, timestamped (<run>.mx).
 # Output: OUT (default $S/out-2221-span): <rep>-<arm>-<shape>-k<k>.*, summary.txt (RESULT
@@ -188,8 +189,13 @@ run() { local rep=$1 arm=$2 shape=$3 k=$4 o=$1-$2-$3-k$4 sha=$A
       echo "$res" | tee -a $OUT/summary.txt
       grep -q "FUNCTIONAL FAILED" $OUT/$o.txt && echo "  FUNCTIONAL FAILED $o: $(grep 'FUNCTIONAL FAILED' $OUT/$o.txt)"
       field() { local v; v=$(sed -n "s/.* $1=\([0-9]*\).*/\1/p" <<< "$res"); echo "${v:-0}"; }
-      local prep ops doubt drops rate pct
+      local prep ops doubt drops rate pct nread lost
       prep=$(field ext_prepares); ops=$(field ops_per_s); doubt=$(field in_doubt_end); drops=$(field dropped)
+      nread=$(sed -n 's/.* nodes_read=\([0-9]*\/[0-9]*\).*/\1/p' <<< "$res"); lost=$(sed -n 's/.* callers_lost=\([0-9]*\).*/\1/p' <<< "$res")
+      [ "$nread" = 3/3 ] && echo "    functional $o: metrics read from 3/3 nodes" ||
+        echo "  FUNCTIONAL FAILED $o: metrics read from ${nread:-?} nodes (need 3/3)"
+      [ "$lost" = 0 ] && echo "    functional $o: no caller lost" ||
+        echo "  FUNCTIONAL FAILED $o: ${lost:-?} callers lost at the join"
       case $shape in
         l) rate=$RATE_L pct=90 ;;
         m) rate=${RATE_M:-$RATE_L} pct=90 ;;
@@ -211,12 +217,14 @@ run() { local rep=$1 arm=$2 shape=$3 k=$4 o=$1-$2-$3-k$4 sha=$A
             echo "  FUNCTIONAL FAILED $o: $drops subscriber streams dropped" ;;
         t256) [ -z "$RATE_L" ] && [ $k = 0 ] && RATE_L=$((ops / 2)) && echo "    RATE_L set to $RATE_L (half of $o's $ops ops/s)" ;;
       esac
-      # The last sample of each node's replica_following (one replica per node).
-      local notf; notf=$(awk '$3 ~ /^pigeonhole_replica_following/ {v[$2] = $4} END {n = 0; for (k in v) if (v[k] + 0 != 1) n++; print n + 0}' $OUT/$o.mx)
+      # The last sample of each node's replica_following (one replica per node); a node with
+      # no sample at all counts as not following.
+      local notf; notf=$(awk '$3 ~ /^pigeonhole_replica_following/ {v[$2] = $4} END {n = 0; c = 0; for (k in v) { c++; if (v[k] + 0 != 1) n++ }; print n + 3 - c}' $OUT/$o.mx)
       [ "$notf" -eq 0 ] && echo "    functional $o: every replica following in the last sample" ||
         echo "  FUNCTIONAL FAILED $o: $notf replicas not following in the last sample"
       if [ $k -gt 0 ]; then
-        local waits; waits=$(grep 'pigeonhole_cluster_replica_ack_wait_seconds_count' $OUT/$o.mx | tail -3 | awk '{s += $NF} END {print s + 0}')
+        # The counts in the last sample's lines (the last timestamp each node wrote), summed.
+        local waits; waits=$(grep 'pigeonhole_cluster_replica_ack_wait_seconds_count' $OUT/$o.mx | awk '{last[$2" "$3] = $NF} END {s = 0; for (k in last) s += last[k]; print s + 0}')
         [ "${waits%.*}" -gt 0 ] && echo "    functional $o: replica-ack waits counted ($waits in the last samples)" ||
           echo "  FUNCTIONAL FAILED $o: k=$k but no replica-ack wait counted"
       fi
@@ -225,7 +233,7 @@ run() { local rep=$1 arm=$2 shape=$3 k=$4 o=$1-$2-$3-k$4 sha=$A
   fi
   for p in "${pids[@]}"; do kill -CONT $p 2>/dev/null; kill $p 2>/dev/null; done
   for p in "${pids[@]}"; do
-    local k=0; while kill -0 $p 2>/dev/null && ((k < 30)); do sleep 1; k=$((k + 1)); done
+    local n=0; while kill -0 $p 2>/dev/null && ((n < 30)); do sleep 1; n=$((n + 1)); done
     kill -0 $p 2>/dev/null && kill -9 $p 2>/dev/null
   done
   wait 2>/dev/null

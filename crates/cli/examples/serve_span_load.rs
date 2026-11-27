@@ -30,12 +30,14 @@
 //! `--stall-pid PID --stall-at S --stall-for S` sends SIGSTOP to a node at S seconds into the
 //! measured phase and SIGCONT after the second S, so shares prepared just before stay in
 //! doubt, the feed holds them, and the resolver runs once the node is back (#2221's H shape;
-//! reported, not judged).
+//! reported, not judged). The signals keep their own timer, apart from the metrics reads.
 //!
 //! Before and after the measured phase it reads each node's `/metrics` through
 //! `Admin.Metrics`: the external-share counters (ICR 0148) as deltas, and, every second, the
-//! in-doubt gauges, keeping their peak. A run with spanning transactions whose prepares stay
-//! at 0 prints `FUNCTIONAL FAILED`.
+//! in-doubt gauges, keeping their peak. It prints `FUNCTIONAL FAILED` when a run with spanning
+//! transactions counts no prepare, when a node misses the before or after read (RESULT's
+//! `nodes_read`, the fewer of the two), or when a caller doesn't finish within 30 s of the
+//! phase's end (`callers_lost`: its operations aren't in the tally).
 //!
 //! The last line is `RESULT key=value ...`, for scripts.
 //!
@@ -740,6 +742,8 @@ struct External {
     evicted: u64,
     in_doubt: u64,
     in_doubt_bytes: u64,
+    /// How many nodes answered (`externals`); 1 for one node's read.
+    nodes: u64,
 }
 
 async fn external(ch: &tonic::transport::Channel) -> Result<External, tonic::Status> {
@@ -770,15 +774,26 @@ async fn external(ch: &tonic::transport::Channel) -> Result<External, tonic::Sta
             _ => {}
         }
     }
+    e.nodes = 1;
     Ok(e)
 }
 
-/// Every node's [`External`], summed; a node that doesn't answer (stopped) counts nothing.
+/// Every node's [`External`], read concurrently (1 s each) and summed. A node that doesn't
+/// answer (stopped, slow) counts nothing, and `nodes` says how many did.
 async fn externals(sh: &Shared) -> External {
+    let reads: Vec<_> = sh
+        .conns
+        .iter()
+        .map(|node| {
+            let ch = node[0].clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(1), external(&ch)).await
+            })
+        })
+        .collect();
     let mut sum = External::default();
-    for node in &sh.conns {
-        let read = tokio::time::timeout(Duration::from_secs(1), external(&node[0])).await;
-        if let Ok(Ok(e)) = read {
+    for read in reads {
+        if let Ok(Ok(Ok(e))) = read.await {
             sum.prepares += e.prepares;
             sum.commits += e.commits;
             sum.aborts += e.aborts;
@@ -786,6 +801,7 @@ async fn externals(sh: &Shared) -> External {
             sum.evicted += e.evicted;
             sum.in_doubt += e.in_doubt;
             sum.in_doubt_bytes += e.in_doubt_bytes;
+            sum.nodes += e.nodes;
         }
     }
     sum
@@ -1007,32 +1023,40 @@ async fn run(args: Args, load: Load) -> Result<(), Box<dyn std::error::Error>> {
     sh.measuring.store(true, Ordering::Relaxed);
     let started = Instant::now();
     let end = started + Duration::from_secs(args.seconds);
+    // The stall keeps its own timer, so the 1 s metrics loop (whose reads of the stopped node
+    // time out) can't delay the SIGCONT. 0: not yet stopped, 1: stopped, 2: resumed.
+    let stall_state = Arc::new(AtomicU64::new(0));
+    let staller =
+        if let (Some(pid), Some(at), Some(dur)) = (args.stall_pid, args.stall_at, args.stall_for) {
+            let state = Arc::clone(&stall_state);
+            let (at, dur) = (Duration::from_secs(at), Duration::from_secs(dur));
+            Some(tokio::spawn(async move {
+                tokio::time::sleep_until((started + at).into()).await;
+                stall(pid, "-STOP");
+                state.store(1, Ordering::SeqCst);
+                tokio::time::sleep_until((started + at + dur).into()).await;
+                stall(pid, "-CONT");
+                state.store(2, Ordering::SeqCst);
+            }))
+        } else {
+            None
+        };
     let mut peak = External::default();
-    let mut stalled = false;
-    let mut resumed = false;
     while Instant::now() < end {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let secs = started.elapsed().as_secs();
-        if let (Some(pid), Some(at), Some(dur)) = (args.stall_pid, args.stall_at, args.stall_for) {
-            if !stalled && secs >= at {
-                stall(pid, "-STOP");
-                stalled = true;
-            }
-            if stalled && !resumed && secs >= at + dur {
-                stall(pid, "-CONT");
-                resumed = true;
-            }
-        }
         let now = externals(&sh).await;
         peak.in_doubt = peak.in_doubt.max(now.in_doubt);
         peak.in_doubt_bytes = peak.in_doubt_bytes.max(now.in_doubt_bytes);
     }
     // A stall that hadn't ended by the phase's end ends now, before anything else.
-    if stalled
-        && !resumed
-        && let Some(pid) = args.stall_pid
-    {
-        stall(pid, "-CONT");
+    if let Some(staller) = staller {
+        staller.abort();
+        let _ = staller.await;
+        if stall_state.load(Ordering::SeqCst) == 1
+            && let Some(pid) = args.stall_pid
+        {
+            stall(pid, "-CONT");
+        }
     }
     sh.measuring.store(false, Ordering::Relaxed);
     let secs = started.elapsed().as_secs_f64();
@@ -1045,17 +1069,22 @@ async fn run(args: Args, load: Load) -> Result<(), Box<dyn std::error::Error>> {
     sh.stop.store(true, Ordering::Relaxed);
     pace_stop.store(true, Ordering::Relaxed);
     let skipped = pacer.map_or(0, |p| p.join().unwrap_or(0));
+    // One 30 s deadline for every caller to finish its last operation; one that doesn't (or
+    // panicked) loses its whole tally, so it's counted and reported.
     let mut tally = Tally::new();
+    let mut lost = 0u64;
+    let join_by = tokio::time::Instant::now() + Duration::from_secs(30);
     for t in tasks {
-        if let Ok(t) = tokio::time::timeout(Duration::from_secs(30), t).await {
-            tally.merge(&t?);
+        match tokio::time::timeout_at(join_by, t).await {
+            Ok(Ok(t)) => tally.merge(&t),
+            _ => lost += 1,
         }
     }
     // The counters once the last operations' decides have had a moment.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let after = externals(&sh).await;
     report(
-        &args, &load, &tally, secs, cpu, skipped, &seen, before, after, peak,
+        &args, &load, &tally, secs, cpu, skipped, lost, &seen, before, after, peak,
     );
     Ok(())
 }
@@ -1068,6 +1097,7 @@ fn report(
     secs: f64,
     cpu: f64,
     skipped: u64,
+    lost: u64,
     seen: &FeedSeen,
     before: External,
     after: External,
@@ -1152,6 +1182,19 @@ fn report(
     if skipped > 0 {
         println!("pacer: {skipped} operations skipped (the pacer itself was late)");
     }
+    let nodes = args.servers.len() as u64;
+    if before.nodes < nodes || after.nodes < nodes {
+        println!(
+            "FUNCTIONAL FAILED: metrics read from {}/{} nodes before and {}/{} after the phase",
+            before.nodes, nodes, after.nodes, nodes
+        );
+    }
+    if lost > 0 {
+        println!(
+            "FUNCTIONAL FAILED: {lost} callers didn't finish within 30 s of the phase's end; \
+             their operations aren't in the tally"
+        );
+    }
     if load.span_share > 0.0 && t.spanning.committed > 0 && prepares == 0 {
         println!(
             "FUNCTIONAL FAILED: {} spanning commits but no external prepare counted",
@@ -1169,7 +1212,8 @@ fn report(
          span_committed={} span_p50_us={} span_p99_us={} span_p999_us={} conflicts={} \
          unknown={} other={} unapplied={} cpu_us_per_op={:.1} events_per_sub={:.0} \
          lag_p50_us={} lag_p99_us={} dropped={} ext_prepares={} ext_commits={} ext_aborts={} \
-         feed_holds={} feed_evicted={} in_doubt_peak={} in_doubt_end={} skipped={}",
+         feed_holds={} feed_evicted={} in_doubt_peak={} in_doubt_end={} skipped={} \
+         nodes_read={}/{} callers_lost={}",
         if args.label.is_empty() {
             "-"
         } else {
@@ -1205,6 +1249,9 @@ fn report(
         d(after.evicted, before.evicted),
         peak.in_doubt,
         after.in_doubt,
-        skipped
+        skipped,
+        before.nodes.min(after.nodes),
+        nodes,
+        lost
     );
 }
