@@ -212,11 +212,13 @@ fn sessions_and_snapshots_live_on_their_own_partition_of_a_node() {
             );
         }
         assert_eq!(values, [b"1".to_vec()]);
-        // a holds, for this token: p3's committed transaction's record, p1's snapshot, and
-        // now a transaction on p1. That's a's cap of 3, across both partitions, so another
-        // on p3 is refused; b's p2 counts on its own.
+        // a holds, for this token: p1's snapshot, and now a transaction on p1, then one on
+        // p3. p3's committed transaction's record no longer counts (#2253), so that's a's cap
+        // of 3, across both partitions, and another on p3 is refused; b's p2 counts on its
+        // own.
         let _p1 = begin(c, "alice", None).await.unwrap();
-        let e = begin(b, "zed", None).await.unwrap_err();
+        let _p3 = begin(b, "zed", None).await.unwrap();
+        let e = begin(b, "zoe", None).await.unwrap_err();
         assert_eq!(code(&e), "Overloaded", "{e}");
         assert!(e.message().contains("per-token"), "{e}");
         begin(c, "hank", None).await.unwrap();

@@ -171,8 +171,9 @@ pub(crate) struct ServeArgs {
     /// compaction's version GC and blob GC.
     #[arg(long, value_name = "MS", default_value_t = 600_000)]
     pub snapshot_lifetime_ms: u64,
-    /// Sessions (transactions, pinned snapshots, and the tombstones of committed
-    /// transactions) held at once.
+    /// Sessions (open transactions, pinned snapshots and remote MCP sessions) held at once.
+    /// A committed transaction's record counts against the node's own bound instead
+    /// (131,072 records), so this doesn't cap a commit rate.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_sessions: usize,
     /// Sessions one token may hold at once.
