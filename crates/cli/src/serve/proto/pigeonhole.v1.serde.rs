@@ -7131,6 +7131,18 @@ impl serde::Serialize for FailoverEvent {
         if self.state != 0 {
             len += 1;
         }
+        if !self.fork_token.is_empty() {
+            len += 1;
+        }
+        if self.tail_state != 0 {
+            len += 1;
+        }
+        if self.from_history_epoch != 0 {
+            len += 1;
+        }
+        if self.from_epoch != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.FailoverEvent", len)?;
         if self.kind != 0 {
             let v = FailoverKind::try_from(self.kind)
@@ -7187,6 +7199,26 @@ impl serde::Serialize for FailoverEvent {
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.state)))?;
             struct_ser.serialize_field("state", &v)?;
         }
+        if !self.fork_token.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fork_token", pbjson::private::base64::encode(&self.fork_token).as_str())?;
+        }
+        if self.tail_state != 0 {
+            let v = TailState::try_from(self.tail_state)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.tail_state)))?;
+            struct_ser.serialize_field("tail_state", &v)?;
+        }
+        if self.from_history_epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("from_history_epoch", ToString::to_string(&self.from_history_epoch).as_str())?;
+        }
+        if self.from_epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("from_epoch", ToString::to_string(&self.from_epoch).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -7217,6 +7249,14 @@ impl<'de> serde::Deserialize<'de> for FailoverEvent {
             "to_epoch",
             "toEpoch",
             "state",
+            "fork_token",
+            "forkToken",
+            "tail_state",
+            "tailState",
+            "from_history_epoch",
+            "fromHistoryEpoch",
+            "from_epoch",
+            "fromEpoch",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7234,6 +7274,10 @@ impl<'de> serde::Deserialize<'de> for FailoverEvent {
             InDoubtCount,
             ToEpoch,
             State,
+            ForkToken,
+            TailState,
+            FromHistoryEpoch,
+            FromEpoch,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7268,6 +7312,10 @@ impl<'de> serde::Deserialize<'de> for FailoverEvent {
                             "inDoubtCount" | "in_doubt_count" => Ok(GeneratedField::InDoubtCount),
                             "toEpoch" | "to_epoch" => Ok(GeneratedField::ToEpoch),
                             "state" => Ok(GeneratedField::State),
+                            "forkToken" | "fork_token" => Ok(GeneratedField::ForkToken),
+                            "tailState" | "tail_state" => Ok(GeneratedField::TailState),
+                            "fromHistoryEpoch" | "from_history_epoch" => Ok(GeneratedField::FromHistoryEpoch),
+                            "fromEpoch" | "from_epoch" => Ok(GeneratedField::FromEpoch),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7300,6 +7348,10 @@ impl<'de> serde::Deserialize<'de> for FailoverEvent {
                 let mut in_doubt_count__ = None;
                 let mut to_epoch__ = None;
                 let mut state__ = None;
+                let mut fork_token__ = None;
+                let mut tail_state__ = None;
+                let mut from_history_epoch__ = None;
+                let mut from_epoch__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Kind => {
@@ -7392,6 +7444,36 @@ impl<'de> serde::Deserialize<'de> for FailoverEvent {
                             }
                             state__ = Some(map_.next_value::<FailoverState>()? as i32);
                         }
+                        GeneratedField::ForkToken => {
+                            if fork_token__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("forkToken"));
+                            }
+                            fork_token__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::TailState => {
+                            if tail_state__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("tailState"));
+                            }
+                            tail_state__ = Some(map_.next_value::<TailState>()? as i32);
+                        }
+                        GeneratedField::FromHistoryEpoch => {
+                            if from_history_epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fromHistoryEpoch"));
+                            }
+                            from_history_epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::FromEpoch => {
+                            if from_epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fromEpoch"));
+                            }
+                            from_epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(FailoverEvent {
@@ -7408,6 +7490,10 @@ impl<'de> serde::Deserialize<'de> for FailoverEvent {
                     in_doubt_count: in_doubt_count__.unwrap_or_default(),
                     to_epoch: to_epoch__.unwrap_or_default(),
                     state: state__.unwrap_or_default(),
+                    fork_token: fork_token__.unwrap_or_default(),
+                    tail_state: tail_state__.unwrap_or_default(),
+                    from_history_epoch: from_history_epoch__.unwrap_or_default(),
+                    from_epoch: from_epoch__.unwrap_or_default(),
                 })
             }
         }
@@ -14176,6 +14262,12 @@ impl serde::Serialize for LocalPartition {
         if self.replica_applied_position.is_some() {
             len += 1;
         }
+        if !self.fork_token.is_empty() {
+            len += 1;
+        }
+        if self.tail_kept.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -14315,6 +14407,14 @@ impl serde::Serialize for LocalPartition {
         if let Some(v) = self.replica_applied_position.as_ref() {
             struct_ser.serialize_field("replica_applied_position", v)?;
         }
+        if !self.fork_token.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fork_token", pbjson::private::base64::encode(&self.fork_token).as_str())?;
+        }
+        if let Some(v) = self.tail_kept.as_ref() {
+            struct_ser.serialize_field("tail_kept", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -14387,6 +14487,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "healthyReplicas",
             "replica_applied_position",
             "replicaAppliedPosition",
+            "fork_token",
+            "forkToken",
+            "tail_kept",
+            "tailKept",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -14427,6 +14531,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             AckedPosition,
             HealthyReplicas,
             ReplicaAppliedPosition,
+            ForkToken,
+            TailKept,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -14484,6 +14590,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "ackedPosition" | "acked_position" => Ok(GeneratedField::AckedPosition),
                             "healthyReplicas" | "healthy_replicas" => Ok(GeneratedField::HealthyReplicas),
                             "replicaAppliedPosition" | "replica_applied_position" => Ok(GeneratedField::ReplicaAppliedPosition),
+                            "forkToken" | "fork_token" => Ok(GeneratedField::ForkToken),
+                            "tailKept" | "tail_kept" => Ok(GeneratedField::TailKept),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14539,6 +14647,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut acked_position__ = None;
                 let mut healthy_replicas__ = None;
                 let mut replica_applied_position__ = None;
+                let mut fork_token__ = None;
+                let mut tail_kept__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -14789,6 +14899,20 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             replica_applied_position__ = map_.next_value()?;
                         }
+                        GeneratedField::ForkToken => {
+                            if fork_token__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("forkToken"));
+                            }
+                            fork_token__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::TailKept => {
+                            if tail_kept__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("tailKept"));
+                            }
+                            tail_kept__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -14828,6 +14952,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     acked_position: acked_position__,
                     healthy_replicas: healthy_replicas__.unwrap_or_default(),
                     replica_applied_position: replica_applied_position__,
+                    fork_token: fork_token__.unwrap_or_default(),
+                    tail_kept: tail_kept__,
                 })
             }
         }
@@ -30008,6 +30134,203 @@ impl<'de> serde::Deserialize<'de> for TabletsRequest {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.TabletsRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for TailKept {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.bytes != 0 {
+            len += 1;
+        }
+        if self.last_durable_seqno != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TailKept", len)?;
+        if self.bytes != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("bytes", ToString::to_string(&self.bytes).as_str())?;
+        }
+        if self.last_durable_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("last_durable_seqno", ToString::to_string(&self.last_durable_seqno).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for TailKept {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "bytes",
+            "last_durable_seqno",
+            "lastDurableSeqno",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Bytes,
+            LastDurableSeqno,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "bytes" => Ok(GeneratedField::Bytes),
+                            "lastDurableSeqno" | "last_durable_seqno" => Ok(GeneratedField::LastDurableSeqno),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = TailKept;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.TailKept")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<TailKept, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut bytes__ = None;
+                let mut last_durable_seqno__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Bytes => {
+                            if bytes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("bytes"));
+                            }
+                            bytes__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::LastDurableSeqno => {
+                            if last_durable_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("lastDurableSeqno"));
+                            }
+                            last_durable_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(TailKept {
+                    bytes: bytes__.unwrap_or_default(),
+                    last_durable_seqno: last_durable_seqno__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.TailKept", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for TailState {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Unspecified => "TAIL_STATE_UNSPECIFIED",
+            Self::None => "TAIL_STATE_NONE",
+            Self::Pending => "TAIL_STATE_PENDING",
+            Self::Done => "TAIL_STATE_DONE",
+            Self::Discarded => "TAIL_STATE_DISCARDED",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for TailState {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "TAIL_STATE_UNSPECIFIED",
+            "TAIL_STATE_NONE",
+            "TAIL_STATE_PENDING",
+            "TAIL_STATE_DONE",
+            "TAIL_STATE_DISCARDED",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = TailState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "TAIL_STATE_UNSPECIFIED" => Ok(TailState::Unspecified),
+                    "TAIL_STATE_NONE" => Ok(TailState::None),
+                    "TAIL_STATE_PENDING" => Ok(TailState::Pending),
+                    "TAIL_STATE_DONE" => Ok(TailState::Done),
+                    "TAIL_STATE_DISCARDED" => Ok(TailState::Discarded),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
     }
 }
 impl serde::Serialize for TextClause {
