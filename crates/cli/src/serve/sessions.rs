@@ -16,14 +16,19 @@
 //!   repeated `Commit` answers it until the tombstone expires. A transaction that expires
 //!   before any `Commit` leaves a marker for one idle lease, which answers
 //!   `TransactionExpired`; after that, the id is `NotFound`.
-//! - **Caps:** sessions in total and per token, tombstones and markers counted in.
+//! - **Caps:** sessions in total and per token: open transactions, pinned snapshots and MCP
+//!   sessions, what holds a snapshot, a read set or memory. A tombstone or a marker is a
+//!   small record kept only for a retry, so it gives its slot back and counts against
+//!   [`MAX_RECORDS`] per node instead, the oldest going first past it (#2253: counted in
+//!   the caps, they capped a token at ~2 commits a second).
 //! - **Remote MCP sessions** (`Mcp-Session-Id`, D313 §7 and ai1249's M1) live here too, with
 //!   leases of their own: bound to their token, never expired with a request in flight
 //!   (any number at once, unlike a transaction; the session caps its own), and counted in
 //!   the caps.
 
 use super::auth::Principal;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -90,7 +95,17 @@ struct Entry {
     /// What a range move's in-doubt watch needs of its writes (D331 PR 5): out of the entry
     /// with the transaction.
     watched: Watched,
+    /// Whether it holds a slot in the caps: until it becomes a record (a tombstone or a
+    /// marker, [`Table::become_record`]), which counts against [`MAX_RECORDS`] instead.
+    counted: bool,
 }
+
+/// The records (tombstones and markers) a node keeps at most, across its tables (#2253):
+/// past it, a table drops its own oldest. Sized to cover a whole default `--txn-idle-ms`
+/// (30 s) at about 4,000 commits a second (#2221 measured 2,500 to 2,900 per node), so a
+/// repeated `Commit` answers its outcome for the whole lease below that rate. A record is a
+/// few hundred bytes: some tens of MB at most.
+pub(crate) const MAX_RECORDS: usize = 1 << 17;
 
 /// A transaction's writes as D331 PR 5's in-doubt watch sees them (simp724's rule): the
 /// partition's watch sequence at its first write, and the moves whose watched ranges it
@@ -135,13 +150,28 @@ impl Entry {
 /// table on it: one per partition on a cluster node (D317 ticket 8a), whose caps stay the
 /// node's. The total and each principal's count are under one lock (cli692's Q2), taken
 /// inside a table's lock and never the other way round.
-#[derive(Default)]
-pub(crate) struct Caps(Mutex<Counts>);
+pub(crate) struct Caps(Mutex<Counts>, AtomicU64);
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self(
+            Mutex::new(Counts {
+                max_records: MAX_RECORDS,
+                ..Counts::default()
+            }),
+            AtomicU64::new(0),
+        )
+    }
+}
 
 #[derive(Default)]
 struct Counts {
     total: usize,
     per_principal: HashMap<Principal, usize>,
+    /// Records (tombstones and markers) on every table: out of `total`, bounded by
+    /// `max_records` ([`MAX_RECORDS`]; smaller in a test of the bound).
+    records: usize,
+    max_records: usize,
 }
 
 impl Caps {
@@ -174,7 +204,10 @@ impl Caps {
 
     /// A session of `principal`'s ended.
     fn give(&self, principal: Principal) {
-        let mut c = self.lock();
+        Self::give_in(&mut self.lock(), principal);
+    }
+
+    fn give_in(c: &mut Counts, principal: Principal) {
         c.total = c.total.saturating_sub(1);
         if let Some(n) = c.per_principal.get_mut(&principal) {
             *n -= 1;
@@ -183,19 +216,96 @@ impl Caps {
             }
         }
     }
+
+    /// A session of `principal`'s became a record: its slot goes back, and it counts as a
+    /// record. Whether the node is then past [`MAX_RECORDS`].
+    fn record(&self, principal: Principal) -> bool {
+        let mut c = self.lock();
+        Self::give_in(&mut c, principal);
+        c.records += 1;
+        c.records > c.max_records
+    }
+
+    /// A record went (its lease, or [`MAX_RECORDS`]). Whether the node is still past it.
+    fn unrecord(&self) -> bool {
+        let mut c = self.lock();
+        c.records = c.records.saturating_sub(1);
+        c.records > c.max_records
+    }
+
+    /// Caps whose record bound is `max` (a test of the bound: [`MAX_RECORDS`] is too many
+    /// to reach in one).
+    #[cfg(test)]
+    pub(crate) fn with_max_records(max: usize) -> Self {
+        let caps = Self::default();
+        caps.lock().max_records = max;
+        caps
+    }
+
+    /// Records dropped for [`MAX_RECORDS`] before their lease ended, since the node started:
+    /// each one a repeated `Commit` (or call on an expired transaction) answered `NotFound`
+    /// sooner than its lease.
+    pub(crate) fn records_dropped(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
 }
 
 struct Table {
     map: HashMap<Id, Entry>,
     /// The node's counts, which this table's sessions are part of.
     caps: Arc<Caps>,
+    /// This table's records in the order they became records, oldest first: what goes past
+    /// [`MAX_RECORDS`]. An id here may be gone already (its lease ended), and is passed over.
+    records: VecDeque<Id>,
 }
 
 impl Table {
     fn remove(&mut self, id: &Id) -> Option<Entry> {
         let e = self.map.remove(id)?;
-        self.caps.give(e.principal);
+        if e.counted {
+            self.caps.give(e.principal);
+        } else {
+            self.caps.unrecord();
+        }
         Some(e)
+    }
+
+    /// Session `id` became a record (a tombstone or a marker, #2253): it gives its slot in
+    /// the caps back and counts against [`MAX_RECORDS`]. Past that, this table drops its own
+    /// oldest records, never `id` itself, so a node keeps at most the bound plus one record
+    /// per table, and no table reaches into another's lock.
+    fn become_record(&mut self, id: &Id) {
+        let Some(e) = self.map.get_mut(id) else {
+            return;
+        };
+        if !e.counted {
+            return;
+        }
+        e.counted = false;
+        let mut over = self.caps.record(e.principal);
+        // Ids whose lease ended since: the queue stays about as long as the records.
+        while let Some(old) = self.records.front() {
+            if self.map.get(old).is_some_and(|e| !e.counted) {
+                break;
+            }
+            self.records.pop_front();
+        }
+        self.records.push_back(*id);
+        while over {
+            let Some(old) = self.records.front().copied() else {
+                break;
+            };
+            if old == *id {
+                break;
+            }
+            self.records.pop_front();
+            if !self.map.get(&old).is_some_and(|e| !e.counted) {
+                continue;
+            }
+            self.map.remove(&old);
+            self.caps.1.fetch_add(1, Ordering::Relaxed);
+            over = self.caps.unrecord();
+        }
     }
 
     /// Expires `id` if its lease has lapsed: an open transaction becomes its marker (the
@@ -213,6 +323,7 @@ impl Table {
             e.renewed = now;
             e.idle = leases.txn_idle;
             e.hard = now + leases.txn_idle;
+            self.become_record(id);
         } else {
             self.remove(id);
         }
@@ -278,6 +389,7 @@ impl Sessions {
             table: Mutex::new(Table {
                 map: HashMap::new(),
                 caps,
+                records: VecDeque::new(),
             }),
             leases,
             reaper: Once::new(),
@@ -373,6 +485,7 @@ impl Sessions {
                 xid,
                 span,
                 watched: Watched::default(),
+                counted: true,
             },
         );
         Ok(())
@@ -810,18 +923,23 @@ impl Sessions {
     ) {
         let now = Instant::now();
         let mut t = self.lock();
+        let mut lost = false;
         if let Some(e) = t.map.get_mut(id) {
             e.busy = 0;
             e.wrote |= wrote;
             e.span = span;
             e.watched = watched;
             e.renew(now);
+            lost = txn.is_none();
             e.state = match txn {
                 Some(txn) => State::Txn(Some(txn)),
                 // A call that panicked with the transaction lost it before any Commit: nothing
                 // was written.
                 None => State::Expired,
             };
+        }
+        if lost {
+            t.become_record(id);
         }
     }
 
@@ -833,7 +951,13 @@ impl Sessions {
             e.state = State::Done(outcome);
             e.renew(now);
             e.hard = e.hard.max(now + e.idle);
+            t.become_record(id);
         }
+    }
+
+    /// The node's records dropped for [`MAX_RECORDS`] (every table shares one count).
+    pub(crate) fn records_dropped(&self) -> u64 {
+        self.lock().caps.records_dropped()
     }
 
     fn remove(&self, id: &Id) {
@@ -1185,6 +1309,94 @@ mod tests {
             Ok(Taken::Done(_)) => panic!("a tombstone"),
             Err(e) => panic!("{e:?}"),
         }
+    }
+
+    /// Begins and commits a transaction for `who` on `s`, recording a committed outcome.
+    fn committed(s: &Arc<Sessions>, db: &Pigeonhole, who: Principal) -> String {
+        let id = s.begin(who, db.transaction().unwrap(), None).unwrap();
+        let (txn, _, ticket) = open(s.take(&id, who)).commit();
+        drop(txn);
+        ticket.finish(Ok(Default::default()));
+        id
+    }
+
+    /// #2253: a committed transaction's tombstone gives its slot back, so one token commits
+    /// far past its cap (3 here) within one idle lease, and every tombstone still answers its
+    /// outcome. The caps still hold what's open: a fourth open transaction is refused.
+    #[test]
+    fn a_token_commits_past_its_cap_and_each_tombstone_answers() {
+        let (db, dir) = db("records");
+        let s = Sessions::sharing(leases(), None, Arc::default());
+        let ids: Vec<String> = (0..40).map(|_| committed(&s, &db, p(1))).collect();
+        for id in &ids {
+            assert!(
+                matches!(s.take(id, p(1)), Ok(Taken::Done(Ok(_)))),
+                "the outcome of {id}"
+            );
+        }
+        let held: Vec<String> = (0..3)
+            .map(|_| s.begin(p(1), db.transaction().unwrap(), None).unwrap())
+            .collect();
+        let e = s.begin(p(1), db.transaction().unwrap(), None).unwrap_err();
+        assert_eq!(e.code, "Overloaded", "{e:?}");
+        assert_eq!(s.stats(Instant::now()).tombstones, 40);
+        assert_eq!(s.records_dropped(), 0);
+        drop(held);
+        drop(s);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2253: past the node's record bound (4 here), a table drops its own oldest record
+    /// first: its id then answers `NotFound`, the newer ones their outcomes, and the drop is
+    /// counted. Shared caps bound records across a node's tables.
+    #[test]
+    fn past_the_record_bound_the_oldest_tombstone_goes_first() {
+        let (db, dir) = db("bound");
+        let caps = Arc::new(Caps::with_max_records(4));
+        let s = Sessions::sharing(leases(), None, Arc::clone(&caps));
+        let ids: Vec<String> = (0..6).map(|_| committed(&s, &db, p(1))).collect();
+        for id in &ids[..2] {
+            let e = s.take(id, p(1)).err().expect("dropped for the bound");
+            assert_eq!(e.code, "NotFound", "{id}: {e:?}");
+        }
+        for id in &ids[2..] {
+            assert!(
+                matches!(s.take(id, p(1)), Ok(Taken::Done(Ok(_)))),
+                "the outcome of {id}"
+            );
+        }
+        assert_eq!(s.records_dropped(), 2);
+        assert_eq!(s.stats(Instant::now()).tombstones, 4);
+        drop(s);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2253: an expired transaction's marker gives its slot back too: the token opens as
+    /// many again at once, while the marker still answers `TransactionExpired`.
+    #[test]
+    fn an_expired_transactions_marker_holds_no_slot() {
+        let (db, dir) = db("marker");
+        let mut l = leases();
+        l.txn_idle = Duration::from_millis(1);
+        let s = Sessions::sharing(l, None, Arc::default());
+        let gone: Vec<String> = (0..3)
+            .map(|_| s.begin(p(1), db.transaction().unwrap(), None).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(20));
+        // Each call checks expiry first: the transaction becomes its marker.
+        for id in &gone {
+            let e = s.take(id, p(1)).err().expect("expired");
+            assert_eq!(e.code, "TransactionExpired", "{e:?}");
+        }
+        let again: Vec<String> = (0..3)
+            .map(|_| s.begin(p(1), db.transaction().unwrap(), None).unwrap())
+            .collect();
+        assert_eq!(again.len(), 3);
+        drop(s);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

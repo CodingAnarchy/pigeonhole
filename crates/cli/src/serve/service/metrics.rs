@@ -323,6 +323,20 @@ pub(crate) fn render_sessions(out: &mut String, tables: &[&super::super::session
     ] {
         let _ = writeln!(out, "pigeonhole_serve_sessions{{kind=\"{kind}\"}} {n}");
     }
+    // Records (tombstones and markers) dropped for the node's bound before their lease
+    // ended (#2253): a retried `Commit` answered `NotFound` sooner. The caps are the node's,
+    // so any table gives the count.
+    if let Some(t) = tables.first() {
+        let _ = writeln!(
+            out,
+            "# TYPE pigeonhole_serve_session_records_dropped_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "pigeonhole_serve_session_records_dropped_total {}",
+            t.records_dropped()
+        );
+    }
     let _ = writeln!(out, "# TYPE pigeonhole_serve_oldest_session_seconds gauge");
     let _ = writeln!(
         out,
