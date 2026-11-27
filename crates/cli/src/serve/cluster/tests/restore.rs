@@ -108,6 +108,7 @@ fn a_restore_puts_the_backup_back_at_new_epochs_and_old_tokens_expire() {
             data(a)
                 .await
                 .mutate(MutateRequest {
+                    replication: 0,
                     writes: Some(cells_row(r.as_bytes(), &[3], 100 + i as u64)),
                     durability: 0,
                 })
@@ -172,6 +173,7 @@ fn a_restore_puts_the_backup_back_at_new_epochs_and_old_tokens_expire() {
         data(a)
             .await
             .mutate(MutateRequest {
+                replication: 0,
                 writes: Some(cells_row(b"after", &[3], 200)),
                 durability: 0,
             })
@@ -600,6 +602,7 @@ async fn put_row(port: u16, row: &str, tag: u64) {
     data(port)
         .await
         .mutate(MutateRequest {
+            replication: 0,
             writes: Some(cells_row(row.as_bytes(), &[3], tag)),
             durability: 0,
         })

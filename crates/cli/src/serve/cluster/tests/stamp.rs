@@ -604,6 +604,7 @@ fn relocate_copy_refuses_a_copy_that_isnt_the_old_nodes_closed_files() {
             data(b)
                 .await
                 .mutate(crate::serve::proto::MutateRequest {
+                    replication: 0,
                     writes: Some(put_row("alice", "2")),
                     durability: 0,
                 })

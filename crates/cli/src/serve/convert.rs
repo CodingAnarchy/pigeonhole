@@ -37,6 +37,8 @@ pub(crate) fn commit_info(c: pigeonhole::CommitInfo) -> proto::CommitInfo {
     proto::CommitInfo {
         seqno: c.seqno,
         durability: durability_out(c.durability),
+        // D335: set once the write's replica acknowledgements are in (`Service::call`).
+        replica_acks: 0,
     }
 }
 

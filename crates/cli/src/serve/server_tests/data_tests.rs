@@ -112,6 +112,7 @@ fn grpc_covers_the_data_writes() {
     };
     let cm = |c: &mut DataClient<_>| {
         let req = proto::CheckAndMutateRequest {
+            replication: 0,
             writes: Some(row("job", vec![put("lock", b"me")])),
             condition: Some(absent.clone()),
             durability: 0,
@@ -123,6 +124,7 @@ fn grpc_covers_the_data_writes() {
     assert!(!second.applied && second.commit.is_none());
     // Batch across rows.
     let batch = proto::BatchRequest {
+        replication: 0,
         rows: vec![
             row("a", vec![put("x", b"1")]),
             row("b", vec![put("x", b"2")]),
@@ -139,6 +141,7 @@ fn grpc_covers_the_data_writes() {
     // MutateReturning hands back the counter after the commit.
     for want in [3, 5] {
         let req = proto::MutateRequest {
+            replication: 0,
             writes: Some(row("ctr", vec![incr(if want == 3 { 3 } else { 2 })])),
             durability: 0,
         };
@@ -189,6 +192,7 @@ fn a_wide_row_reads_in_pages_cut_by_bytes() {
         writes,
     };
     s.block_on(c.mutate(proto::MutateRequest {
+        replication: 0,
         writes: Some(rw),
         durability: 0,
     }))
@@ -345,6 +349,7 @@ fn a_write_whose_client_went_away_still_commits() {
     s.block_on(service.call(get(), &Caller::anonymous(), None))
         .unwrap();
     let write = ServiceOp::Mutate(proto::MutateRequest {
+        replication: 0,
         writes: Some(proto::RowWrites {
             row: Some(proto::RowKey {
                 table: "t".into(),
@@ -490,6 +495,7 @@ fn a_limit_holds_when_the_row_a_position_is_inside_is_deleted() {
     // That row is deleted before the next page (no snapshot_id): the resumed page asks for
     // one row more than remain, and every row it brings is new (simp724's B1 on #1510).
     s.block_on(c.mutate(proto::MutateRequest {
+        replication: 0,
         writes: Some(proto::RowWrites {
             row: Some(proto::RowKey {
                 table: "t".into(),
@@ -989,6 +995,7 @@ fn aggregate_rows(
     };
     let mut mutate = |row: &[u8], writes: Vec<proto::Write>| {
         s.block_on(c.mutate(proto::MutateRequest {
+            replication: 0,
             writes: Some(proto::RowWrites {
                 row: Some(proto::RowKey {
                     table: "agg".into(),
@@ -1418,6 +1425,7 @@ fn grpc_health_reserves_nothing_and_refuses_a_long_message() {
 /// One write to `row` of `table`: each value into `q:x` and `r:x`, two aggregate columns.
 fn grow_put(table: &str, row: &str, values: &[f64]) -> proto::MutateRequest {
     proto::MutateRequest {
+        replication: 0,
         writes: Some(proto::RowWrites {
             row: Some(proto::RowKey {
                 table: table.into(),

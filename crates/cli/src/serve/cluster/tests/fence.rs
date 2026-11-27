@@ -11,6 +11,7 @@ async fn try_put(port: u16, row: &str, value: &str) -> Result<(), tonic::Status>
     data(port)
         .await
         .mutate(crate::serve::proto::MutateRequest {
+            replication: 0,
             writes: Some(put_row(row, value)),
             durability: 0,
         })
@@ -405,6 +406,7 @@ fn a_table_created_during_an_operators_fence_is_there_once_unfenced() {
         data(a)
             .await
             .mutate(crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(w),
                 durability: 0,
             })
@@ -3742,6 +3744,7 @@ async fn put_as(
         .await
         .mutate(with(
             crate::serve::proto::MutateRequest {
+                replication: 0,
                 writes: Some(put_row(row, value)),
                 durability: 0,
             },

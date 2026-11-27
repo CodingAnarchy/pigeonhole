@@ -156,6 +156,8 @@ impl Service {
         if !r.rows.is_empty() && !caller.scope.allows(Scope::Write) {
             return Err(ApiError::permission_denied("commit writes"));
         }
+        let asked_async =
+            caller.replication_async || r.replication == proto::ReplicationMode::Async as i32;
         let rows = self.txn_rows(&r.rows).await?;
         let mut g = match self.sessions.take(&r.txn_id, caller.principal)? {
             Taken::Open(g) => g,
@@ -182,7 +184,26 @@ impl Service {
             convert::txn_apply(g.txn(), table, row, ops);
         }
         drop(rows);
+        // D335: a commit that writes on a partition whose map sets `replica_acks` waits
+        // for that many replicas before its outcome is recorded, so a repeated `Commit` or
+        // `Outcome` never reads it as acknowledged sooner. Refused at admission while too
+        // few replicas are healthy (the transaction stays open), and raised to `GroupSync`.
+        let waits = match (&held, &self.gate, &self.part) {
+            (Some(_), Some(gate), Some(part)) if part.acks.k() > 0 && !asked_async => {
+                part.acks.admit(gate.partition())?;
+                Some((Arc::clone(&part.acks), Arc::clone(gate)))
+            }
+            _ => None,
+        };
         let (txn, durability, ticket) = g.commit();
+        let durability = match durability {
+            Some(pigeonhole::Durability::None | pigeonhole::Durability::Buffered)
+                if waits.is_some() =>
+            {
+                Some(pigeonhole::Durability::GroupSync)
+            }
+            d => d,
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
@@ -199,12 +220,22 @@ impl Service {
             };
             // A commit that returned past the partition's lease is unknown (D326), and a
             // retry of it finds the same.
+            let mut outcome = outcome.map(convert::commit_info);
+            if let (Ok(c), Some((acks, gate))) = (&mut outcome, &waits) {
+                match acks
+                    .wait(crate::serve::acks::Pos::commit(c.seqno), gate)
+                    .await
+                {
+                    Ok(n) => c.replica_acks = n,
+                    Err(e) => outcome = Err(e),
+                }
+            }
             let outcome = match (outcome, &held) {
                 (Ok(c), Some(h)) => h.committed().map(|()| c),
                 (o, _) => o,
             };
             ticket.finish(outcome.clone().map(|c| proto::TxnCommitResponse {
-                commit: Some(convert::commit_info(c)),
+                commit: Some(c),
                 parts: Vec::new(),
             }));
             drop(budget);
@@ -219,7 +250,7 @@ impl Service {
             ))
         })?;
         Ok(proto::TxnCommitResponse {
-            commit: Some(convert::commit_info(outcome)),
+            commit: Some(outcome),
             parts: Vec::new(),
         })
     }

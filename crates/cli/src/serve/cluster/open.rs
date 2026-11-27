@@ -761,7 +761,21 @@ impl Node {
             );
             let parts = Arc::new(parts);
             tokio::task::spawn_blocking(move || {
-                node.arm_ranges(&gate, &id, epoch, &db, || slot.store(parts))
+                // D335: its replica acks from the map before it joins, under the install
+                // lock: an install either ran before (its map is read here) or sees it.
+                let acks = parts
+                    .get(&id)
+                    .and_then(|s| s.part_opt().map(|p| Arc::clone(&p.acks)));
+                node.arm_ranges(&gate, &id, epoch, &db, || {
+                    if let (Some(acks), Ok(map)) = (acks, node.get_map()) {
+                        acks.configure(crate::serve::acks::AckConfig::of(
+                            &map,
+                            &id,
+                            node.peers.replica_ack_timeout,
+                        ));
+                    }
+                    slot.store(parts)
+                })
             })
             .await?
             .map_err(|e| ApiError::internal(format!("partition's range gate: {e}")))?;
