@@ -137,6 +137,57 @@ fn a_connection_past_the_cap_is_closed_and_counted() {
     assert_eq!(conns.open(), 2, "the gRPC channel holds the other slot");
 }
 
+/// #2262: a gRPC client past the cap is refused with `Unavailable`, at once, on every call.
+/// Before, the connection was closed with no protocol answer: tonic's channel failed its
+/// calls with `Unknown` or `Cancelled`, and now and then parked one while it reconnected,
+/// until another request on the same channel woke it.
+#[test]
+fn a_grpc_client_past_the_cap_is_refused_at_once_with_unavailable() {
+    let s = capped(1, Duration::from_secs(5));
+    let mut held = connect(&s);
+    health(&mut held);
+    wait_open(&s, 1);
+    let url = s.url.clone();
+    let (answers, parked) = s.block_on(async move {
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .unwrap()
+            .connect_lazy();
+        let mut c = DataClient::new(channel);
+        let mut answers = std::collections::BTreeMap::<String, u32>::new();
+        let mut parked = 0u32;
+        // Calls one after another for 2 s, each bounded: a parked call shows as a timeout.
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < until && parked < 3 {
+            let get = c.get(proto::GetRequest {
+                table: "t".into(),
+                row: b"r".to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            });
+            match tokio::time::timeout(Duration::from_millis(500), get).await {
+                Ok(Ok(_)) => *answers.entry("served".to_owned()).or_default() += 1,
+                Ok(Err(st)) => *answers.entry(format!("{:?}", st.code())).or_default() += 1,
+                Err(_) => parked += 1,
+            }
+        }
+        (answers, parked)
+    });
+    assert_eq!(
+        parked,
+        0,
+        "calls parked past 500 ms; answers {answers:?}; {}",
+        counts(&s)
+    );
+    assert_eq!(
+        answers.keys().collect::<Vec<_>>(),
+        ["Unavailable"],
+        "{answers:?}; {}",
+        counts(&s)
+    );
+    drop(held);
+}
+
 /// cli692's D1 on the design: a connection that sends nothing is dropped after
 /// `--request-timeout-ms`, freeing its slot. The deadline ends at the first byte: an HTTP/2
 /// connection that sent its preface and then idles is kept.
