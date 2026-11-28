@@ -412,6 +412,20 @@ impl RangeState {
         self.check_keys(write, &mut |f| op.touches(f))
     }
 
+    /// [`check`](Self::check) of rows written by name, each `(table, row)`: an old owner's
+    /// replayed tail commit (D336 PR 3a, ICR 0147), which no call carries.
+    pub(crate) fn check_rows<'r>(
+        &self,
+        rows: impl Iterator<Item = (&'r str, &'r [u8])> + Clone,
+    ) -> Result<(), ApiError> {
+        self.check_keys(true, &mut |f| {
+            for (table, row) in rows.clone() {
+                f(table, Touch::Row(row))?;
+            }
+            ControlFlow::Continue(())
+        })
+    }
+
     /// [`check`](Self::check) of a read's keys taken before it ran ([`Touched`]), after it
     /// (#2160): a range handed over since is refused.
     pub(crate) fn check_touched(&self, touched: &Touched) -> Result<(), ApiError> {

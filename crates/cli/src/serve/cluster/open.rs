@@ -546,6 +546,13 @@ impl Node {
         if open_now.contains_key(id) || copies_now.contains_key(id) {
             return Ok(());
         }
+        // D336 PR 3a: the file is an old owner's, open as a tail source; the map never
+        // places the partition here while its tail is pending (Amendment 2's M1).
+        if self.tail_sources.holds(id) {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {id}'s file here is open as the source of a tail replay"
+            )));
+        }
         let map = self.get_map()?;
         let epoch = match map.partitions.iter().find(|p| p.id == id) {
             Some(p) if replica && p.replicas.contains(&self.id) => p.epoch,

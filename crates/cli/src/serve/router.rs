@@ -534,6 +534,7 @@ impl Router {
         // D331 PR 4b: the range moves followed here, and copies refused for the cap.
         cluster.range_follows.render_metrics(&mut text);
         cluster.range_copies.render_metrics(&mut text);
+        cluster.node.replays.render_metrics(&mut text);
         cluster.node.render_balancer_metrics(&mut text);
         text
     }

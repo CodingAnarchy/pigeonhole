@@ -18,6 +18,11 @@ impl ClusterGrpc {
 
 pub(super) const READERS: &[Scope] = &[Scope::Read, Scope::Cluster];
 
+/// `Cluster.ReadTail` and `Cluster.ReplayTail`'s paths (D336 PR 3a): each on a route of its
+/// own, outside the `Cluster` calls' small limit, as a memory watch's is.
+pub(super) const READ_TAIL: &str = "/pigeonhole.v1.Cluster/ReadTail";
+const REPLAY_TAIL: &str = "/pigeonhole.v1.Cluster/ReplayTail";
+
 impl ClusterGrpc {
     /// Partition `id`'s line of `Status`.
     async fn local(&self, id: &str) -> Result<LocalPartition, ApiError> {
@@ -106,6 +111,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 &r.xid,
                 None,
                 shared.limits.request_timeout,
+                false,
             )
             .await;
             // A home that answers UNKNOWN (its history changed) can't settle the share: the
@@ -444,6 +450,49 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Box<dyn futures_core::Stream<Item = Result<proto::FeedEvent, Status>> + Send>,
     >;
 
+    type ReadTailStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<proto::ReadTailEvent, Status>> + Send>,
+    >;
+
+    /// Node to node (D336 PR 3a): this node's old file of a partition, as the source of its
+    /// tail's replay ([`tail_source`](super::tail_source)). Cluster scope; under a
+    /// `--max-streams` place, on a route of its own outside the `Cluster` calls' small limit,
+    /// since a tail may take a while to read.
+    async fn read_tail(
+        &self,
+        req: Request<proto::ReadTailRequest>,
+    ) -> Result<tonic::Response<Self::ReadTailStream>, Status> {
+        self.caller(&req, &[Scope::Cluster], "read an old owner's tail")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let slot = shared.router.service.stream_slot()?;
+        let tail = self.0.read_tail(req.into_inner(), slot).await?;
+        Ok(tonic::Response::new(Box::pin(
+            crate::serve::grpc::GrpcStream(tail),
+        )))
+    }
+
+    /// `phdb cluster replay-tail P` (D336 PR 3a), on P's owner: replays an old owner's tail
+    /// into P ([`tail_replay`](super::tail_replay)), and answers P's line of `Status` with its
+    /// progress. Admin scope, or a node's cluster token (the map's writer's automatic
+    /// replay). On a route of its own, outside the `Cluster` calls' small limit: it waits up
+    /// to its timeout.
+    async fn replay_tail(
+        &self,
+        req: Request<proto::ReplayTailRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(
+            &req,
+            &[Scope::Admin, Scope::Cluster],
+            "replay an old owner's tail",
+        )?;
+        let r = req.into_inner();
+        let id = r.partition.clone();
+        self.0.replay_tail(r).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
+    }
+
     /// Served by a route of its own ([`feed::ForwardSubscribeGrpc`]), ahead of this one.
     async fn forward_subscribe(
         &self,
@@ -699,7 +748,9 @@ pub(crate) fn routes(
     match streams {
         Some((feeds, watches, loads)) => app
             .route_service(feed::FORWARD_SUBSCRIBE, feeds)
-            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches)
+            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches.clone())
+            .route_service(READ_TAIL, watches.clone())
+            .route_service(REPLAY_TAIL, watches)
             .route_service(crate::serve::grpc::FORWARD_BULK_LOAD, loads),
         None => app,
     }

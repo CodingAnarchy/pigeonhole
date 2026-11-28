@@ -93,6 +93,49 @@ fn fork_row(epoch: u64) -> Vec<u8> {
 
 const FORK: &[u8] = b"token";
 
+/// The epochs of the promotes' fork rows in `db` (D336 PR 3a): what [`drop_forks`] may take.
+pub(crate) fn fork_epochs(db: &Pigeonhole) -> Result<Vec<u64>, String> {
+    let table = match db.table(TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {TABLE}: {e}")),
+    };
+    let mut out = Vec::new();
+    for row in table
+        .scan_prefix(b"fork/")
+        .family(FAMILY)
+        .iter()
+        .map_err(|e| format!("read {TABLE}: {e}"))?
+    {
+        let row = row.map_err(|e| format!("read {TABLE}: {e}"))?;
+        if let Some(e) = std::str::from_utf8(&row.key()[b"fork/".len()..])
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// Deletes the fork rows at `epochs` in one commit (D336 PR 3a): once a promote's tail
+/// leaves PENDING, or never was, its token is no longer needed (Amendment 4).
+pub(crate) fn drop_forks(db: &Pigeonhole, epochs: &[u64]) -> Result<(), String> {
+    if epochs.is_empty() {
+        return Ok(());
+    }
+    let table = db
+        .table(TABLE)
+        .and_then(|t| t.open())
+        .map_err(|e| format!("open {TABLE}: {e}"))?;
+    let mut b = db.write_batch();
+    for e in epochs {
+        b.delete_column(&table, &fork_row(*e), FAMILY, FORK);
+    }
+    b.commit().map_err(|e| format!("write {TABLE}: {e}"))?;
+    Ok(())
+}
+
 /// [`write`]'s checks: the same cluster and partition, and an epoch that never falls.
 fn check_write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
     if let Some(old) = read(db)? {

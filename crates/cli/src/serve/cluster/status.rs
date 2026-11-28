@@ -119,6 +119,19 @@ impl Node {
                 partitions.push(lp);
                 continue;
             }
+            // An old owner's file open as a tail source (D336 PR 3a): no read of the file,
+            // which the source holds.
+            if let Some((h, epoch, bytes)) = self.tail_sources.shown(&named) {
+                lp.role = proto::PartitionRole::TailSource as i32;
+                lp.epoch = epoch;
+                lp.tail_kept = Some(proto::TailKept {
+                    bytes: bytes.unwrap_or_default(),
+                    last_durable_seqno: self.tail_sources.end(&named, h, epoch).unwrap_or(0),
+                });
+                lp.ok = true;
+                partitions.push(lp);
+                continue;
+            }
             // A partition being opened: no read of its file, whose read-only open would refuse
             // the node's own open (#1770). It shows as opening.
             if self.fences.is_opening(&named) {
@@ -188,6 +201,41 @@ impl Node {
                 in_doubt(&mut lp, &part.db, &named, spanning.as_deref());
             }
             partitions.push(lp);
+        }
+        // D336: a closed file a PENDING tail names as its old owner's is kept for the
+        // replay, not misplaced (Amendment 2's M3): its bytes, and its last durable seqno
+        // once a source open recovered it.
+        if let Some(m) = &map {
+            for lp in partitions.iter_mut().filter(|lp| lp.role == 0) {
+                let Some(e) = m.failovers.iter().find(|e| {
+                    e.kind() == proto::FailoverKind::Partition
+                        && e.partition == lp.id
+                        && e.from == self.id
+                        && e.from_epoch == lp.epoch
+                        && e.tail_state() == proto::TailState::Pending
+                }) else {
+                    continue;
+                };
+                if m.partitions
+                    .iter()
+                    .any(|p| p.id == lp.id && p.node == self.id)
+                {
+                    continue;
+                }
+                lp.tail_kept = Some(proto::TailKept {
+                    bytes: std::fs::metadata(self.dir.join(&lp.file)).map_or(0, |md| md.len()),
+                    last_durable_seqno: self
+                        .tail_sources
+                        .end(&lp.id, e.from_history_epoch, e.from_epoch)
+                        .unwrap_or(0),
+                });
+                lp.error.clear();
+                lp.ok = true;
+            }
+        }
+        // D336: an owner's replay of an old owner's tail, the last one here.
+        for lp in &mut partitions {
+            lp.replay = self.replays.shown(&lp.id);
         }
         // Partitions the map places here with no file in DIR: what an operator most needs
         // to see before the node serves them (cli692's N1).
@@ -443,7 +491,7 @@ pub(crate) fn build_features(dir: &std::path::Path) -> Vec<String> {
 /// and D333 punches it with the length kept, so a partition split for size would be split
 /// again every dwell. The file's length if the engine can't say (that's what was reported
 /// before).
-fn used_bytes(db: &pigeonhole::Pigeonhole) -> u64 {
+pub(super) fn used_bytes(db: &pigeonhole::Pigeonhole) -> u64 {
     match db.info() {
         Ok(info) => info.file_bytes.saturating_sub(info.free_bytes.unwrap_or(0)),
         // The path the database opened, not one built from the id (CodeQL on #2103).

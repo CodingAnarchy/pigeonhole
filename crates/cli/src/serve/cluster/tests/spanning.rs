@@ -848,6 +848,7 @@ fn a_spanning_transactions_outcome_is_its_tokens_alone_while_its_session_lasts()
             op: Some(forward_request::Op::ResolveTxn(ResolveTxn {
                 xid: id.clone(),
                 acked: String::new(),
+                read_only: false,
             })),
             ..Default::default()
         };
@@ -1376,5 +1377,78 @@ fn a_spanning_transaction_on_a_partition_with_replica_acks_is_refused_unless_opt
         for (row, v) in [("alice", "1"), ("zoe", "2")] {
             assert_eq!(get_row(c, row).await.unwrap(), Some(v.as_bytes().to_vec()));
         }
+    });
+}
+
+#[test]
+fn a_read_only_resolve_of_an_absent_decision_row_answers_unknown_and_records_nothing() {
+    // D336 PR 3a (Amendment 5's (a), the coordinator's test): an old owner's tail replay asks
+    // the home with `read_only`, which reads the decision row alone. For an id with no row,
+    // no session, and the home's history unchanged, the resolver's own ask records an abort;
+    // the read-only ask answers UNKNOWN and writes no marker, before and after.
+    use super::super::proto::{
+        ForwardRequest, ResolveTxn, TxnOutcomeState as St, forward_request, forward_response,
+    };
+    let all = format!("write t0ken-a\ncluster {NODE_TOKEN}\n");
+    let t = Three::start([&all, &all, &all]);
+    let [_, b, c] = t.ports;
+    t.rt.block_on(async {
+        let r = super::super::proto::BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        };
+        let live = txns(c)
+            .await
+            .begin(with(r, Some("t0ken-a")))
+            .await
+            .unwrap()
+            .into_inner()
+            .txn_id;
+        // An id the home gave no session: begun a second ago, at the home's history epoch.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = forged(&live, now - 1_000, None);
+        let resolve = |read_only: bool| {
+            let id = id.clone();
+            async move {
+                let req = ForwardRequest {
+                    partition: "p2".into(),
+                    op: Some(forward_request::Op::ResolveTxn(ResolveTxn {
+                        xid: id,
+                        acked: String::new(),
+                        read_only,
+                    })),
+                    ..Default::default()
+                };
+                let reply =
+                    super::super::proto::cluster_client::ClusterClient::new(channel(b).await)
+                        .forward(with(req, Some(NODE_TOKEN)))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                match reply.reply {
+                    Some(forward_response::Reply::ResolveTxn(r)) => r,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        for _ in 0..2 {
+            let r = resolve(true).await;
+            assert_eq!(r.state(), St::Unknown, "{r:?}");
+            assert_eq!(decision_row(&t.dbs[1], &id), None, "nothing recorded");
+        }
+        // The resolver's own ask, by contrast, records the abort the read-only one doesn't.
+        let r = resolve(false).await;
+        assert_eq!(r.state(), St::Aborted, "{r:?}");
+        assert!(
+            decision_row(&t.dbs[1], &id).is_some_and(|v| v.starts_with(b"aborted ")),
+            "{:?}",
+            decision_row(&t.dbs[1], &id)
+        );
+        // And the read-only ask then reads it.
+        assert_eq!(resolve(true).await.state(), St::Aborted);
     });
 }

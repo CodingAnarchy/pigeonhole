@@ -412,6 +412,7 @@ impl Barrier {
             partition: String::new(),
             // A barrier isn't a commit: no transaction's id (D329 2b).
             xid: Default::default(),
+            replayed: None,
         })
     }
 }
@@ -518,7 +519,9 @@ impl Out {
                 .encoded()
                 .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
                 .unwrap_or_else(|| {
+                    // No tag, which never fails to decode.
                     commit_event(e.token.clone(), proto::FeedCommit::default(), b"")
+                        .unwrap_or_default()
                 }),
             Out::Spliced { .. } | Out::Merged(_) => {
                 <proto::FeedEvent as prost::Message>::decode(self.to_bytes()).unwrap_or_default()

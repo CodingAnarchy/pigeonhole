@@ -1779,6 +1779,12 @@ pub struct FeedEvent {
     /// for any other commit.
     #[prost(bytes = "bytes", tag = "7")]
     pub xid: ::prost::bytes::Bytes,
+    /// D336 (#2148): set on a commit a partition's new owner replayed from an old owner's tail
+    /// after a failover: where it first came from. Its cells keep their original timestamps; it
+    /// is a new commit here, at a new seqno. A subscriber grouping by `xid` gets a replayed
+    /// share alone, and must not wait for its siblings.
+    #[prost(message, optional, tag = "10")]
+    pub replayed: ::core::option::Option<ReplayOrigin>,
     #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8, 9")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
@@ -1808,6 +1814,15 @@ pub mod feed_event {
         #[prost(message, tag = "9")]
         RawCommits(super::RawCommits),
     }
+}
+/// D336: a replayed commit's origin: the old history's epoch and the commit's seqno there,
+/// the same through any later failover.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplayOrigin {
+    #[prost(uint64, tag = "1")]
+    pub history_epoch: u64,
+    #[prost(uint64, tag = "2")]
+    pub seqno: u64,
 }
 /// D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
 /// commits.
@@ -1843,6 +1858,10 @@ pub struct RawChange {
     /// The stored value, tag byte first; empty for a delete.
     #[prost(bytes = "bytes", tag = "6")]
     pub stored: ::prost::bytes::Bytes,
+    /// D336 PR 3: its table, in an old owner's tail (`TailCommit`); empty in a range move's
+    /// catch-up, which reads its move's one table.
+    #[prost(string, tag = "7")]
+    pub table: ::prost::alloc::string::String,
 }
 /// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7212,6 +7231,97 @@ pub mod vectors_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// D336 PR 3: `Cluster.ReadTail`'s request.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadTailRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The failover event's old file: its history epoch and identity epoch.
+    #[prost(uint64, tag = "2")]
+    pub from_history_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub from_epoch: u64,
+    /// The all-tables feed token to read from: the event's fork token, or the replay mark's.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub token: ::prost::bytes::Bytes,
+    /// Commits at or below this origin seqno are skipped at the source (a resumed replay).
+    #[prost(uint64, tag = "5")]
+    pub after_seqno: u64,
+}
+/// D336 PR 3: one message of `Cluster.ReadTail`'s stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadTailEvent {
+    #[prost(oneof = "read_tail_event::Event", tags = "1, 2")]
+    pub event: ::core::option::Option<read_tail_event::Event>,
+}
+/// Nested message and enum types in `ReadTailEvent`.
+pub mod read_tail_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Commit(super::TailCommit),
+        #[prost(message, tag = "2")]
+        End(super::TailEnd),
+    }
+}
+/// D336 PR 3: one event of an old owner's tail, as its file logged it, by name: the old
+/// file's table and family ids mean nothing on the new owner, whose catalog has moved on.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TailCommit {
+    /// Its seqno in the old file: the replay's origin seqno.
+    #[prost(uint64, tag = "1")]
+    pub seqno: u64,
+    /// Its changes as logged (kinds, timestamps, stored values), each naming its table and
+    /// family; none for an event `skip` names.
+    #[prost(message, repeated, tag = "2")]
+    pub changes: ::prost::alloc::vec::Vec<RawChange>,
+    /// The old feed's position after it: the replay's mark stores it, so a resumed replay reads
+    /// on from there.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub token: ::prost::bytes::Bytes,
+    /// The commit's timestamp.
+    #[prost(uint64, tag = "4")]
+    pub timestamp: u64,
+    /// The commit's raw tag: a D329 xid, an earlier replay's tag (D336 §8), or empty.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub tag: ::prost::bytes::Bytes,
+    /// Feed-silent: a range move's copy or cleanup (§7's S2).
+    #[prost(bool, tag = "6")]
+    pub silent: bool,
+    /// An event that isn't a commit to replay (§7's S2 and S3), with no changes.
+    #[prost(enumeration = "TailSkip", tag = "7")]
+    pub skip: i32,
+    /// For each table of `changes`: the old file's schema record `created` for the table the
+    /// commit wrote, or 0 for one the old owner dropped later in the tail. The new owner replays
+    /// a change only into its table with the same `created` (§7's S5).
+    #[prost(map = "string, uint64", tag = "8")]
+    pub created: ::std::collections::HashMap<::prost::alloc::string::String, u64>,
+}
+/// D336 PR 3: the tail's end: nothing past it in the old file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TailEnd {
+    /// The file's last durable seqno.
+    #[prost(uint64, tag = "1")]
+    pub last_seqno: u64,
+}
+/// D336 PR 3: `Cluster.ReplayTail`'s request.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplayTailRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The failover event whose tail to replay (its old file's epochs).
+    #[prost(uint64, tag = "2")]
+    pub from_history_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub from_epoch: u64,
+    /// Read the whole tail and apply nothing: the reply says what would be applied, skipped and
+    /// refused.
+    #[prost(bool, tag = "4")]
+    pub dry_run: bool,
+    /// How long to replay before answering (the replay goes on); 0 for the node's default.
+    #[prost(uint64, tag = "5")]
+    pub timeout_ms: u64,
+}
 /// One partition on the node a `Cluster` call is sent to (D317 ticket 6).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PartitionRequest {
@@ -7598,6 +7708,13 @@ pub struct FailoverEvent {
     pub from_history_epoch: u64,
     #[prost(uint64, tag = "17")]
     pub from_epoch: u64,
+    /// D336 PR 3: PARTITION: the replay's mark (`replay/<from_history_epoch>`, the last origin
+    /// seqno it applied) a DONE tail was set at. A map may set `tail_state` DONE only with it,
+    /// and only equal to the end the owner's replay reported reaching
+    /// (`LocalPartition.replay`), so no hand-made map claims a replay that never ran; DISCARDED
+    /// needs none. 0 otherwise.
+    #[prost(uint64, tag = "18")]
+    pub replayed_through: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -8067,11 +8184,56 @@ pub struct LocalPartition {
     /// acks (`ASYNC`, too few healthy replicas). Absent while it answers covered.
     #[prost(message, optional, tag = "41")]
     pub degraded_from: ::core::option::Option<Position>,
+    /// D336 PR 3: P's owner's replay of an old owner's tail (`phdb cluster replay-tail`), the
+    /// last one since the node started; absent when none ran.
+    #[prost(message, optional, tag = "42")]
+    pub replay: ::core::option::Option<ReplayProgress>,
+}
+/// D336 PR 3: an owner's replay of an old owner's tail, as it stands.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplayProgress {
+    /// The failover event whose tail it is: the old file's history epoch (the mark's origin)
+    /// and identity epoch.
+    #[prost(uint64, tag = "1")]
+    pub from_history_epoch: u64,
+    #[prost(uint64, tag = "2")]
+    pub from_epoch: u64,
+    /// The last origin seqno of the source's tail (its `TailEnd`); 0 until the source answered.
+    #[prost(uint64, tag = "3")]
+    pub source_end: u64,
+    /// The replay's mark: the last origin seqno applied, skipped or refused.
+    #[prost(uint64, tag = "4")]
+    pub mark: u64,
+    /// Commits applied, skipped whole (already applied, or nothing kept) and refused.
+    #[prost(uint64, tag = "5")]
+    pub applied: u64,
+    #[prost(uint64, tag = "6")]
+    pub skipped: u64,
+    #[prost(uint64, tag = "7")]
+    pub refused: u64,
+    #[prost(bool, tag = "8")]
+    pub running: bool,
+    /// Why the last run stopped short of `source_end`; empty if it didn't.
+    #[prost(string, tag = "9")]
+    pub last_error: ::prost::alloc::string::String,
+    /// The latest named skips and refusals, at most 32, oldest first.
+    #[prost(message, repeated, tag = "10")]
+    pub skips: ::prost::alloc::vec::Vec<ReplaySkip>,
+}
+/// D336 PR 3: a tail commit the replay skipped or refused, and why.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplaySkip {
+    /// Its origin seqno.
+    #[prost(uint64, tag = "1")]
+    pub seqno: u64,
+    /// `not_owned`, `aborted`, `in_doubt`, `already_decided`, `conflict`, ...
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
 }
 /// D336: an old owner's tail of a partition, as its file holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TailKept {
-    /// The bytes of the file's feed history past the fork token.
+    /// The kept file's bytes on disk.
     #[prost(uint64, tag = "1")]
     pub bytes: u64,
     /// The file's last durable seqno.
@@ -8518,6 +8680,11 @@ pub struct ResolveTxn {
     pub xid: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub acked: ::prost::alloc::string::String,
+    /// D336 PR 3a: answer from the home's decision row alone and write nothing: no row (or a
+    /// live session) answers UNKNOWN, never an abort marker. An old owner's tail replay asks
+    /// so (Amendment 5's (a)): since #2164 an absent row may be a collected COMMITTED.
+    #[prost(bool, tag = "3")]
+    pub read_only: bool,
 }
 /// The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
 /// `UNKNOWN` leave it in doubt (`reason` says why).
@@ -8842,6 +9009,39 @@ pub struct ReleaseRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReleaseResponse {}
+/// D336 PR 3: a tail event the replay passes over whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TailSkip {
+    /// A commit: replayed, change by change.
+    None = 0,
+    /// A catalog change: the cluster's schema is the map's (S3).
+    Catalog = 1,
+    /// A range drop: the map's moves decide what those ranges hold (S2).
+    RangeDrop = 2,
+}
+impl TailSkip {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::None => "TAIL_SKIP_NONE",
+            Self::Catalog => "TAIL_SKIP_CATALOG",
+            Self::RangeDrop => "TAIL_SKIP_RANGE_DROP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TAIL_SKIP_NONE" => Some(Self::None),
+            "TAIL_SKIP_CATALOG" => Some(Self::Catalog),
+            "TAIL_SKIP_RANGE_DROP" => Some(Self::RangeDrop),
+            _ => None,
+        }
+    }
+}
 /// A partition's state on its node (D317 ticket 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -9318,6 +9518,9 @@ pub enum PartitionRole {
     Owner = 1,
     /// One of `Partition.replicas`: a read-only copy following the owner.
     Replica = 2,
+    /// D336 PR 3: an old owner's file of P, open as the source of its tail's replay
+    /// (`Cluster.ReadTail`): no lease, no client call, closed after `TAIL_SOURCE_IDLE`.
+    TailSource = 3,
 }
 impl PartitionRole {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -9329,6 +9532,7 @@ impl PartitionRole {
             Self::Unspecified => "PARTITION_ROLE_UNSPECIFIED",
             Self::Owner => "PARTITION_ROLE_OWNER",
             Self::Replica => "PARTITION_ROLE_REPLICA",
+            Self::TailSource => "PARTITION_ROLE_TAIL_SOURCE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -9337,6 +9541,7 @@ impl PartitionRole {
             "PARTITION_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
             "PARTITION_ROLE_OWNER" => Some(Self::Owner),
             "PARTITION_ROLE_REPLICA" => Some(Self::Replica),
+            "PARTITION_ROLE_TAIL_SOURCE" => Some(Self::TailSource),
             _ => None,
         }
     }
@@ -9925,6 +10130,64 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Release"));
             self.inner.unary(req, path, codec).await
         }
+        /// Node to node (D336 PR 3): an old owner's tail of a partition, read from its kept file
+        /// (the request's `from_history_epoch` and `from_epoch`) past `token`, which opens as a tail
+        /// source (`PARTITION_ROLE_TAIL_SOURCE`). Each commit in order, then `end`. Served only when
+        /// this node's map places the partition elsewhere at an epoch above `from_epoch`, the
+        /// partition isn't open here in another role, and the file is an owner's (never a replica
+        /// copy's); otherwise `FailedPrecondition`, which the caller retries. A tail whose start
+        /// retention already pruned answers `FailedPrecondition` naming it lost: never a part.
+        /// Cluster scope, gRPC only.
+        pub async fn read_tail(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadTailRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ReadTailEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/ReadTail",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ReadTail"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// D336 PR 3: on the partition's owner, replays an old owner's tail (`ReadTail` from its
+        /// node) into the partition, from the replay's mark, until the source's end or
+        /// `timeout_ms`, and answers the partition with its `replay` progress. A `dry_run` reads the
+        /// whole tail and applies nothing. One replay per partition at a time: a second call while
+        /// one runs waits on it. Admin scope, or a node's cluster token.
+        pub async fn replay_tail(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReplayTailRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/ReplayTail",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ReplayTail"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -10116,6 +10379,33 @@ pub mod cluster_server {
             &self,
             request: tonic::Request<super::ReleaseRequest>,
         ) -> std::result::Result<tonic::Response<super::ReleaseResponse>, tonic::Status>;
+        /// Server streaming response type for the ReadTail method.
+        type ReadTailStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ReadTailEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Node to node (D336 PR 3): an old owner's tail of a partition, read from its kept file
+        /// (the request's `from_history_epoch` and `from_epoch`) past `token`, which opens as a tail
+        /// source (`PARTITION_ROLE_TAIL_SOURCE`). Each commit in order, then `end`. Served only when
+        /// this node's map places the partition elsewhere at an epoch above `from_epoch`, the
+        /// partition isn't open here in another role, and the file is an owner's (never a replica
+        /// copy's); otherwise `FailedPrecondition`, which the caller retries. A tail whose start
+        /// retention already pruned answers `FailedPrecondition` naming it lost: never a part.
+        /// Cluster scope, gRPC only.
+        async fn read_tail(
+            &self,
+            request: tonic::Request<super::ReadTailRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadTailStream>, tonic::Status>;
+        /// D336 PR 3: on the partition's owner, replays an old owner's tail (`ReadTail` from its
+        /// node) into the partition, from the replay's mark, until the source's end or
+        /// `timeout_ms`, and answers the partition with its `replay` progress. A `dry_run` reads the
+        /// whole tail and applies nothing. One replay per partition at a time: a second call while
+        /// one runs waits on it. Admin scope, or a node's cluster token.
+        async fn replay_tail(
+            &self,
+            request: tonic::Request<super::ReplayTailRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ClusterServer<T> {
@@ -10925,6 +11215,97 @@ pub mod cluster_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReleaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/ReadTail" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadTailSvc<T: Cluster>(pub Arc<T>);
+                    impl<
+                        T: Cluster,
+                    > tonic::server::ServerStreamingService<super::ReadTailRequest>
+                    for ReadTailSvc<T> {
+                        type Response = super::ReadTailEvent;
+                        type ResponseStream = T::ReadTailStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReadTailRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::read_tail(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadTailSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/ReplayTail" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReplayTailSvc<T: Cluster>(pub Arc<T>);
+                    impl<
+                        T: Cluster,
+                    > tonic::server::UnaryService<super::ReplayTailRequest>
+                    for ReplayTailSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReplayTailRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::replay_tail(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReplayTailSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

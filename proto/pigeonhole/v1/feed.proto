@@ -81,6 +81,18 @@ message FeedEvent {
   // id, the same on every partition's share of it, so a subscriber can group them. Empty
   // for any other commit.
   bytes xid = 7;
+  // D336 (#2148): set on a commit a partition's new owner replayed from an old owner's tail
+  // after a failover: where it first came from. Its cells keep their original timestamps; it
+  // is a new commit here, at a new seqno. A subscriber grouping by `xid` gets a replayed
+  // share alone, and must not wait for its siblings.
+  ReplayOrigin replayed = 10;
+}
+
+// D336: a replayed commit's origin: the old history's epoch and the commit's seqno there,
+// the same through any later failover.
+message ReplayOrigin {
+  uint64 history_epoch = 1;
+  uint64 seqno = 2;
 }
 
 // D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
@@ -106,6 +118,9 @@ message RawChange {
   uint64 timestamp = 5;
   // The stored value, tag byte first; empty for a delete.
   bytes stored = 6;
+  // D336 PR 3: its table, in an old owner's tail (`TailCommit`); empty in a range move's
+  // catch-up, which reads its move's one table.
+  string table = 7;
 }
 
 // D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).

@@ -860,6 +860,16 @@ impl Feed {
         ))
     }
 
+    /// Whether the commit [`next_event`](Self::next_event) (or its try and poll forms) last
+    /// delivered is feed-silent (only ever, with [`include_silent`](Self::include_silent)):
+    /// an old owner's tail source names it so, by name, with no replicated form built (D336,
+    /// ICR 0147). Hidden: not part of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-tail-replay")]
+    #[doc(hidden)]
+    pub fn delivered_silent(&self) -> bool {
+        self.reader.silent()
+    }
+
     /// Delivers the primary's feed-silent commits too (D331, ICR 0141), each marked in
     /// [`replicated`](Self::replicated): for a replica's follower only, which applies them
     /// silent. [`FeedBuilder`](crate::FeedBuilder) has no such option, so a client's

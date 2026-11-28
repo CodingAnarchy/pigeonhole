@@ -291,9 +291,37 @@ pub(crate) async fn settle(
     Ok(resp)
 }
 
+/// What home `home`'s decision row says of transaction `xid`, and nothing more (D336 PR 3a,
+/// Amendment 5's (a)): COMMITTED or ABORTED as the row says; UNKNOWN for no row, which may be
+/// a live session, an undecided one, or (since #2164) a collected COMMITTED. Unlike
+/// [`settle`], it never records an abort.
+pub(crate) async fn read_only_outcome(
+    home: &Service,
+    xid: &str,
+) -> Result<proto::TxnResolution, ApiError> {
+    use proto::TxnOutcomeState as S;
+    let (state, reason) = match home.decision(xid).await? {
+        Some(v) => match read_decision(&v)? {
+            (true, _) => (S::Committed, String::new()),
+            (false, _) => (S::Aborted, "the transaction was not committed".to_owned()),
+        },
+        None => (
+            S::Unknown,
+            "the home holds no decision row for it (read-only: nothing recorded)".to_owned(),
+        ),
+    };
+    Ok(proto::TxnResolution {
+        state: state as i32,
+        reason,
+    })
+}
+
 /// Asks transaction `xid`'s home what was decided (D329: the resolver, and `DecideTxn`'s
 /// check that the home is gone): a `ResolveTxn` to the home's owner by this node's map, or
 /// answered here if that's this node. The node's own call, under the cluster token.
+/// `read_only` (D336 PR 3a, an old owner's tail replay): the home answers from its decision
+/// row alone and writes nothing ([`read_only_outcome`]); `acked` must then be `None`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn ask_home(
     node: &Arc<Node>,
     parts: &Parts,
@@ -302,6 +330,7 @@ pub(crate) async fn ask_home(
     xid: &str,
     acked: Option<&str>,
     timeout: Duration,
+    read_only: bool,
 ) -> Result<proto::TxnResolution, ApiError> {
     let (home, _, _) = super::super::sessions::spanning_parts(xid)
         .ok_or_else(|| ApiError::invalid("not a spanning transaction's id"))?;
@@ -327,6 +356,7 @@ pub(crate) async fn ask_home(
     let op = Op::ResolveTxn(proto::ResolveTxn {
         xid: xid.to_owned(),
         acked: acked.unwrap_or_default().to_owned(),
+        read_only,
     });
     let caller = Caller::anonymous();
     let reply = if owner.node == node.id() {
@@ -636,6 +666,10 @@ pub(crate) async fn serve_branch(
             )
         }
         // A share in doubt elsewhere asks this home what was decided (D329's resolver).
+        // D336 PR 3a (Amendment 5's (a)): the decision row alone, nothing written.
+        Op::ResolveTxn(r) if r.read_only => {
+            Reply::ResolveTxn(read_only_outcome(&service, &r.xid).await?)
+        }
         Op::ResolveTxn(r) => {
             if !r.acked.is_empty() {
                 service
@@ -1856,6 +1890,7 @@ pub(crate) fn start_resolver(
                                 xid,
                                 acked,
                                 timeout,
+                                false,
                             )
                             .await
                         }

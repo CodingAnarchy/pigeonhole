@@ -1296,6 +1296,23 @@ impl LoggedBatch<'_> {
             .commit_logged_with(self.batch, None, self.xid.as_deref())?;
         Ok(crate::CommitInfo::from_engine(info))
     }
+
+    /// [`commit`](Self::commit) with `durability` for this commit only (D336, ICR 0147): a
+    /// replayed tail commit and its mark are durable together, whatever the database's
+    /// default. Hidden: not part of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-tail-replay")]
+    #[doc(hidden)]
+    pub fn commit_with(self, durability: crate::Durability) -> Result<crate::CommitInfo> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let info = self.db.engine().commit_logged_with(
+            self.batch,
+            Some(durability.engine()),
+            self.xid.as_deref(),
+        )?;
+        Ok(crate::CommitInfo::from_engine(info))
+    }
 }
 
 /// One tablet as [`Pigeonhole::tablets`] reports it (D332, ICR 0142).

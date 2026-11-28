@@ -6345,18 +6345,26 @@ impl Inner {
                 shards.push(shard);
             }
         }
-        let mut out = if fixed_ts || counter_writes > 1 || converts {
+        // A commit with nothing logged beside it returns as before D336, on either branch
+        // (perf2 on #2235: +29 instructions on commit-incr, +15 on commit-one).
+        let out = if fixed_ts || counter_writes > 1 || converts {
             let combines = counter_writes > 1 || converts;
-            prepare_counter_writes(&batch.builder, catalog, combines)?
+            let out = prepare_counter_writes(&batch.builder, catalog, combines)?;
+            if batch.logged_beside.is_none() {
+                return Ok((out, shards));
+            }
+            out
+        } else if batch.logged_beside.is_none() {
+            return Ok((batch.builder, shards));
         } else {
             batch.builder
         };
-        // D336: changes as their primary logged them, after the ordinary part's rewrite, so
-        // none of it touches them.
-        if let Some(logged) = batch.logged_beside {
-            append_logged(&mut out, &logged, view, &mut shards)?;
+        match batch.logged_beside {
+            // D336: changes as their primary logged them, after the ordinary part's rewrite,
+            // so none of it touches them.
+            Some(logged) => with_logged(out, &logged, view, shards),
+            None => Ok((out, shards)),
         }
-        Ok((out, shards))
     }
 
     pub(crate) fn submit(
@@ -8086,6 +8094,19 @@ fn route_logged(batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)
     let mut shards = Shards::new();
     check_logged(&batch.builder, view, &mut shards)?;
     Ok((batch.builder, shards))
+}
+
+/// [`append_logged`], out of `route`'s line (perf2 on #2235: the common commit has none).
+#[cold]
+#[inline(never)]
+fn with_logged(
+    mut out: BatchBuilder,
+    logged: &BatchBuilder,
+    view: &View,
+    mut shards: Shards,
+) -> Result<(BatchBuilder, Shards)> {
+    append_logged(&mut out, logged, view, &mut shards)?;
+    Ok((out, shards))
 }
 
 /// Appends `logged`'s changes to the routed `out` as they are (D336,
