@@ -333,7 +333,6 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let Some(shared) = &self.1 else {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
-        self.0.catch_up(&peer, req.metadata()).await?;
         // The sender's deadline for the call (it sends what's left of its client's), for a
         // replica copy's read-your-writes wait (D328).
         let sent = crate::serve::grpc::grpc_timeout(req.metadata().as_ref());
@@ -342,18 +341,20 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             shared.limits.request_timeout,
             sent,
         );
-        let msg = req.into_inner();
-        // Its place in its lane (#2258): a client's call past the limit is refused at once,
-        // a node's own arm waits for one up to its deadline.
+        // Its place in its lane (#2258), before anything else is done for it (ai1249 on
+        // #2276): a client's call past the limit is refused at once, a node's own arm waits
+        // for one up to its deadline.
         let _place = self
             .0
             .lanes
             .enter(
-                lanes::Lane::of(&msg),
+                lanes::Lane::of(req.get_ref()),
                 shared.limits.max_concurrent,
                 sent.unwrap_or(shared.limits.request_timeout),
             )
             .await?;
+        self.0.catch_up(&peer, req.metadata()).await?;
+        let msg = req.into_inner();
         #[cfg(test)]
         seams::hold_forward(&self.0.dir).await;
         // A spanning transaction's branch call (D329): served on the partition it names.
@@ -548,8 +549,6 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let Some(shared) = &self.1 else {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
-        self.0.catch_up(&peer, req.metadata()).await?;
-        let msg = req.into_inner();
         // A client's scan, in the clients' lane until its pages start (#2258).
         let _place = self
             .0
@@ -560,6 +559,8 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 shared.limits.request_timeout,
             )
             .await?;
+        self.0.catch_up(&peer, req.metadata()).await?;
+        let msg = req.into_inner();
         let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
         let scan = msg
             .scan

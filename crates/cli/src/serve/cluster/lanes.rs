@@ -13,8 +13,10 @@
 //!   one past that waits for a place, up to its deadline, since a refusal would only be
 //!   retried later (and an in-doubt share holds its rows meanwhile).
 //! - **Parts:** one partition's part of a read another node fans out (#1715), served with no
-//!   budget of its own. [`READ_PARTS`] at once, and one past that is refused at once: this
-//!   bound is what keeps a node's memory for other nodes' parts at [`READ_PARTS`] pages.
+//!   budget of its own. [`READ_PARTS`] at once, which keeps a node's memory for other nodes'
+//!   parts at [`READ_PARTS`] pages. One past that is refused at once rather than queued
+//!   (cli692 on #2276: a queued part holds no page, so this is for failing fast, as a
+//!   client's call does), and the entry node's read answers `Overloaded`.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -41,11 +43,65 @@ pub(crate) enum Lane {
 
 impl Lane {
     /// The lane of forwarded call `msg`.
+    ///
+    /// Every op is named (ai1249 on #2276): a new one must be placed here, since a node's own
+    /// call left in the clients' lane would be refused at once under load.
     pub(crate) fn of(msg: &proto::ForwardRequest) -> Self {
         use proto::forward_request::Op;
-        if super::spanning::is_node_arm(msg)
-            || matches!(msg.op, Some(Op::RangeCopy(_) | Op::Tablets(_)))
-        {
+        let node_own = match &msg.op {
+            Some(
+                Op::BranchPrepare(_)
+                | Op::BranchDecide(_)
+                | Op::ResolveTxn(_)
+                | Op::RangeCopy(_)
+                | Op::Tablets(_),
+            ) => true,
+            Some(
+                Op::Get(_)
+                | Op::ReadRow(_)
+                | Op::Mutate(_)
+                | Op::CheckAndMutate(_)
+                | Op::MutateReturning(_)
+                | Op::Batch(_)
+                | Op::MultiGet(_)
+                | Op::Begin(_)
+                | Op::TxnGet(_)
+                | Op::TxnGetRow(_)
+                | Op::TxnWrite(_)
+                | Op::Commit(_)
+                | Op::Abort(_)
+                | Op::OpenSnapshot(_)
+                | Op::ReleaseSnapshot(_)
+                | Op::Nearest(_)
+                | Op::CreateTable(_)
+                | Op::DropTable(_)
+                | Op::CreateVectorIndex(_)
+                | Op::VectorInsert(_)
+                | Op::VectorDelete(_)
+                | Op::VectorSearch(_)
+                | Op::VectorVerify(_)
+                | Op::CreateTextIndex(_)
+                | Op::TextPut(_)
+                | Op::TextDelete(_)
+                | Op::TextRebuild(_)
+                | Op::TextVerify(_)
+                | Op::TextStats(_)
+                | Op::TextSearch(_)
+                | Op::Remember(_)
+                | Op::Recall(_)
+                | Op::MarkUsed(_)
+                | Op::Supersede(_)
+                | Op::Link(_)
+                | Op::Forget(_)
+                | Op::RecallPool(_)
+                | Op::RecallBodies(_)
+                // A client's own arms of a spanning transaction (D329's data arms).
+                | Op::BranchBegin(_)
+                | Op::TxnOutcome(_),
+            )
+            | None => false,
+        };
+        if node_own {
             Self::Nodes
         } else if msg.fanout_part {
             Self::Parts
@@ -129,11 +185,12 @@ mod tests {
 
     #[test]
     fn a_forwarded_call_takes_its_senders_lane() {
+        let prepare = Some(Op::BranchPrepare(proto::BranchPrepare::default()));
         let decide = Some(Op::BranchDecide(proto::BranchDecide::default()));
         let resolve = Some(Op::ResolveTxn(proto::ResolveTxn::default()));
         let copy = Some(Op::RangeCopy(proto::RangeCopyRequest::default()));
         let tablets = Some(Op::Tablets(proto::TabletsRequest::default()));
-        for op in [decide, resolve, copy, tablets] {
+        for op in [prepare, decide, resolve, copy, tablets] {
             assert_eq!(Lane::of(&msg(op.clone(), false)), Lane::Nodes, "{op:?}");
         }
         // A client's own arms of a spanning transaction are the client's.

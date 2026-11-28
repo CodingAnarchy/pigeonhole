@@ -814,6 +814,78 @@ fn a_bounded_read_is_served_by_a_replica_and_says_so() {
     });
 }
 
+/// cli692 on #2276: a replica whose forwarded calls' lane is full refuses a read with
+/// `Overloaded`, which sends it on to the owner, as a replica that's behind does, rather
+/// than failing it.
+#[test]
+fn a_replica_with_its_lane_full_leaves_the_read_to_the_owner() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    let a = dirs[0].clone();
+    let max = crate::serve::server_tests::limits().max_concurrent;
+    struct LetGo(PathBuf);
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            super::super::HOLD_FORWARDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|d| *d != self.0);
+        }
+    }
+    let held_on_a = || {
+        super::super::HELD_FORWARDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| **d == a)
+            .count()
+    };
+    rt.block_on(async {
+        eventually("a's copy to serve the read first", async || {
+            read_through(ports[1], "k1", Some(60_000), None)
+                .await
+                .is_ok_and(|(_, by, _)| by.as_deref() == Some("replica"))
+        })
+        .await;
+        super::super::HOLD_FORWARDS.lock().unwrap().push(a.clone());
+        let let_go = LetGo(a.clone());
+        let c = client(ports[0]).await;
+        let held: Vec<_> = (0..max)
+            .map(|_| {
+                let mut c = c.clone();
+                tokio::spawn(async move {
+                    c.forward(crate::serve::proto::ForwardRequest {
+                        partition: "p3".into(),
+                        ..Default::default()
+                    })
+                    .await
+                })
+            })
+            .collect();
+        eventually("a's clients' lane to be full", async || held_on_a() == max).await;
+        let (value, by, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_through(ports[1], "k1", Some(60_000), None),
+        )
+        .await
+        .expect("the read answers within 5 s")
+        .unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert_eq!(
+            by.as_deref(),
+            Some("owner"),
+            "the replica's refusal falls back"
+        );
+        drop(let_go);
+        for h in held {
+            let _ = tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .expect("a forward let go answers within 5 s")
+                .unwrap();
+        }
+    });
+}
+
 /// A replica that isn't fresh (its owner has no change feed, so it never follows) leaves a
 /// bounded read to the owner, which says so; the next read skips it for its back-off.
 #[test]
