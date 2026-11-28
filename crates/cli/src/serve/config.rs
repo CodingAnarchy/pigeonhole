@@ -82,8 +82,9 @@ pub(crate) struct ServeArgs {
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_concurrent: usize,
-    /// Open connections at once, HTTP/1.1 and HTTP/2 alike; one past this is closed as soon
-    /// as it's accepted. Default: half the open-file limit (`ulimit -n`), at most 4096.
+    /// Open connections at once, HTTP/1.1 and HTTP/2 alike; one past this is refused: its
+    /// requests are answered `Overloaded` (gRPC: `UNAVAILABLE`; HTTP: 503), then it's
+    /// closed. Default: half the open-file limit (`ulimit -n`), at most 4096.
     #[arg(long, value_name = "N")]
     pub max_connections: Option<usize>,
     /// Scans streaming at once; more are refused at once (`Overloaded`). A scan's stream
