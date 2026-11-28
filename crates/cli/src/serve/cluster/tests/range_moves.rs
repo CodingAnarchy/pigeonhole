@@ -1193,6 +1193,18 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         .lock()
         .unwrap()
         .push(((dirs[1].clone(), 2), held));
+    // The abort's drop of the copy, held until the checks below are done (#2271): it joins
+    // the follower, drops the range and prunes the records, so with it free a second chunk
+    // the follower did commit was gone again by the time the test looked. A move id of
+    // this test's own: the hold is keyed by it.
+    let id = "stopped-mid-copy";
+    let drop_reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (drop_go, drop_held) = tokio::sync::oneshot::channel();
+    super::super::range_drop::HOLD.lock().unwrap().push((
+        id.into(),
+        std::sync::Arc::clone(&drop_reached),
+        drop_held,
+    ));
     rt.block_on(async {
         eventually("p1 takes writes", async || {
             try_put(c, "c", "0").await.is_ok()
@@ -1203,7 +1215,9 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
             try_put(c, row, &big).await.unwrap();
         }
         try_put(c, "d", "1").await.unwrap();
-        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        let mut copying = moving(&v1, 2, Some(MovePhase::Copying));
+        copying.moves[0].id = id.into();
+        push(&ports, &copying).await;
         // The follower holds its second chunk: the first chunk's commits are all in (#2107's
         // Windows flake: a count read while they still landed moved after it).
         eventually_within(
@@ -1215,7 +1229,7 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         // The first chunk's records, read while the hold keeps the second out and before the
         // abort: once b takes it, the abort's reconcile (D331 PR 5) may prune them at any
         // moment (the race behind main's flake since 2026-11-20).
-        recorded_before = records(&db_b);
+        recorded_before = head_cell(&db_b, id, "n");
         // The move goes from the map (an abort at COPYING) while the chunk is in hand. The
         // hold is never released, so only the stop wakes the follower, and its own check
         // must keep it from committing.
@@ -1223,9 +1237,12 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         aborted.map_version = 3;
         push(&ports, &aborted).await;
         eventually("b takes the abort", async || {
-            move_status(b, "p2", "mv1").await.is_none()
+            move_status(b, "p2", id).await.is_none()
         })
         .await;
+        tokio::time::timeout(Duration::from_secs(30), drop_reached.notified())
+            .await
+            .expect("b's drop of the copy started, and is held");
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
     let users = db_b.table("users").unwrap().open().unwrap();
@@ -1233,14 +1250,15 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         users.get(b"d", "f", b"q").unwrap().is_none(),
         "the second chunk wasn't written"
     );
-    // No record after the stop: the first chunk's, or none once the abort's reconcile
-    // (D331 PR 5) pruned them.
-    let after = records(&db_b);
-    assert!(
-        after.is_none() || after == recorded_before,
+    // The drop is held, so nothing has erased a chunk or pruned a record: the range holds
+    // no row of the second chunk, and the records are the first chunk's.
+    assert!(recorded_before.is_some(), "the first chunk's records");
+    assert_eq!(
+        head_cell(&db_b, id, "n"),
+        recorded_before,
         "a record after the stop"
     );
-    assert!(recorded_before.is_some(), "the first chunk's records");
+    let _ = drop_go.send(());
     let _ = (db_a.close(), db_b.close());
 }
 
@@ -1278,6 +1296,18 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
         .lock()
         .unwrap()
         .push(((dirs[1].clone(), 2), held));
+    // The abort's drop of the copy, held until the checks below are done (#2271): it joins
+    // the follower, drops the range and prunes the records, so with it free a second chunk
+    // the follower did commit was gone again by the time the test looked. A move id of
+    // this test's own: the hold is keyed by it.
+    let id = "aborting-mid-copy";
+    let drop_reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (drop_go, drop_held) = tokio::sync::oneshot::channel();
+    super::super::range_drop::HOLD.lock().unwrap().push((
+        id.into(),
+        std::sync::Arc::clone(&drop_reached),
+        drop_held,
+    ));
     rt.block_on(async {
         eventually("p1 takes writes", async || {
             try_put(c, "c", "0").await.is_ok()
@@ -1288,7 +1318,9 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
             try_put(c, row, &big).await.unwrap();
         }
         try_put(c, "d", "1").await.unwrap();
-        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        let mut copying = moving(&v1, 2, Some(MovePhase::Copying));
+        copying.moves[0].id = id.into();
+        push(&ports, &copying).await;
         eventually_within(
             Duration::from_secs(60),
             "b holds its second chunk",
@@ -1298,18 +1330,23 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
         // The first chunk's records, read while the hold keeps the second out and before the
         // abort: once b takes it, the abort's reconcile (D331 PR 5) may prune them at any
         // moment (the race behind main's flake since 2026-11-20).
-        recorded_before = records(&db_b);
-        push(&ports, &moving(&v1, 3, Some(MovePhase::Aborting))).await;
+        recorded_before = head_cell(&db_b, id, "n");
+        let mut aborting = moving(&v1, 3, Some(MovePhase::Aborting));
+        aborting.moves[0].id = id.into();
+        push(&ports, &aborting).await;
         eventually("b takes the abort", async || {
-            move_status(b, "p2", "mv1")
+            move_status(b, "p2", id)
                 .await
                 .is_some_and(|s| s.phase == MovePhase::Aborting as i32)
         })
         .await;
+        tokio::time::timeout(Duration::from_secs(30), drop_reached.notified())
+            .await
+            .expect("b's drop of the copy started, and is held");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let t = move_status(b, "p2", "mv1").await.unwrap();
+        let t = move_status(b, "p2", id).await.unwrap();
         assert!(!t.serving, "the target serves none of it");
-        let s = move_status(a, "p1", "mv1").await.unwrap();
+        let s = move_status(a, "p1", id).await.unwrap();
         assert!(s.serving && !s.fenced, "the source serves it, unfenced");
         // The source takes the range's writes (the target's gate refusing them is
         // ranges.rs's an_aborting_move_gates_its_target_and_leaves_its_source_serving).
@@ -1320,17 +1357,19 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
         users.get(b"d", "f", b"q").unwrap().is_none(),
         "the second chunk wasn't written"
     );
-    let after = records(&db_b);
-    assert!(
-        after.is_none() || after == recorded_before,
+    // The drop is held, so nothing has erased a chunk or pruned a record: the range holds
+    // no row of the second chunk, and the records are the first chunk's.
+    assert!(recorded_before.is_some(), "the first chunk's records");
+    assert_eq!(
+        head_cell(&db_b, id, "n"),
+        recorded_before,
         "a record after the stop"
     );
-    assert!(recorded_before.is_some(), "the first chunk's records");
     assert!(
         !crate::serve::ranges::read_serving(&db_b)
             .unwrap()
             .iter()
-            .any(|r| r.id == "mv1"),
+            .any(|r| r.id == id),
         "no serving row on the target"
     );
     assert!(
@@ -1342,6 +1381,7 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
         1,
         "the source's epoch wasn't raised"
     );
+    let _ = drop_go.send(());
     let _ = (db_a.close(), db_b.close());
 }
 
