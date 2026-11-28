@@ -115,9 +115,11 @@ impl Service {
             {
                 reply = Err(e);
             } else if held.is_some()
+                && !waits
                 && let (Some(part), Ok(r)) = (&self.part, &reply)
             {
-                // D335: timed until the frontier covers it (one load with no stream).
+                // D335: timed until the frontier covers it (one load with no stream). A
+                // write that waited was timed from before its wait (`wait_for_acks`).
                 part.acks.committed(|| match committed_seqno(r) {
                     Committed::At(s) => s,
                     _ => part.db.visible_seqno(),
@@ -690,6 +692,9 @@ impl Service {
             Ok(Committed::Unknown) => part.db.visible_seqno(),
             Ok(Committed::Nothing) | Err(_) => return reply,
         };
+        // Timed from here, before the wait (perf287 on #2256: timed after it, the frontier
+        // already covered every waited write, and the histogram held only zeros at k ≥ 1).
+        part.acks.committed(|| seqno);
         match part
             .acks
             .wait(crate::serve::acks::Pos::commit(seqno), gate)

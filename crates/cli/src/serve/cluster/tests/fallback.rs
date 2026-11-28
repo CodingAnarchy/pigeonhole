@@ -270,6 +270,17 @@ fn an_async_partition_answers_uncovered_only_once_a_majority_recorded_its_fallba
             .await
             .unwrap();
         assert_eq!(write("k2").await.unwrap().replica_acks, 1);
+        // The write that waited is timed to its ack, from before its wait: not zero (perf287
+        // on #2256, the histogram timed it after the wait).
+        let text = metrics_at(ports[2]).await;
+        let sum: f64 = text
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("pigeonhole_cluster_replica_ack_wait_seconds_sum{partition=\"p3\"} ")
+            })
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no ack-wait sum for p3: {text}"));
+        assert!(sum > 0.0, "a waited write timed at zero: {text}");
         // Every grantor recorded p3 CLEAR at its epoch, on its first grant since k = 1.
         for &port in &ports {
             eventually_why(
