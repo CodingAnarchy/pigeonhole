@@ -51,6 +51,10 @@ pub(crate) struct Db {
     /// otherwise): how a commit that resolves later finds it again on its error path only
     /// (#966).
     watch_id: u64,
+    /// A replica's state as its last apply stored it (#2264), so the next apply chains on
+    /// it without reading the state cell.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) replica_state: crate::replication::StateCache,
 }
 
 /// The supervised databases of one process, by watch id: a commit that resolves after its
@@ -302,6 +306,8 @@ impl Db {
             stall_timeout,
             txn_counts: Default::default(),
             watch_id,
+            #[cfg(feature = "__unstable-replication")]
+            replica_state: Default::default(),
         });
         if watch_id != 0 {
             let registry = watched();
