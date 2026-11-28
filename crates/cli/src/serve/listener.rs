@@ -4,10 +4,17 @@
 //!
 //! **Connections are capped** (`--max-connections`, #1604): each accepted TCP connection
 //! holds a slot from `accept` until it ends, TLS handshake included, HTTP/1.1 and HTTP/2
-//! alike. Past the cap a connection is accepted and closed at once, before any protocol is
-//! read, so the client sees the close (gRPC: `UNAVAILABLE`) rather than waiting in the
-//! kernel's backlog. A connection that sends nothing within `--request-timeout-ms` is
-//! dropped, so silent sockets can't hold the slots (cli692's D1 on the design).
+//! alike. Past the cap a connection is accepted and served a refusal (#2262): every request
+//! on it is answered `Overloaded` (gRPC: a trailers-only `UNAVAILABLE`, "the server is at
+//! --max-connections"; HTTP/1.1: a 503 with `Connection: close`). It's held [`REFUSAL_HOLD`]
+//! at most (or `--request-timeout-ms`, if shorter): HTTP/2 takes calls for most of it, so a
+//! client that calls again at once is refused on the same connection, then sends GOAWAY and
+//! closes. At most [`REFUSING`] are held at once; past that a connection is closed at once,
+//! before any protocol is read. Either way the client gets an answer rather than
+//! waiting in the kernel's backlog. A bare close alone left a tonic client's call parked
+//! until another call on its channel woke it, and failing as `Unknown`, not `UNAVAILABLE`
+//! (#2262). A connection that sends nothing within `--request-timeout-ms` is dropped, so
+//! silent sockets can't hold the slots (cli692's D1 on the design).
 
 use std::io;
 use std::pin::Pin;
@@ -38,6 +45,18 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 /// The default cap's ceiling: 4096 connections pin at most 256 MiB in HTTP/1.1 pre-reads
 /// (64 KiB each), before HTTP/2's windows and send buffers (cli692 on #1604).
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+
+/// Connections past the cap served a refusal at once (#2262); past these, a connection is
+/// closed bare. A fixed bound: each holds a descriptor for [`REFUSAL_HOLD`] at most, so
+/// refusing costs 32 descriptors at most, beyond `--max-connections`.
+const REFUSING: usize = 32;
+
+/// The longest a refusing connection is held, `--request-timeout-ms` if shorter: an HTTP/2
+/// one takes calls for nine tenths of it, then sends GOAWAY, and is dropped at its end.
+/// Closing it after the first answer instead made a client that calls again at once
+/// connect again for every call (some 9,000 times a second), and a call sent as a
+/// connection closes fails `Cancelled`, not `UNAVAILABLE`: a few hundred in 18,000.
+const REFUSAL_HOLD: Duration = Duration::from_secs(1);
 
 /// Refusals in a row before the accept loop yields, so a connection flood doesn't keep the
 /// other tasks on its worker from running.
@@ -75,6 +94,8 @@ pub(crate) struct Connections {
     max: usize,
     /// Connections holding a slot: never more than `max`.
     open: AtomicUsize,
+    /// Connections past the cap being served a refusal: never more than [`REFUSING`].
+    refusing: AtomicUsize,
     refused: AtomicU64,
     accept_errors: AtomicU64,
     /// A slot was freed: an accept loop out of descriptors waits for it.
@@ -89,6 +110,7 @@ impl Connections {
         Arc::new(Self {
             max: max.max(1),
             open: AtomicUsize::new(0),
+            refusing: AtomicUsize::new(0),
             refused: AtomicU64::new(0),
             accept_errors: AtomicU64::new(0),
             closed: tokio::sync::Notify::new(),
@@ -115,6 +137,23 @@ impl Connections {
                 .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => return Some(Slot(Arc::clone(self))),
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// A place to serve a refusal past the cap (#2262), or `None` past [`REFUSING`].
+    fn take_refusal(self: &Arc<Self>) -> Option<Refusing> {
+        let mut n = self.refusing.load(Ordering::Relaxed);
+        loop {
+            if n >= REFUSING {
+                return None;
+            }
+            match self
+                .refusing
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(Refusing(Arc::clone(self))),
                 Err(now) => n = now,
             }
         }
@@ -159,6 +198,17 @@ struct Slot(Arc<Connections>);
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.open.fetch_sub(1, Ordering::AcqRel);
+        self.0.closed.notify_one();
+    }
+}
+
+/// A refusing connection's place, given back when its task ends (#2262).
+struct Refusing(Arc<Connections>);
+
+impl Drop for Refusing {
+    fn drop(&mut self) {
+        self.0.refusing.fetch_sub(1, Ordering::AcqRel);
+        // A descriptor was freed too.
         self.0.closed.notify_one();
     }
 }
@@ -287,6 +337,36 @@ where
     Ended::Served(conn.await)
 }
 
+/// Serves a connection past the cap a refusal for `hold` (#2262): each request on it is
+/// answered `Overloaded` ([`super::http::refusal`]). An HTTP/1.1 connection closes after its
+/// answer (`Connection: close`). An HTTP/2 one takes calls for most of `hold`, so a client
+/// that calls again at once is refused on it rather than connecting again, then sends GOAWAY
+/// and closes once its streams are answered; past `hold` it's dropped.
+async fn refuse_one<S>(io: S, hold: Duration) -> Ended
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| {
+        let answer = super::http::refusal(&req);
+        async move { Ok::<_, std::convert::Infallible>(answer) }
+    });
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().keep_alive(false);
+    builder.http2().max_concurrent_streams(MAX_STREAMS);
+    let conn = builder.serve_connection(TokioIo::new(io), service);
+    tokio::pin!(conn);
+    let grace = hold / 10;
+    tokio::select! {
+        r = &mut conn => return Ended::Served(r),
+        () = tokio::time::sleep(hold - grace) => {}
+    }
+    conn.as_mut().graceful_shutdown();
+    match tokio::time::timeout(grace, conn).await {
+        Ok(r) => Ended::Served(r),
+        Err(_) => Ended::Silent,
+    }
+}
+
 pub(crate) async fn serve(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
@@ -331,9 +411,32 @@ pub(crate) async fn serve(
             () = &mut shutdown => break,
         };
         let Some(slot) = conns.take() else {
-            // At the cap: closed before any protocol is read.
+            // At the cap: served a refusal, or past [`REFUSING`] of those, closed before any
+            // protocol is read (#2262).
             conns.refused.fetch_add(1, Ordering::Relaxed);
-            drop(stream);
+            if let Some(refusing) = conns.take_refusal() {
+                let _ = stream.set_nodelay(true);
+                let tls = tls.clone();
+                let hold = bounds.first_byte.min(REFUSAL_HOLD);
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let _ = tokio::time::timeout(hold, async move {
+                        match tls {
+                            None => refuse_one(stream, hold).await,
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(tls) => {
+                                    refuse_one(tls, hold.saturating_sub(started.elapsed())).await
+                                }
+                                Err(_) => Ended::Handshake,
+                            },
+                        }
+                    })
+                    .await;
+                    drop(refusing);
+                });
+            } else {
+                drop(stream);
+            }
             refusals += 1;
             if refusals.is_multiple_of(REFUSALS_PER_YIELD) {
                 tokio::task::yield_now().await;
@@ -392,7 +495,27 @@ pub(crate) async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_CONNECTIONS, default_max_connections};
+    use super::{Connections, DEFAULT_MAX_CONNECTIONS, REFUSING, default_max_connections};
+
+    /// #2262: at most [`REFUSING`] connections past the cap are served a refusal at once;
+    /// past them, `None` (a bare close). A refusal that ends frees its place.
+    #[test]
+    fn at_most_refusing_connections_are_served_a_refusal_at_once() {
+        let conns = Connections::new(1);
+        let mut held: Vec<_> = (0..REFUSING)
+            .map(|i| {
+                conns
+                    .take_refusal()
+                    .unwrap_or_else(|| panic!("refusal {i} of {REFUSING}"))
+            })
+            .collect();
+        assert!(conns.take_refusal().is_none(), "past {REFUSING}");
+        held.pop();
+        assert!(conns.take_refusal().is_some(), "a place freed");
+        // Refusals hold no slot under the cap.
+        assert_eq!(conns.open(), 0);
+        assert!(conns.take().is_some());
+    }
 
     #[test]
     fn the_default_cap_is_half_the_open_file_limit_between_16_and_4096() {
