@@ -936,6 +936,18 @@ fn round_dropped_by_recovery(
     sync_on_a: bool,
     first: bool,
 ) -> Option<(Dropped, Vec<u8>)> {
+    let (dropped, token, decision_kept) = round_after_a_power_loss(vfs, sync_on_a, first)?;
+    decision_kept.then_some((dropped, token))
+}
+
+/// [`round_dropped_by_recovery`]'s run, with whether the round's Decision was kept
+/// ([`decision_kept`]): `false` is the round dropped as aborted, which that builder doesn't
+/// keep. `None` when the round is in doubt or committed whole.
+fn round_after_a_power_loss(
+    vfs: &Arc<SimVfs>,
+    sync_on_a: bool,
+    first: bool,
+) -> Option<(Dropped, Vec<u8>, bool)> {
     let db = open(vfs, Some(feed(1 << 20)));
     let (a, b) = tables(&db);
     // A token from before the round, in its session.
@@ -986,15 +998,13 @@ fn round_dropped_by_recovery(
     if kept {
         return None;
     }
-    if !decision_kept(&db, &a, &b, FeedStart::Oldest) {
-        return None;
-    }
+    let decision_kept = decision_kept(&db, &a, &b, FeedStart::Oldest);
     // The next session writes on both streams: on the torn one, the dropped session's
     // segment holds nothing readable, so a cursor there reads on into these (#2250's
     // sweeps: taken for an unreadable stream, which gave up the session).
     single(&db, &a, b"next-a", Durability::GroupSync);
     single(&db, &b, b"next-b", Durability::GroupSync);
-    Some(((db, a, b, decided, after), token))
+    Some(((db, a, b, decided, after), token, decision_kept))
 }
 
 /// The round [`round_dropped_by_recovery`] drops, from whichever stream coordinates it.
@@ -1079,24 +1089,28 @@ fn a_dropped_round_taken_for_an_earlier_one_expires_cleanly() {
     db.close().unwrap();
 }
 
-/// #2266: every scenario [`round_dropped_by_recovery`] keeps has the round's Decision, so
-/// the forced expiry comes at the first read to the end, with no wait. Over seeds where
-/// some picks tore the Decision with one PREPARE (syncing b's stream, when this was
-/// written; mutation-checked, with the builder's check off): those were kept before, and their reader delivered the single after
-/// the round and stayed `Pending`, which failed
-/// `a_dropped_round_taken_for_an_earlier_one_expires_cleanly` on CI whenever its own seeds
-/// fell that way.
+/// #2266: [`round_dropped_by_recovery`] keeps a run only with the round's Decision. Both
+/// outcomes of a dropped round are met here (#2271: the test required only that some run
+/// was kept, so it passed with no Decision torn), over seeds from 5108 until each was seen:
+/// - **Decision kept:** the forced expiry comes at the first read to the end, with no wait.
+/// - **Decision torn, with one PREPARE:** the builder doesn't keep it. Its reader has no
+///   Decision to expire on: it delivers the single after the round and is `Pending`, which
+///   failed `a_dropped_round_taken_for_an_earlier_one_expires_cleanly` on CI whenever its
+///   own seeds fell that way.
+///
+/// Mutation-checked: with `decision_kept` answering yes regardless, a torn run is taken for
+/// a kept one and its expiry never comes.
 #[test]
 fn a_dropped_round_whose_decision_was_torn_is_not_kept_as_a_scenario() {
-    let mut kept = 0;
-    for seed in 5108..5124 {
+    let (mut kept, mut torn) = (0, 0);
+    for seed in 5108..5108 + 64 {
         for sync_on_a in [true, false] {
-            let Some(((db, a, b, decided, _), _)) =
-                round_dropped_by_recovery(&SimVfs::new(seed), sync_on_a, false)
+            let vfs = SimVfs::new(seed);
+            let Some(((db, a, b, decided, after), _, decision_kept)) =
+                round_after_a_power_loss(&vfs, sync_on_a, false)
             else {
                 continue;
             };
-            kept += 1;
             db.inject(Fault::FeedRoundsBeforeSession, true);
             let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
             let mut got = Vec::new();
@@ -1107,16 +1121,26 @@ fn a_dropped_round_whose_decision_was_torn_is_not_kept_as_a_scenario() {
                     _ => break false,
                 }
             };
-            assert!(
-                expired && got.iter().all(|&s| s < decided),
-                "seed {seed}, sync_on_a {sync_on_a}: no Decision to expire on (got {got:?}, round {decided})"
-            );
+            let at = format!("seed {seed}, sync_on_a {sync_on_a}: got {got:?}, round {decided}");
+            if decision_kept {
+                kept += 1;
+                assert!(expired, "a Decision kept, and no expiry on it ({at})");
+                assert!(got.iter().all(|&s| s < decided), "past the round ({at})");
+            } else {
+                torn += 1;
+                assert!(!expired, "an expiry with no Decision to expire on ({at})");
+                assert!(got.contains(&after), "the single after the round ({at})");
+                assert!(!got.contains(&decided), "the dropped round ({at})");
+            }
             db.inject(Fault::FeedRoundsBeforeSession, false);
             drop(r);
             db.close().unwrap();
         }
+        if kept > 0 && torn > 0 {
+            return;
+        }
     }
-    assert!(kept > 0, "no seed kept a scenario");
+    panic!("64 seeds didn't meet both: {kept} with the Decision kept, {torn} with it torn");
 }
 
 /// [`round_dropped_by_recovery`], late in a session whose first segments retention has
