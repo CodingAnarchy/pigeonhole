@@ -2,8 +2,9 @@
 //! feed with the primary's ids. Behind `__unstable-replication`, hidden: not part of the API.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use pigeonhole_engine::{CatalogEvent, FamilyId, TableId, WriteBatch};
+use pigeonhole_engine::{CatalogEvent, Engine, FamilyId, TableId, WriteBatch};
 use pigeonhole_format::Kind;
 
 use crate::feed::StreamPosition;
@@ -518,6 +519,75 @@ impl State {
     }
 }
 
+/// Commits one part of a replicated run with the state after its last event, which it
+/// returns.
+fn commit_part(
+    engine: &Engine,
+    batch: WriteBatch,
+    end: &ReplicatedEvent,
+    max_ts: u64,
+) -> Result<State> {
+    let state = State {
+        primary: primary_of(&end.token),
+        after: end.after,
+        token: Some(end.token.clone()),
+    };
+    // A part holds one spanning commit's share or none (the split above), so its last
+    // event's xid is the whole part's (D329 2b).
+    engine.apply_replicated_with(batch, &state.encode(), max_ts, end.xid())?;
+    Ok(state)
+}
+
+/// The replica state `engine`'s cell holds; `None` on a database that isn't a replica.
+fn state_of(engine: &Engine) -> Result<Option<State>> {
+    #[cfg(test)]
+    tests::CELL_READS.with(|n| n.set(n.get() + 1));
+    engine
+        .replication_state()?
+        .map(|b| State::decode(&b))
+        .transpose()
+}
+
+/// A replica's state as the last apply through a handle stored it (#2264), on the [`Db`]
+/// every clone of the handle shares: each apply chains on it instead of reading the state
+/// cell. The cell sits at one fixed timestamp, so every version written since the last
+/// flush is one group a read resolves whole, and reading it per apply cost time quadratic
+/// in the applies between flushes.
+///
+/// It is set only after an apply's commits all succeed, emptied by an apply that fails,
+/// a bootstrap ([`Pigeonhole::begin_replication`]) and a promote, and kept per engine: a
+/// swapped-in engine (a recovery's reopen, a re-bootstrap's
+/// [`replace_with`](Pigeonhole::replace_with)) never matches what an earlier one stored, so
+/// its first apply reads its own cell. A swap doesn't take the lock: a recovery's swap may
+/// come while an apply holding it waits on the failed engine.
+///
+/// [`Db`]: crate::db::Db
+#[derive(Debug, Default)]
+pub(crate) struct StateCache(Mutex<Option<Known>>);
+
+impl StateCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Known>> {
+        // A panic inside an apply leaves the slot empty (it was taken): nothing to undo.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What [`StateCache`] holds: the state, and the engine it was stored through.
+#[derive(Debug)]
+struct Known {
+    /// Held weakly: the allocation outlives the engine, so no later engine shares its
+    /// address while this is here.
+    engine: Weak<Engine>,
+    state: State,
+}
+
+impl Known {
+    /// The state, if it was stored through `engine`.
+    fn on(self, engine: &Arc<Engine>) -> Option<State> {
+        std::ptr::eq(self.engine.as_ptr(), Arc::as_ptr(engine)).then_some(self.state)
+    }
+}
+
 /// A cell at one timestamp, as one commit may write it once: table, family, row, qualifier
 /// and timestamp.
 type Cell<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], u64);
@@ -587,6 +657,9 @@ impl Pigeonhole {
             after: StreamPosition { seqno, catalog },
             token: Some(token.clone()),
         };
+        // The first apply reads the state stored here (#2264).
+        let mut slot = self.db.replica_state.lock();
+        *slot = None;
         self.engine().begin_replication(&state.encode(), true)?;
         Ok(())
     }
@@ -658,6 +731,10 @@ impl Pigeonhole {
     /// it to finish. Not part of the stable API.
     #[doc(hidden)]
     pub fn promote(&self) -> Result<Option<FeedToken>> {
+        // Under the state cache's lock, which it leaves empty (#2264): no apply runs beside
+        // it, and none after it chains on a state the promote dropped.
+        let mut slot = self.db.replica_state.lock();
+        *slot = None;
         let token = self.replicated_token()?;
         self.engine().promote()?;
         Ok(token)
@@ -701,18 +778,42 @@ impl Pigeonhole {
     }
 
     fn replication_state(&self) -> Result<Option<State>> {
-        self.engine()
-            .replication_state()?
-            .map(|b| State::decode(&b))
-            .transpose()
+        state_of(&self.engine())
     }
 
-    /// Where an apply starting at `before` stands: the stored state, which must end there
-    /// (`run[0].before == stored.after`: anything else is a gap or an overlap). The first
-    /// apply, with none stored, needs a database with no tables of its own, and records
-    /// `before` as where it starts.
-    fn chain(&self, before: StreamPosition, primary: [u8; 16]) -> Result<()> {
-        match self.replication_state()? {
+    /// Runs one apply under the state cache's lock (#2264), on one engine throughout, so
+    /// applies run one at a time and each checks and commits on the same file. `apply` is
+    /// handed the state the last apply on that engine stored, when this handle knows it
+    /// (`None`: read the cell), and returns the state it stored, which the cache then holds.
+    /// On an error the cache holds nothing, so the next apply reads the cell: the truth
+    /// whether or not the failed commit landed.
+    fn applying(&self, apply: impl FnOnce(&Engine, Option<State>) -> Result<State>) -> Result<()> {
+        let mut slot = self.db.replica_state.lock();
+        let engine = self.db.engine_arc();
+        let known = slot.take().and_then(|k| k.on(&engine));
+        let state = apply(&engine, known)?;
+        *slot = Some(Known {
+            engine: Arc::downgrade(&engine),
+            state,
+        });
+        Ok(())
+    }
+
+    /// Where an apply starting at `before` stands: the stored state (`known`, or read from
+    /// the cell), which must end there (`run[0].before == stored.after`: anything else is a
+    /// gap or an overlap). The first apply, with none stored, needs a database with no
+    /// tables of its own, and records `before` as where it starts.
+    fn chain(
+        engine: &Engine,
+        known: Option<State>,
+        before: StreamPosition,
+        primary: [u8; 16],
+    ) -> Result<()> {
+        let stored = match known {
+            Some(s) => Some(s),
+            None => state_of(engine)?,
+        };
+        match stored {
             // Another database's history (#1436): a replica follows only its primary.
             Some(s) if s.primary != [0; 16] && s.primary != primary => Err(invalid(
                 "the events are another database's than the replica's primary".to_owned(),
@@ -724,7 +825,7 @@ impl Pigeonhole {
                 s.after
             ))),
             None => {
-                if !self.engine().tables().is_empty() {
+                if !engine.tables().is_empty() {
                     return Err(invalid(
                         "a replica's first apply needs a database with no tables of its own"
                             .to_owned(),
@@ -735,7 +836,7 @@ impl Pigeonhole {
                     after: before,
                     token: None,
                 };
-                self.engine().begin_replication(&start.encode(), false)?;
+                engine.begin_replication(&start.encode(), false)?;
                 Ok(())
             }
         }
@@ -775,12 +876,20 @@ impl Pigeonhole {
                 "the token to store must be the run's last event's".to_owned(),
             ));
         }
-        self.chain(first.before, primary_of(&first.token))?;
+        self.applying(|engine, known| {
+            Self::chain(engine, known, first.before, primary_of(&first.token))?;
+            Self::apply_run(engine, run)
+        })
+    }
+
+    /// [`apply_replicated`](Self::apply_replicated)'s commits, once the run chains: the
+    /// state its last part stored.
+    fn apply_run(engine: &Engine, run: &[ReplicatedEvent]) -> Result<State> {
         let mut batch = WriteBatch::new();
         let mut cells: HashSet<Cell<'_>> = HashSet::new();
         let mut max_ts = 0;
         let mut part_end: Option<&ReplicatedEvent> = None;
-        let cap = self.engine().max_replicated_part_bytes();
+        let cap = engine.max_replicated_part_bytes();
         let mut part_bytes = 0;
         for event in run {
             // A range drop in the run is refused here, at no cost to a run of commits (#2089's
@@ -808,7 +917,7 @@ impl Pigeonhole {
                         cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
                     }))
             {
-                self.commit_part(std::mem::take(&mut batch), end, max_ts)?;
+                commit_part(engine, std::mem::take(&mut batch), end, max_ts)?;
                 cells.clear();
                 max_ts = 0;
                 part_bytes = 0;
@@ -843,10 +952,10 @@ impl Pigeonhole {
                 after: end.after,
                 token: Some(end.token.clone()),
             };
-            self.engine().store_replication_state(&state.encode())?;
-            return Ok(());
+            engine.store_replication_state(&state.encode())?;
+            return Ok(state);
         }
-        self.commit_part(batch, end, max_ts)
+        commit_part(engine, batch, end, max_ts)
     }
 
     /// Raises the timestamp floor to at least `ts`, durably (D331, ICR 0141): a range move's
@@ -934,16 +1043,17 @@ impl Pigeonhole {
         if event.token != *token {
             return Err(invalid("the token to store must be the event's".to_owned()));
         }
-        self.chain(event.before, primary_of(&event.token))?;
-        self.engine()
-            .apply_range_drop(d.table, &d.start, d.end.as_deref())?;
-        let state = State {
-            primary: primary_of(&event.token),
-            after: event.after,
-            token: Some(event.token.clone()),
-        };
-        self.engine().store_replication_state(&state.encode())?;
-        Ok(())
+        self.applying(|engine, known| {
+            Self::chain(engine, known, event.before, primary_of(&event.token))?;
+            engine.apply_range_drop(d.table, &d.start, d.end.as_deref())?;
+            let state = State {
+                primary: primary_of(&event.token),
+                after: event.after,
+                token: Some(event.token.clone()),
+            };
+            engine.store_replication_state(&state.encode())?;
+            Ok(state)
+        })
     }
 
     /// One chunk of rows `[after, end)` of `table` at `snapshot`, for a range move's copy
@@ -990,19 +1100,6 @@ impl Pigeonhole {
         })
     }
 
-    fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {
-        let state = State {
-            primary: primary_of(&end.token),
-            after: end.after,
-            token: Some(end.token.clone()),
-        };
-        // A part holds one spanning commit's share or none (the split above), so its last
-        // event's xid is the whole part's (D329 2b).
-        self.engine()
-            .apply_replicated_with(batch, &state.encode(), max_ts, end.xid())?;
-        Ok(())
-    }
-
     /// Applies a catalog change of a primary's feed (D315 PR 3), with the primary's ids,
     /// between runs of commits, then stores `token` (the event's). It must start where the
     /// last apply ended. The change and the token are two commits (the manifest's, then the
@@ -1019,15 +1116,17 @@ impl Pigeonhole {
         if event.token != *token {
             return Err(invalid("the token to store must be the event's".to_owned()));
         }
-        self.chain(event.before, primary_of(&event.token))?;
-        self.engine().apply_catalog(&change.edits)?;
-        let state = State {
-            primary: primary_of(&event.token),
-            after: event.after,
-            token: Some(event.token.clone()),
-        };
-        self.engine().store_replication_state(&state.encode())?;
-        Ok(())
+        self.applying(|engine, known| {
+            Self::chain(engine, known, event.before, primary_of(&event.token))?;
+            engine.apply_catalog(&change.edits)?;
+            let state = State {
+                primary: primary_of(&event.token),
+                after: event.after,
+                token: Some(event.token.clone()),
+            };
+            engine.store_replication_state(&state.encode())?;
+            Ok(state)
+        })
     }
 }
 
@@ -1200,6 +1299,160 @@ pub struct TabletLoad {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::Cell as Counter;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use crate::{Family, FeedRetention, Options};
+
+    thread_local! {
+        /// State cell reads on this thread ([`state_of`]).
+        pub(super) static CELL_READS: Counter<u64> = const { Counter::new(0) };
+    }
+
+    fn reads() -> u64 {
+        CELL_READS.with(Counter::get)
+    }
+
+    fn options(vfs: &std::sync::Arc<pigeonhole_io::sim::SimVfs>) -> Options {
+        Options::default()
+            .vfs(std::sync::Arc::clone(vfs) as _)
+            .shards(2)
+            .pin_threads(false)
+            .change_feed(FeedRetention::bytes(16 << 20))
+    }
+
+    /// The events `feed` has ready now.
+    fn ready(feed: &mut crate::Feed) -> Vec<ReplicatedEvent> {
+        let mut out = Vec::new();
+        while feed
+            .next_event(Duration::from_millis(200))
+            .unwrap()
+            .is_some()
+        {
+            out.push(feed.replicated().expect("an event was delivered"));
+        }
+        out
+    }
+
+    /// Applies each event alone, through the call for its kind.
+    fn apply(replica: &Pigeonhole, events: &[ReplicatedEvent]) -> Result<()> {
+        for e in events {
+            if e.is_catalog() {
+                replica.apply_catalog(e, e.token())?;
+            } else {
+                replica.apply_replicated(std::slice::from_ref(e), e.token())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn put(primary: &Pigeonhole, rows: std::ops::Range<u32>) {
+        let t = primary
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        for i in rows {
+            t.mutate(format!("r{i}").as_bytes())
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+        }
+    }
+
+    /// #2264: applies chain on the state the last one stored without reading the cell, and
+    /// every case that may leave that state stale reads the cell again: a failed apply, an
+    /// engine swapped in by a recovery, a re-bootstrap's `replace_with` (a file at another
+    /// position, where a stale state would refuse the right run and take the wrong one), and
+    /// a promote.
+    #[test]
+    fn applies_chain_on_the_last_stored_state_and_every_reset_reads_the_cell() {
+        let vfs = pigeonhole_io::sim::SimVfs::new(2264);
+        let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+        let mut feed = primary.feed().open().unwrap();
+        let replica = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+        put(&primary, 0..2);
+        apply(&replica, &ready(&mut feed)).unwrap();
+
+        // Steady state: no reads, through this handle or a clone (one cache per database).
+        put(&primary, 2..8);
+        let events = ready(&mut feed);
+        assert_eq!(events.len(), 6);
+        let before = reads();
+        apply(&replica, &events[..3]).unwrap();
+        apply(&replica.clone(), &events[3..]).unwrap();
+        assert_eq!(
+            reads(),
+            before,
+            "an apply chains on what the last one stored"
+        );
+
+        // A failed apply (an overlap) empties the cache: the next one reads the cell.
+        put(&primary, 8..9);
+        let next = ready(&mut feed);
+        let e = apply(&replica, &events[5..]).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+        let before = reads();
+        apply(&replica, &next).unwrap();
+        assert_eq!(reads(), before + 1, "after a failure, the cell is read");
+        let before = reads();
+        put(&primary, 9..10);
+        apply(&replica, &ready(&mut feed)).unwrap();
+        assert_eq!(reads(), before, "and the cache holds again");
+
+        // A recovery's swap: the new engine's first apply reads its own cell.
+        let old = replica.db.engine_arc();
+        let (closed, handover) = old.close_for_reopen();
+        closed.unwrap();
+        let reopened = pigeonhole_engine::Engine::open_with(
+            Path::new("/r/data.phdb"),
+            options(&vfs).to_engine().unwrap(),
+            handover.unwrap(),
+        )
+        .map_err(|(e, _)| e)
+        .unwrap();
+        drop((replica.db.swap_engine(reopened), old));
+        put(&primary, 10..11);
+        let before = reads();
+        apply(&replica, &ready(&mut feed)).unwrap();
+        assert_eq!(reads(), before + 1, "a swapped-in engine's cell is read");
+
+        // A re-bootstrap: a copy of the primary at a later snapshot, swapped in. The stale
+        // state would refuse the copy's next event as a gap, and chain the old feed's.
+        put(&primary, 11..14);
+        let stale = ready(&mut feed);
+        let snap = primary.durable_snapshot().unwrap();
+        primary.backup_at(&snap, "/r/side.phdb").unwrap();
+        let mut fresh = primary.feed().from_snapshot(&snap).open().unwrap();
+        let start = fresh.token();
+        drop(snap);
+        let side = Pigeonhole::open("/r/side.phdb", options(&vfs)).unwrap();
+        side.begin_replication(&start).unwrap();
+        side.close().unwrap();
+        replica.replace_with("/r/side.phdb").unwrap();
+        let e = apply(&replica, &stale[..1]).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+        put(&primary, 14..16);
+        let after = ready(&mut fresh);
+        assert!(!after.is_empty());
+        apply(&replica, &after).unwrap();
+        assert_eq!(replica.replicated_token().unwrap(), Some(fresh.token()));
+
+        // A promote: the next apply finds no state, and is refused.
+        put(&primary, 16..17);
+        let later = ready(&mut fresh);
+        replica.promote().unwrap();
+        let before = reads();
+        let e = apply(&replica, &later).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+        assert_eq!(reads(), before + 1, "after a promote, the cell is read");
+        drop((feed, fresh));
+        replica.close().unwrap();
+        primary.close().unwrap();
+    }
 
     #[test]
     fn a_silent_spanning_share_round_trips_as_version_3() {
