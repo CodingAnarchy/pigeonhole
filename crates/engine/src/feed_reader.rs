@@ -1671,7 +1671,11 @@ impl FeedReader {
                 self.streams.iter_mut().for_each(|st| st.index.clear());
             }
             self.frontier = self.frontier.max(frontier);
-            self.read_through = Some(frontier);
+            // A stream whose cursor stopped at a segment with no successor though a later
+            // one is on disk looks again on the next poll, not only after a commit (#2279): a
+            // chain broken there is an error, and an idle feed would otherwise never look.
+            self.read_through =
+                (!self.streams.iter().any(|st| st.cursor.rechecking())).then_some(frontier);
             // A feed of every table (D315): the catalog changes up to the frontier, after it was
             // loaded. In the writer's process, once the session's sidecar appends stopped no
             // later change can reach the feed: it expires (simp724 on #1493).
