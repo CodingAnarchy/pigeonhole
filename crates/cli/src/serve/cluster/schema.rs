@@ -60,7 +60,7 @@ pub(crate) struct Outcome {
 }
 
 /// The schema records in `db`: each recorded table's `created`.
-fn records(db: &Pigeonhole) -> Result<BTreeMap<String, u64>, String> {
+pub(crate) fn records(db: &Pigeonhole) -> Result<BTreeMap<String, u64>, String> {
     let t = match db.table(identity::TABLE).and_then(|t| t.open()) {
         Ok(t) => t,
         Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(BTreeMap::new()),

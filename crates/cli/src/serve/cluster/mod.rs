@@ -40,11 +40,15 @@ pub(crate) mod range_follow;
 mod range_merge;
 pub(crate) mod range_move;
 pub(crate) mod range_prune;
+mod replay_cli;
+pub(crate) mod replay_tag;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
 pub(crate) mod spanning;
 pub(crate) mod stamp;
+pub(crate) mod tail_replay;
+pub(crate) mod tail_source;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
@@ -327,6 +331,10 @@ pub(crate) struct Node {
     hand_overs_seen: Mutex<std::collections::HashMap<String, (tokio::time::Instant, bool)>>,
     /// The forwarded calls' lanes (#2258): clients', nodes' and read parts' places.
     lanes: lanes::Lanes,
+    /// The old owners' files open here as tail sources (D336 PR 3a, `Cluster.ReadTail`).
+    pub(crate) tail_sources: Arc<tail_source::TailSources>,
+    /// The tail replays this node ran as a partition's owner (D336 PR 3a).
+    pub(crate) replays: tail_replay::Replays,
 }
 
 impl Node {
@@ -351,6 +359,8 @@ impl Node {
             pruning: std::sync::atomic::AtomicBool::new(false),
             hand_overs_seen: Mutex::new(std::collections::HashMap::new()),
             lanes: lanes::Lanes::default(),
+            tail_sources: Arc::default(),
+            replays: tail_replay::Replays::default(),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),

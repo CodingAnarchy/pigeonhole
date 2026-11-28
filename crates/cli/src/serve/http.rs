@@ -264,6 +264,22 @@ async fn preread(State(shared): State<Arc<Shared>>, req: Request, next: Next) ->
     response
 }
 
+/// What a connection past `--max-connections` answers each of its requests (#2262), in the
+/// request's protocol: `Overloaded`, so gRPC gets a trailers-only `UNAVAILABLE` and
+/// HTTP/1.1 a 503, which also closes the connection (`Connection: close`).
+pub(crate) fn refusal<B>(req: &axum::http::Request<B>) -> Response {
+    let mut response = error_response(
+        req.headers(),
+        ApiError::overloaded("the server is at --max-connections"),
+    );
+    if req.version() < axum::http::Version::HTTP_2 {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
+}
+
 /// An error in the protocol the request spoke: a gRPC status for gRPC, JSON otherwise.
 fn error_response(headers: &HeaderMap, e: ApiError) -> Response {
     let grpc = headers

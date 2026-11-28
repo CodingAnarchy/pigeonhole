@@ -1068,6 +1068,7 @@ impl Member {
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
             xid: Default::default(),
+            replayed: None,
         };
         self.send(Out::event(event), true).await
     }

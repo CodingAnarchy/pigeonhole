@@ -909,7 +909,7 @@ impl Node {
     }
 
     /// Node `id`'s address in this node's map.
-    fn address_of(&self, id: &str) -> Result<String, Failure> {
+    pub(super) fn address_of(&self, id: &str) -> Result<String, Failure> {
         let map = self.get_map().map_err(|e| Failure::usage(&e.message))?;
         map.nodes
             .iter()

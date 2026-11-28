@@ -44,6 +44,14 @@ D336 (#2148) replays an old owner's unreplicated tail into the partition's new o
   - the plain changes go in exactly as logged (`Transaction::push_logged`);
   - the transaction reads the source row raw (`Transaction::read_row_logged`) to decide whether anything newer is there.
 
+**A vector id's "nothing newer" (D336 Amendment 3, V1, option A; the vector crate, ai1249):**
+1. `M{id}:map:l` carries the id's last client write's timestamp. The index's moves (`split`, `split_paged`, `reassign`, `merge`) rewrite it at its stored timestamp, read in their transaction, never above it. The one exception is a vector with no mapping, which only a broken index has (`verify` reports it): a move gives it one at the move's own timestamp. So in that case alone, `M{id}`'s newest timestamp is a move's, and the replay would wrongly supersede a tail write older than the move. A reassign to the list a vector is already in never happens: phase 2 moves only out of a neighbour, into one of the split's two lists.
+2. A client insert or upsert writes it at the commit's fresh timestamp, in the same commit as its `L…:vec:{id}` write. That includes an upsert within the id's own list, and a bulk load's repeat of an id.
+3. `L…:vec:{id}` cells take the move's fresh timestamp. A move leaves a delete marker in the old list, and a marker hides every version at or below its timestamp whatever the commit order (FORMAT.md §2), so a vector moved back into that list at its old timestamp would stay hidden.
+4. D336's replay checks "nothing newer" for a vector id by reading `M{id}` raw: its newest version, the row tombstone and the `map:l` column delete. Anything strictly above the tail change's timestamp supersedes it.
+
+The index's own reads (searches, `verify`, the moves' reads) are at seqno snapshots, never bounded by timestamp, so a mapping a move rewrote at an older timestamp is seen by every read after the move's commit (simp724).
+
 ## Semantics
 
 **`push_logged_beside` / `Transaction::push_logged` (simp724 on D336 PR 1):**
@@ -78,6 +86,34 @@ D336 (#2148) replays an old owner's unreplicated tail into the partition's new o
 - So there's no new format or feature bit (the coordinator's condition). The replay's version byte is inside the tag's bytes.
 - 1–255 bytes, checked when the commit is routed. `None` is `commit_logged`.
 
+## D336 PR 3a: what the replay adds
+
+Two more hidden calls, under the same feature, and one wire field. All additive.
+
+```rust
+// pigeonhole, #[cfg(feature = "__unstable-tail-replay")], #[doc(hidden)]
+impl LoggedBatch<'_> {
+    /// `commit`, at `durability` (`commit_logged_with` with the engine's durability).
+    pub fn commit_with(self, durability: Durability) -> Result<CommitInfo>;
+}
+impl Feed {
+    /// Whether the commit the last `next` delivered was feed-silent (a range move's copy
+    /// or cleanup): the tail source tells the replay, which skips it by name.
+    pub fn delivered_silent(&self) -> bool;
+}
+```
+
+- **`commit_with`:** a replayed commit is one logged batch with its mark, at `GroupSync`, so the mark is durable with the commit it records. `commit` keeps the database's default durability.
+- **`ResolveTxn.read_only` (`cluster.proto`, field 3):** the replay asks a share's home what its decision row says, and nothing more. The home answers COMMITTED or ABORTED from the row and UNKNOWN for no row, and records nothing; the resolver's own ask records an abort over an absent row (D329 2b), which must never follow from a replay.
+  - **Mixed versions:** a node that doesn't know the field ignores it and runs the resolver's ask, which may record that abort. No released build has `tail_replay`: a replay runs only once the cluster adopted it, so every node of the map knows `read_only` by then.
+- **The replay's rows pass the caller's checks** (above):
+  - D331's range gate: each replayed row as a write (`RangeState::check_rows`), before anything is dropped or written. A refusal stops the run, which a rerun resumes from the mark. While the tail is PENDING, no move of the partition starts (D336 PR 2).
+  - D329's holds: the engine's, which see a logged commit as any (`overlaps_undecided` reads the batch). A commit writing a row an undecided share read waits for the decision, and one writing a row the share writes is ordered by the decision's seqno (D271).
+  - The write gate (D326): each commit enters it, and the drop of (b) below does too.
+- **Amendment 5's (b), drop then apply:** a share the new owner's copy holds in doubt is first dropped (`Pigeonhole::decide(xid, false)`), then applied with the mark in one commit. The drop writes no data, no decision row and no feed event: an external share's abort delivers nothing (the engine's feed reader). A crash between the two leaves the share decided nowhere here and the mark unmoved, and the rerun asks the home (a).
+  - **When D335 PR 4 lands,** a replicated prepare can be in doubt on the new owner, and "a branch keeps no record of a share it decided" stops being enough: deciding a replicated prepare that a PENDING tail names must then go through the replay's gate and write the mark in the same commit. Whichever of D336 and D335 PR 4 lands second wires it.
+    - **The race it closes** (simp724's N2 on #2265): the resolver can decide X between the replay's in-doubt check and its drop. The drop then fails, and the rerun takes (a), finds COMMITTED, and applies the share a second time. In 3a a copy holds no replicated prepare, so nothing reaches it.
+
 ## Not in this ICR
 
 - **`promoted_from`** (D336 §3) is dropped (Amendment 4). The fork token lives in the promote intent's sibling file, in a `__phdb_cluster` row written with the identity, and in the map. It's cli-only, with no format change.
@@ -85,4 +121,4 @@ D336 (#2148) replays an old owner's unreplicated tail into the partition's new o
 
 ## Callers
 
-`phdb serve`'s tail replay (D336 PR 3). Tests: `crates/pigeonhole/tests/tail_replay.rs` and `crates/engine/tests/it/logged_beside.rs`. The `delete_row` tie (a logged cell at exactly the commit's timestamp) has no test, because a test can't pin the commit's timestamp.
+`phdb serve`'s tail replay (D336 PR 3). Tests: `crates/pigeonhole/tests/tail_replay.rs`, `crates/engine/tests/it/logged_beside.rs`, and the cluster's `tests/fence/tail_replay.rs` and `tests/spanning.rs` (the read-only resolve). The `delete_row` tie (a logged cell at exactly the commit's timestamp) has no test, because a test can't pin the commit's timestamp.
