@@ -482,3 +482,61 @@ fn a_punched_range_gives_its_blocks_back() {
         assert!(after + 3 * MIB <= before, "allocated {before} -> {after}");
     }
 }
+
+/// #2279 on a real file (audit120): two threads grow one handle at once. One grows it by
+/// `BIG` (the shorter growth), the other by `SMALL` past that and writes a marker at its new
+/// end. Where `allocate` reads the length and then sets it (macOS after `F_PREALLOCATE`,
+/// Windows, Linux without `fallocate`), the small growth can finish inside the big one's
+/// reservation, and the big one then sets the length back under the marker. Each round, the
+/// length and the marker must survive. Linux with `fallocate` never shrinks, so there it only
+/// checks the contract.
+#[test]
+fn concurrent_allocates_on_one_handle_never_shrink_the_file() {
+    const BIG: u64 = 1 << 20;
+    const SMALL: u64 = 4 << 10;
+    const ROUNDS: u64 = 5_000;
+    // The file starts over every `CYCLE` rounds, so it stays under 8 MiB.
+    const CYCLE: u64 = 7;
+    let (_dir, vfs, path) = setup("allocate-race");
+    let f = vfs.open(&path, OpenOptions::read_write_create()).unwrap();
+    let start = std::sync::Barrier::new(2);
+    let done = std::sync::Barrier::new(2);
+    let mut failures = Vec::new();
+    std::thread::scope(|s| {
+        let (f, start, done) = (&f, &start, &done);
+        s.spawn(move || {
+            for k in 0..ROUNDS {
+                start.wait();
+                f.allocate((k % CYCLE) * (BIG + SMALL), BIG).unwrap();
+                done.wait();
+            }
+        });
+        for k in 0..ROUNDS {
+            let end = (k % CYCLE + 1) * (BIG + SMALL);
+            if k % CYCLE == 0 {
+                // The other thread waits at `start`.
+                f.set_len(0).unwrap();
+            }
+            start.wait();
+            f.allocate(end - SMALL, SMALL).unwrap();
+            f.write_at(&k.to_le_bytes(), end - 8).unwrap();
+            done.wait();
+            // Recorded, not asserted here: a panic on this thread would leave the other
+            // waiting on the barrier, and the test would hang instead of failing.
+            let len = f.len().unwrap();
+            let mut marker = [0u8; 8];
+            if len >= end {
+                f.read_at(&mut marker, end - 8).unwrap();
+            }
+            if len < end || u64::from_le_bytes(marker) != k {
+                failures.push((k, len, u64::from_le_bytes(marker)));
+            }
+        }
+    });
+    assert!(
+        failures.is_empty(),
+        "{} of {ROUNDS} rounds lost the growth (round, length, marker): {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+}
