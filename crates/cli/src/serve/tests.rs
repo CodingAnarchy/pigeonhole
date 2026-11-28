@@ -167,6 +167,7 @@ fn a_quiet_stream_still_moves_its_token() {
         event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
         partition: String::new(),
         xid: Default::default(),
+        replayed: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["token"], "AQI=");

@@ -112,6 +112,95 @@ service Cluster {
   // asking node, at a round no older than the grant's, so a delayed release can never end
   // a grant that's live. Cluster scope, gRPC only.
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  // Node to node (D336 PR 3): an old owner's tail of a partition, read from its kept file
+  // (the request's `from_history_epoch` and `from_epoch`) past `token`, which opens as a tail
+  // source (`PARTITION_ROLE_TAIL_SOURCE`). Each commit in order, then `end`. Served only when
+  // this node's map places the partition elsewhere at an epoch above `from_epoch`, the
+  // partition isn't open here in another role, and the file is an owner's (never a replica
+  // copy's); otherwise `FailedPrecondition`, which the caller retries. A tail whose start
+  // retention already pruned answers `FailedPrecondition` naming it lost: never a part.
+  // Cluster scope, gRPC only.
+  rpc ReadTail(ReadTailRequest) returns (stream ReadTailEvent);
+  // D336 PR 3: on the partition's owner, replays an old owner's tail (`ReadTail` from its
+  // node) into the partition, from the replay's mark, until the source's end or
+  // `timeout_ms`, and answers the partition with its `replay` progress. A `dry_run` reads the
+  // whole tail and applies nothing. One replay per partition at a time: a second call while
+  // one runs waits on it. Admin scope, or a node's cluster token.
+  rpc ReplayTail(ReplayTailRequest) returns (LocalPartition);
+}
+
+// D336 PR 3: `Cluster.ReadTail`'s request.
+message ReadTailRequest {
+  string partition = 1;
+  // The failover event's old file: its history epoch and identity epoch.
+  uint64 from_history_epoch = 2;
+  uint64 from_epoch = 3;
+  // The all-tables feed token to read from: the event's fork token, or the replay mark's.
+  bytes token = 4;
+  // Commits at or below this origin seqno are skipped at the source (a resumed replay).
+  uint64 after_seqno = 5;
+}
+
+// D336 PR 3: one message of `Cluster.ReadTail`'s stream.
+message ReadTailEvent {
+  oneof event {
+    TailCommit commit = 1;
+    TailEnd end = 2;
+  }
+}
+
+// D336 PR 3: one event of an old owner's tail, as its file logged it, by name: the old
+// file's table and family ids mean nothing on the new owner, whose catalog has moved on.
+message TailCommit {
+  // Its seqno in the old file: the replay's origin seqno.
+  uint64 seqno = 1;
+  // Its changes as logged (kinds, timestamps, stored values), each naming its table and
+  // family; none for an event `skip` names.
+  repeated RawChange changes = 2;
+  // The old feed's position after it: the replay's mark stores it, so a resumed replay reads
+  // on from there.
+  bytes token = 3;
+  // The commit's timestamp.
+  uint64 timestamp = 4;
+  // The commit's raw tag: a D329 xid, an earlier replay's tag (D336 §8), or empty.
+  bytes tag = 5;
+  // Feed-silent: a range move's copy or cleanup (§7's S2).
+  bool silent = 6;
+  // An event that isn't a commit to replay (§7's S2 and S3), with no changes.
+  TailSkip skip = 7;
+  // For each table of `changes`: the old file's schema record `created` for the table the
+  // commit wrote, or 0 for one the old owner dropped later in the tail. The new owner replays
+  // a change only into its table with the same `created` (§7's S5).
+  map<string, uint64> created = 8;
+}
+
+// D336 PR 3: a tail event the replay passes over whole.
+enum TailSkip {
+  // A commit: replayed, change by change.
+  TAIL_SKIP_NONE = 0;
+  // A catalog change: the cluster's schema is the map's (S3).
+  TAIL_SKIP_CATALOG = 1;
+  // A range drop: the map's moves decide what those ranges hold (S2).
+  TAIL_SKIP_RANGE_DROP = 2;
+}
+
+// D336 PR 3: the tail's end: nothing past it in the old file.
+message TailEnd {
+  // The file's last durable seqno.
+  uint64 last_seqno = 1;
+}
+
+// D336 PR 3: `Cluster.ReplayTail`'s request.
+message ReplayTailRequest {
+  string partition = 1;
+  // The failover event whose tail to replay (its old file's epochs).
+  uint64 from_history_epoch = 2;
+  uint64 from_epoch = 3;
+  // Read the whole tail and apply nothing: the reply says what would be applied, skipped and
+  // refused.
+  bool dry_run = 4;
+  // How long to replay before answering (the replay goes on); 0 for the node's default.
+  uint64 timeout_ms = 5;
 }
 
 // One partition on the node a `Cluster` call is sent to (D317 ticket 6).
@@ -506,6 +595,12 @@ message FailoverEvent {
   // the replay marks its progress under) and its identity epoch (the source checks it).
   uint64 from_history_epoch = 16;
   uint64 from_epoch = 17;
+  // D336 PR 3: PARTITION: the replay's mark (`replay/<from_history_epoch>`, the last origin
+  // seqno it applied) a DONE tail was set at. A map may set `tail_state` DONE only with it,
+  // and only equal to the end the owner's replay reported reaching
+  // (`LocalPartition.replay`), so no hand-made map claims a replay that never ran; DISCARDED
+  // needs none. 0 otherwise.
+  uint64 replayed_through = 18;
 }
 
 // D336 (#2148): what became of a failed-over partition's old owner's tail.
@@ -875,11 +970,44 @@ message LocalPartition {
   // D336: an old owner's kept tail of this partition, once it opens its file as a tail
   // source (PR 3); absent otherwise.
   TailKept tail_kept = 40;
+  // 41 is D335 PR 2b's.
+  // D336 PR 3: P's owner's replay of an old owner's tail (`phdb cluster replay-tail`), the
+  // last one since the node started; absent when none ran.
+  ReplayProgress replay = 42;
+}
+
+// D336 PR 3: an owner's replay of an old owner's tail, as it stands.
+message ReplayProgress {
+  // The failover event whose tail it is: the old file's history epoch (the mark's origin)
+  // and identity epoch.
+  uint64 from_history_epoch = 1;
+  uint64 from_epoch = 2;
+  // The last origin seqno of the source's tail (its `TailEnd`); 0 until the source answered.
+  uint64 source_end = 3;
+  // The replay's mark: the last origin seqno applied, skipped or refused.
+  uint64 mark = 4;
+  // Commits applied, skipped whole (already applied, or nothing kept) and refused.
+  uint64 applied = 5;
+  uint64 skipped = 6;
+  uint64 refused = 7;
+  bool running = 8;
+  // Why the last run stopped short of `source_end`; empty if it didn't.
+  string last_error = 9;
+  // The latest named skips and refusals, at most 32, oldest first.
+  repeated ReplaySkip skips = 10;
+}
+
+// D336 PR 3: a tail commit the replay skipped or refused, and why.
+message ReplaySkip {
+  // Its origin seqno.
+  uint64 seqno = 1;
+  // `not_owned`, `aborted`, `in_doubt`, `already_decided`, `conflict`, ...
+  string reason = 2;
 }
 
 // D336: an old owner's tail of a partition, as its file holds it.
 message TailKept {
-  // The bytes of the file's feed history past the fork token.
+  // The kept file's bytes on disk.
   uint64 bytes = 1;
   // The file's last durable seqno.
   uint64 last_durable_seqno = 2;
@@ -899,6 +1027,9 @@ enum PartitionRole {
   PARTITION_ROLE_OWNER = 1;
   // One of `Partition.replicas`: a read-only copy following the owner.
   PARTITION_ROLE_REPLICA = 2;
+  // D336 PR 3: an old owner's file of P, open as the source of its tail's replay
+  // (`Cluster.ReadTail`): no lease, no client call, closed after `TAIL_SOURCE_IDLE`.
+  PARTITION_ROLE_TAIL_SOURCE = 3;
 }
 
 // D328: a replica copy's follower.
@@ -1226,6 +1357,10 @@ message DecideTxnRequest {
 message ResolveTxn {
   string xid = 1;
   string acked = 2;
+  // D336 PR 3a: answer from the home's decision row alone and write nothing: no row (or a
+  // live session) answers UNKNOWN, never an abort marker. An old owner's tail replay asks
+  // so (Amendment 5's (a)): since #2164 an absent row may be a collected COMMITTED.
+  bool read_only = 3;
 }
 
 // The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
