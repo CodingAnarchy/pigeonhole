@@ -10,6 +10,16 @@ mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
 
+/// Holds a handle's length lock (#2279): every change of the file's length through the
+/// handle that reads the length first (`allocate`'s stat-then-extend, `set_len`) runs under
+/// it, so a growth computed from a stale length can never set the length below what a
+/// concurrent growth through the same handle already set. Poisoning is ignored: the lock
+/// guards no data, only the order of length changes.
+pub(crate) fn hold_len(lock: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// What the OS says about a process id (unix: `current_start_time` reads its own).
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

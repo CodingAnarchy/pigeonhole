@@ -607,3 +607,62 @@ fn a_hinted_output_whose_sync_fails_fails_the_commit() {
     drop(pager);
     assert_eq!(reopened_root(&vfs), root(1));
 }
+
+/// #2279 (simp724): a growth ahead of need allocates its claimed tail after dropping the
+/// allocator lock, so an allocation meanwhile can grow the file inline past that tail and
+/// hand out an extent there. Here the growth ahead pauses between computing its range and
+/// changing the file's length; in the pause, an allocation grows the file inline and a page
+/// is written into its extent. Before the fix, the growth ahead then set the length back to
+/// the end of its own tail, truncating the data file under that extent.
+#[test]
+fn an_inline_growth_survives_a_growth_ahead_in_flight() {
+    let sim = SimVfs::new(common::seed());
+    let vfs: VfsRef = sim.clone();
+    let pager = Arc::new(Pager::create(&vfs, path()).unwrap());
+    pager.set_grow_ahead(BLOCK, 2 * BLOCK).unwrap();
+    pager.commit_root(root(1)).unwrap();
+    // Warm up until every block-sized allocation finds a block grown ahead and starts the
+    // next growth ahead (`a_growing_file_grows_ahead_of_need_not_inline`).
+    while pager.stats().growths_ahead == 0 {
+        pager.allocate(BLOCK).unwrap();
+    }
+    let before = pager.stats();
+    let inline = Arc::new(Mutex::new(None));
+    let (p, got) = (Arc::clone(&pager), Arc::clone(&inline));
+    // Nothing else allocates on the file until the next growth ahead does.
+    sim.pause_next_allocate(
+        |_, _| true,
+        move || {
+            // The claimed tail isn't free yet: this grows the file inline, past it.
+            let e = p.allocate(BLOCK).unwrap();
+            p.write(e, 0, &[0x79; 4096]).unwrap();
+            *got.lock().unwrap() = Some(e);
+        },
+    );
+    pager.allocate(BLOCK).unwrap();
+    let s = pager.stats();
+    assert_eq!(
+        s.growths,
+        before.growths + 1,
+        "the pause grew inline: {s:?}"
+    );
+    assert_eq!(s.growths_ahead, before.growths_ahead + 1, "{s:?}");
+    let e = inline.lock().unwrap().expect("the pause ran");
+    let len = vfs
+        .open(path(), OpenOptions::read())
+        .unwrap()
+        .len()
+        .unwrap();
+    assert!(
+        len >= e.offset() + e.len(),
+        "the growth ahead cut the file to {len} under the extent at {} + {}",
+        e.offset(),
+        e.len()
+    );
+    let mut page = [0u8; 4096];
+    pager.read(e, 0, &mut page).unwrap();
+    assert_eq!(page, [0x79; 4096]);
+    pager.commit_root(root(2)).unwrap();
+    drop(pager);
+    assert_eq!(reopened_root(&vfs), root(2));
+}

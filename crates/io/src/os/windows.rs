@@ -135,10 +135,22 @@ fn is_local(file: &fs::File) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+/// Grows the file to cover `[offset, offset + len)` if it is shorter; never shrinks it. The
+/// length read and the `set_len` run under the handle's length lock ([`super::hold_len`]):
+/// between them, another growth through the handle could otherwise set a larger length,
+/// which this `set_len` would cut back, truncating what was written there (#2279). A write
+/// past the end through another path can still be cut the same way, so callers allocate a
+/// range before writing into it.
+pub(crate) fn allocate(
+    file: &fs::File,
+    offset: u64,
+    len: u64,
+    len_lock: &std::sync::Mutex<()>,
+) -> Result<()> {
     let end = offset
         .checked_add(len)
         .ok_or(Error::new(ErrorKind::Other, "allocate: range overflows"))?;
+    let _len = super::hold_len(len_lock);
     let cur = file.metadata().map_err(|e| Error::os("stat", e))?.len();
     if end > cur {
         file.set_len(end).map_err(|e| Error::os("allocate", e))?;

@@ -159,13 +159,23 @@ pub(crate) fn start_writeback(file: &fs::File, offset: u64, len: u64) -> Result<
     Err(Error::os("sync_file_range", io::Error::last_os_error()))
 }
 
+/// Preallocates `[offset, offset + len)`, growing the file to cover it. `len_lock` is the
+/// handle's length lock ([`super::hold_len`]): `fallocate` (mode 0) only ever grows the file,
+/// atomically, so it runs without it; the fallback that reads the length and then sets it
+/// runs under it (#2279).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+pub(crate) fn allocate(
+    file: &fs::File,
+    offset: u64,
+    len: u64,
+    len_lock: &std::sync::Mutex<()>,
+) -> Result<()> {
     let start = off(offset, "allocate: offset too large")?;
     let count = off(len, "allocate: length too large")?;
     if count == 0 {
         // fallocate rejects a zero length with EINVAL; keep the cross-backend semantics
         // (extend to `offset` if the file is shorter) without the syscall.
+        let _len = super::hold_len(len_lock);
         return extend(file, offset, len);
     }
     // SAFETY: plain syscall on an fd owned by `file`.
@@ -175,16 +185,29 @@ pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
         // The filesystem cannot preallocate: fall back to extending the length.
-        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => extend(file, offset, len),
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
+            let _len = super::hold_len(len_lock);
+            extend(file, offset, len)
+        }
         _ => Err(Error::os("fallocate", err)),
     }
 }
 
+/// Preallocates `[offset, offset + len)` (`F_PREALLOCATE`, which reserves space past the
+/// physical end but leaves the length alone), then grows the length to cover it. All of it
+/// runs under the handle's length lock ([`super::hold_len`]): the reservation is sized from
+/// the length read first, and the growth sets the length from it (#2279).
 #[cfg(target_vendor = "apple")]
-pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+pub(crate) fn allocate(
+    file: &fs::File,
+    offset: u64,
+    len: u64,
+    len_lock: &std::sync::Mutex<()>,
+) -> Result<()> {
     let end = offset
         .checked_add(len)
         .ok_or(Error::new(ErrorKind::Other, "allocate: range overflows"))?;
+    let _len = super::hold_len(len_lock);
     let cur = file.metadata().map_err(|e| Error::os("stat", e))?.len();
     if end <= cur {
         return Ok(());
@@ -210,8 +233,16 @@ pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     extend(file, offset, len)
 }
 
+/// Grows the file to cover `[offset, offset + len)`, under the handle's length lock
+/// ([`super::hold_len`], #2279).
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+pub(crate) fn allocate(
+    file: &fs::File,
+    offset: u64,
+    len: u64,
+    len_lock: &std::sync::Mutex<()>,
+) -> Result<()> {
+    let _len = super::hold_len(len_lock);
     extend(file, offset, len)
 }
 
@@ -268,7 +299,13 @@ pub(crate) fn punch_hole(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     }
 }
 
-/// Grows the file to cover `[offset, offset + len)` if it is shorter.
+/// Grows the file to cover `[offset, offset + len)` if it is shorter; never shrinks it.
+///
+/// The caller holds the handle's length lock ([`super::hold_len`]): between the `stat` and
+/// the `set_len`, another growth through the handle could otherwise set a larger length,
+/// which this `set_len` would cut back, truncating what was written there (#2279). A write
+/// past the end through another path can still be cut the same way, so callers allocate a
+/// range before writing into it.
 fn extend(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let end = offset
         .checked_add(len)

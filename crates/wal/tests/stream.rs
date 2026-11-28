@@ -779,3 +779,58 @@ fn a_new_streams_creation_is_durable_once_its_file_and_directory_syncs_finish() 
         Some(true)
     );
 }
+
+/// #2279: a slot the stream grows inline while a spares preparation is growing the file
+/// keeps its segment. The interleaving audit120 traced: the preparation claims slots 1 and 2;
+/// between its allocate of slot 2 reading the file's length and setting it, the stream fills
+/// epoch 1, finds no spare ready, grows slot 3 inline and writes and syncs epoch 2 there.
+/// Before the fix, the preparation then set the length to the end of slot 2, cutting slot 3
+/// (and epoch 2's synced records) off, and replay ended at epoch 1.
+#[test]
+fn an_inline_slot_survives_a_spares_preparation_growing_the_file_meanwhile() {
+    use std::sync::{Arc, Mutex};
+
+    let sim = pigeonhole_io::sim::SimVfs::new(2279);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let opts = opts(4, 2);
+    let seg = opts.segment_size;
+    let wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    let spares = wal.spares();
+    let wal = Arc::new(Mutex::new(wal));
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let (w, out) = (Arc::clone(&wal), Arc::clone(&written));
+    sim.pause_next_allocate(
+        move |offset, len| offset + len == 3 * seg,
+        move || {
+            let mut wal = w.lock().unwrap();
+            let mut out = out.lock().unwrap();
+            let mut seqno = 0;
+            // Fill epoch 1, then one record into epoch 2.
+            while wal.written().epoch() < 2 || out.len() < 4 {
+                seqno += 1;
+                let rec = batch(seqno, FRAME_SIZE / 2);
+                let t = wal.append(&rec.record(), Durability::Sync).unwrap();
+                wal.write().unwrap();
+                out.push((t.end, rec.bytes()));
+            }
+            wal.sync().unwrap();
+            assert_eq!(wal.written().epoch(), 2);
+            assert_eq!(wal.inline_grows(), 1, "epoch 2 took a slot grown inline");
+        },
+    );
+    assert_eq!(spares.prepare(2).unwrap(), 2);
+    let wal = Arc::try_unwrap(wal).unwrap().into_inner().unwrap();
+    assert_eq!(wal.inline_grows(), 1, "the pause ran");
+    assert_eq!(file_len(&vfs), 4 * seg, "the preparation shrank the file");
+    let headers = headers(&vfs, seg);
+    assert_eq!(
+        headers[3].map(|h| h.epoch),
+        Some(2),
+        "epoch 2 kept its slot"
+    );
+    drop(wal);
+
+    let want = Arc::try_unwrap(written).unwrap().into_inner().unwrap();
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.records, want, "replay reaches every synced record");
+}

@@ -135,6 +135,7 @@ impl PreadVfs {
                 writable: opts.write || opts.create || opts.create_new,
                 direct_align,
                 held: Mutex::new(HashMap::new()),
+                len_lock: Mutex::new(()),
                 #[cfg(target_os = "linux")]
                 nowait: Arc::clone(&self.nowait),
                 #[cfg(target_os = "linux")]
@@ -267,6 +268,10 @@ struct FileInner {
     direct_align: Option<usize>,
     /// Locks this handle holds, by byte.
     held: Mutex<HashMap<u64, LockMode>>,
+    /// Orders the length changes made through this handle that read the length first
+    /// (`allocate` off Linux's `fallocate`, `set_len`), so a growth never sets the length
+    /// below one that ran meanwhile (#2279, `os::hold_len`).
+    len_lock: Mutex<()>,
     /// D292: the backend's switch and counters, and this handle's own state.
     #[cfg(target_os = "linux")]
     nowait: Arc<nowait::Backend>,
@@ -696,6 +701,7 @@ impl File for PreadFile {
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
+        let _len = os::hold_len(&self.inner.len_lock);
         self.inner
             .file()
             .set_len(len)
@@ -703,7 +709,7 @@ impl File for PreadFile {
     }
 
     fn allocate(&self, offset: u64, len: u64) -> Result<()> {
-        os::allocate(self.inner.file(), offset, len)
+        os::allocate(self.inner.file(), offset, len, &self.inner.len_lock)
     }
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
