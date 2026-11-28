@@ -192,6 +192,10 @@ impl Node {
             // D335: each partition's replica acks as the map has them (k, its replicas),
             // still under the install lock, as an open arms them.
             self.apply_acks(m);
+            // D336 PR 3a: fork rows no PENDING tail needs go, and so do idle tail sources
+            // of tails no longer PENDING (cli692's S-b on #2265).
+            self.prune_forks_soon(m);
+            self.tail_sources.close_settled(m, &self.id);
         }
         self.wake_copies(&moved);
         Ok(version)
@@ -323,6 +327,15 @@ impl Node {
                 .get_map()
                 .map(|c| c.adopted_features)
                 .unwrap_or_default();
+            // D336 PR 3a: a forced map claims no replay (the writer confirms DONE with the
+            // owner, which a recovery skips), and one that drops a tail's old node discards
+            // that tail (C3).
+            if let Ok(current) = self.get_map() {
+                refuse_forced_done(&current, &map)?;
+            }
+            for d in super::tail_replay::discard_removed_sources(&mut map) {
+                eprintln!("phdb serve: the forced map discards {d}");
+            }
             let version = self.install_async(map, None, |_| Ok(None)).await?;
             let pushed = self.push_all().await;
             return Ok(SetMapResponse {
@@ -407,6 +420,9 @@ impl Node {
                 self.every_node_keeps(&map, REPLICA_ACK_WAIT_FEATURE, "a partition's replica_acks")
                     .await?;
             }
+            // D336 PR 3a: a tail goes DONE only as its owner reports it (C4), and its old
+            // node stays in the map while it's PENDING (C3).
+            self.check_tails(&current, &map).await?;
             // A node the map adds must report each adopted feature, and the writer adopts
             // what every node reports now.
             self.new_nodes_keep_adopted(&current, &map).await?;
@@ -594,4 +610,30 @@ impl Node {
         };
         (joint, pushed)
     }
+}
+
+/// D336 PR 3a: a forced map can't move a PENDING tail to DONE, since the writer's check with
+/// the owner ([`Node::check_tails`]) is what a recovery skips. Discarding stays allowed.
+fn refuse_forced_done(current: &ClusterMap, new: &ClusterMap) -> Result<(), ApiError> {
+    use crate::serve::proto::TailState as T;
+    for e in current
+        .failovers
+        .iter()
+        .filter(|e| e.tail_state() == T::Pending)
+    {
+        if new.failovers.iter().any(|n| {
+            n.kind == e.kind
+                && n.partition == e.partition
+                && n.to == e.to
+                && n.to_epoch == e.to_epoch
+                && n.tail_state() == T::Done
+        }) {
+            return Err(ApiError::failed_precondition(format!(
+                "a forced map can't set partition {:?}'s old owner's tail DONE: only a replay \
+                 does, through the map's writer; a forced map may discard it",
+                e.partition
+            )));
+        }
+    }
+    Ok(())
 }

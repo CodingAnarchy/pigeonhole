@@ -27,7 +27,7 @@ pub(crate) static FAIL_AFTER_FIRST_RENAME: std::sync::Mutex<Vec<PathBuf>> =
     std::sync::Mutex::new(Vec::new());
 
 /// `.phdb-incoming/<P>.installing`.
-fn marker(dir: &Path, partition: &str) -> PathBuf {
+pub(super) fn marker(dir: &Path, partition: &str) -> PathBuf {
     dir.join(INCOMING).join(format!("{partition}.installing"))
 }
 
@@ -317,6 +317,29 @@ impl Node {
                  drop-partition {p} here), then run the move, relocate or restore again"
             )));
         }
+        // D336 (cli692's M1, the node's safety net): this node's file of P is an old owner's
+        // tail while a PENDING event names it, which a stamp would take over or move aside
+        // as `.replaced`, out of the replay's reach. The writer refuses such a map already.
+        if self.tail_sources.holds(&p) {
+            return Err(ApiError::failed_precondition(format!(
+                "this node's file of partition {p:?} is open as the source of a tail replay"
+            )));
+        }
+        if let Ok(map) = self.get_map()
+            && let Some(e) = map.failovers.iter().find(|e| {
+                e.partition == p
+                    && e.from == self.id
+                    && e.tail_state() == crate::serve::proto::TailState::Pending
+            })
+            && main_file(&self.dir, &p).exists()
+        {
+            return Err(ApiError::failed_precondition(format!(
+                "this node's file of partition {p:?} holds its old owner's tail, PENDING since \
+                 the failover to node {:?} at epoch {}: replay it or discard it (phdb cluster \
+                 replay-tail {p} [--discard]) before installing over it",
+                e.to, e.to_epoch
+            )));
+        }
         let dir = self.dir.clone();
         let restore = req.restore;
         let (installed, fork) =
@@ -460,7 +483,11 @@ impl Node {
                 let id = name.strip_suffix(".phdb")?.to_owned();
                 (super::map::id_ok(&id) && !skip.contains(&id)).then_some(id)
             })
-            .filter(|id| self.part_state(id).is_none() && !self.replica_open(id))
+            .filter(|id| {
+                self.part_state(id).is_none()
+                    && !self.replica_open(id)
+                    && !self.tail_sources.holds(id)
+            })
             .filter(|id| !self.split_unmarked(id))
             .collect();
         for id in candidates {
@@ -637,7 +664,7 @@ fn create_file(dir: &Path, req: &StampRequest) -> Result<(), ApiError> {
 
 /// Whether `.phdb-incoming` holds any staged file or header of partition `p`, complete or
 /// not.
-fn staged_any(dir: &Path, p: &str) -> bool {
+pub(super) fn staged_any(dir: &Path, p: &str) -> bool {
     let prefix = format!("{p}.phdb");
     std::fs::read_dir(dir.join(INCOMING)).is_ok_and(|entries| {
         entries

@@ -602,7 +602,8 @@ pub(crate) static FAIL_PROMOTE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// The tests' seam (simp724's S1 on #2001): a replica copy whose database is under one of
 /// these directories applies nothing while it's listed, though it still hears its owner,
-/// as a copy that fell behind would: still fresh as of its last apply, until the bound.
+/// as a copy that fell behind would: still fresh as of its last apply, until the bound. A
+/// promote while it's listed drops what it held unapplied.
 #[cfg(test)]
 pub(crate) static HOLD_APPLIES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
@@ -1556,6 +1557,13 @@ impl Replica {
             .iter()
             .any(|d| db.path().starts_with(d))
         {
+            // A promote or shutdown while held finds the copy as far as it had applied, as
+            // one that fell behind would be (D336: an old owner's tail).
+            if *self.stop.borrow() {
+                run.events.clear();
+                run.bytes = 0;
+                return Ok(());
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let applied = last.primary_seqno();

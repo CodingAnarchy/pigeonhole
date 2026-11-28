@@ -429,6 +429,7 @@ impl Stream {
                 event: Some(event),
                 partition: String::new(),
                 xid: Bytes::new(),
+                replayed: None,
             }))
             .await
     }
@@ -448,6 +449,8 @@ impl Stream {
                         qualifier: Bytes::copy_from_slice(ch.qualifier()),
                         timestamp: ch.timestamp(),
                         stored: Bytes::copy_from_slice(ch.stored()),
+                        // One table: the move's (D336's tail names each change's).
+                        table: String::new(),
                     })
                     .collect();
                 Read::Commit((!changes.is_empty()).then(|| proto::RawCommit {
@@ -561,6 +564,7 @@ mod tests {
                 qualifier: Bytes::from_static(b"c"),
                 timestamp: ts,
                 stored: Bytes::from_static(&[1, 1, 0, 0, 0, 0, 0, 0, 0]),
+                table: String::new(),
             }],
         }
     }

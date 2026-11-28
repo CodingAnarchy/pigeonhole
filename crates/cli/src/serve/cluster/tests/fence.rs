@@ -427,6 +427,8 @@ struct Rig {
     tokens: String,
     /// A stopped node's port, held for its restart ([`HeldPort`]).
     held: [Option<HeldPort>; 3],
+    /// Every node's `--change-feed` (none: partitions it opens keep no feed).
+    feed: Option<u64>,
 }
 
 const NODES: [(&str, &str); 3] = [("a", "p1"), ("b", "p2"), ("c", "p3")];
@@ -463,8 +465,17 @@ impl Rig {
         Self::start_p1(tokens, None)
     }
 
+    /// [`Rig::start`] with every node's `--change-feed` at `bytes`.
+    fn start_feed(bytes: u64) -> Self {
+        Self::start_all("", None, Some(bytes))
+    }
+
     /// [`Rig::start_with`], p1's database created with `p1` if given (small tablets, say).
     fn start_p1(tokens: &str, p1: Option<pigeonhole::Options>) -> Self {
+        Self::start_all(tokens, p1, None)
+    }
+
+    fn start_all(tokens: &str, p1: Option<pigeonhole::Options>, feed: Option<u64>) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -482,7 +493,8 @@ impl Rig {
                 .take()
                 .filter(|_| p == "p1")
                 .map(|o| test_partition_with(dir, p, o));
-            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, tokens, limits, given, false);
+            let (stop, db) =
+                data_node_feed(&rt, dir, id, Some(p), l, tokens, limits, given, false, feed);
             stops.push(Some(stop));
             dbs.push(db);
         }
@@ -494,6 +506,7 @@ impl Rig {
             dbs,
             tokens: tokens.to_owned(),
             held: [None, None, None],
+            feed,
         }
     }
 
@@ -517,7 +530,7 @@ impl Rig {
             .take()
             .unwrap_or_else(|| HeldPort::take(self.ports[i]))
             .listen();
-        let (stop, _) = data_node_full(
+        let (stop, _) = data_node_feed(
             &self.rt,
             &self.dirs[i],
             NODES[i].0,
@@ -527,6 +540,7 @@ impl Rig {
             crate::serve::server_tests::limits(),
             self.dbs[i].clone(),
             true,
+            self.feed,
         );
         self.stops[i] = Some(stop);
     }
@@ -2178,7 +2192,11 @@ async fn replica_row(port: u16, p: &str) -> Option<LocalPartition> {
 /// A leased rig with p3's replica copies on `replicas` (b first) following c past a write of
 /// "zed", and failover `on`.
 fn failover_rig_with(on: bool, replicas: &[&str]) -> Rig {
-    let mut t = Rig::start();
+    failover_rig_from(Rig::start(), on, replicas)
+}
+
+/// [`failover_rig_with`] on rig `t`, as started.
+fn failover_rig_from(mut t: Rig, on: bool, replicas: &[&str]) -> Rig {
     writer_leased(&mut t);
     let [a, b, c] = t.ports;
     t.rt.block_on(async {
@@ -4600,3 +4618,5 @@ fn an_earlier_writers_split_past_its_hand_over_is_finished() {
         }
     });
 }
+
+mod tail_replay;

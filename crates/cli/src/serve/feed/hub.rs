@@ -265,16 +265,25 @@ impl<K: RingKind> HubOf<K> {
 }
 
 impl Hub {
-    pub(super) fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
+    /// Pushes `commit` onto the ring; `Err` (the hub must fail) for one whose tag is
+    /// corrupt (D336 §8): each client meets that on its own stream.
+    pub(super) fn push(
+        &self,
+        commit: Commit,
+        token: Bytes,
+        position: u64,
+        total: usize,
+    ) -> Result<(), crate::serve::errors::ApiError> {
         let limit = self.ring_limit(total);
         // Encoded here, on the hub's task and outside the ring's lock.
         let seqno = commit.seqno();
-        let mut entry = Entry::new(&commit, token.clone());
+        let mut entry = Entry::new(&commit, token.clone())?;
         let mut r = self.ring();
         entry.prev = r.passed;
         r.passed = position.max(seqno);
         r.passed_token = token;
         r.push(Arc::new(entry), limit);
+        Ok(())
     }
 
     /// Tells the clients the ring's head moved: once per batch of pushes ([`drive`], #1901).
@@ -483,7 +492,13 @@ pub(super) fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = (
             match item {
                 Some(Ok(commit)) => {
                     let at = d.stream.position().seqno();
-                    hub.push(commit, token_of(&d.stream), at, d.ring_bytes);
+                    if hub
+                        .push(commit, token_of(&d.stream), at, d.ring_bytes)
+                        .is_err()
+                    {
+                        hub.fail();
+                        return;
+                    }
                     d.batch = d.batch.saturating_add(1);
                     d.unnotified += 1;
                     if d.unnotified >= NOTIFY_EVERY {

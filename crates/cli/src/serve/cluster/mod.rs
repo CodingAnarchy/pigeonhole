@@ -40,11 +40,15 @@ pub(crate) mod range_follow;
 mod range_merge;
 pub(crate) mod range_move;
 pub(crate) mod range_prune;
+mod replay_cli;
+pub(crate) mod replay_tag;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
 pub(crate) mod spanning;
 pub(crate) mod stamp;
+pub(crate) mod tail_replay;
+pub(crate) mod tail_source;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
@@ -324,6 +328,10 @@ pub(crate) struct Node {
     /// Each range move at HANDING_OVER in the map: when this node first saw it there, and
     /// whether the writer's abort of it runs (#2160, [`Node::abort_orphaned_hand_overs`]).
     hand_overs_seen: Mutex<std::collections::HashMap<String, (tokio::time::Instant, bool)>>,
+    /// The old owners' files open here as tail sources (D336 PR 3a, `Cluster.ReadTail`).
+    pub(crate) tail_sources: Arc<tail_source::TailSources>,
+    /// The tail replays this node ran as a partition's owner (D336 PR 3a).
+    pub(crate) replays: tail_replay::Replays,
 }
 
 impl Node {
@@ -347,6 +355,8 @@ impl Node {
             watching_device: std::sync::atomic::AtomicBool::new(false),
             pruning: std::sync::atomic::AtomicBool::new(false),
             hand_overs_seen: Mutex::new(std::collections::HashMap::new()),
+            tail_sources: Arc::default(),
+            replays: tail_replay::Replays::default(),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),

@@ -416,6 +416,13 @@ impl Node {
                 "partition {id:?} is open here: close it first (phdb cluster close)"
             )));
         }
+        // D336 PR 3a: an old owner's file open as a tail source is being read.
+        if self.tail_sources.holds(id) {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {id:?}'s file here is open as the source of a tail replay: it closes {}s after the replay's last read",
+                super::tail_source::TAIL_SOURCE_IDLE.as_secs()
+            )));
+        }
         // D331 PR 6 (audit120's S1): a node the map still lists among the partition's
         // replicas keeps its copy, open or not (seeding, a failed open), now that a merge
         // drops files with no operator looking. One exception (R1): a copy an unfinished
