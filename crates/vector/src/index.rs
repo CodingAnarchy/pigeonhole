@@ -557,6 +557,21 @@ fn read_stored(
     }
 }
 
+/// The timestamp of `id`'s mapping `M{id}:map:l`, read in the transaction; `None` when `id`
+/// has none.
+///
+/// A move (a split, a phase 2 reassign, a merge) rewrites the mapping at this timestamp,
+/// not its own (D336 Amendment 3, V1). So `M{id}`'s newest version is always the id's last
+/// client insert, upsert or delete, which a tail replay's "nothing newer" check reads.
+/// The moved vector itself takes the move's timestamp: its old list keeps a delete marker,
+/// and a marker hides every version at or below its timestamp whatever the commit order
+/// (FORMAT.md §2), so a vector moved back into that list at its old timestamp would stay
+/// hidden. The mapping takes no marker but a client's delete, and a live id's mapping
+/// is always newer than that.
+fn read_map_ts(tx: &mut Transaction, t: &Table, id: &[u8]) -> std::result::Result<Option<u64>, Tx> {
+    Ok(tx.get(t, &map_row(id), MAP, LIST)?.map(|c| c.timestamp()))
+}
+
 /// Writes `id`'s vector into list `l`, moving it out of `old` (the list `id` is in) when
 /// that's another list. The caller has read `l`'s version in `tx`. With `check_old` (`old`
 /// came from `M{id}` at `tx`'s snapshot) this reads `old`'s version, and a mapping to a
@@ -572,8 +587,12 @@ fn write_into(
     v: Input<'_>,
 ) -> std::result::Result<(), Tx> {
     match old {
-        // An upsert within its list: the vector only (M2).
-        Some(o) if o == l => v.put(tx, t, &list_row(l), id),
+        // An upsert within its list (M2): the vector, and the mapping again at this
+        // commit's timestamp, so `M{id}`'s newest version is this write ([`read_map_ts`]).
+        Some(o) if o == l => {
+            v.put(tx, t, &list_row(l), id);
+            tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l));
+        }
         Some(o) => {
             if check_old && read_version(tx, t, o)?.is_none() {
                 return Err(Tx::Stale);
@@ -1613,7 +1632,11 @@ impl Index {
                 let id = id.as_ref();
                 let old = read_list_of(tx, t, id)?;
                 match old {
-                    Some(o) if o == l => input(v).put(tx, t, &row, id),
+                    // As `write_into`'s upsert within a list: the mapping too.
+                    Some(o) if o == l => {
+                        input(v).put(tx, t, &row, id);
+                        tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l));
+                    }
                     Some(o) => {
                         tx.delete_column(t, &list_row(o), VEC, id)
                             .incr(t, &count_row(o), CNT, b"", -1)
@@ -2371,12 +2394,16 @@ impl Index {
                     let Some(stored) = read_stored(tx, t, &from, id)? else {
                         continue;
                     };
+                    let Some(at) = read_map_ts(tx, t, id)? else {
+                        continue;
+                    };
                     stored.input().put(tx, t, &to, id);
-                    tx.delete_column(t, &from, VEC, id).put_u64(
+                    tx.delete_column(t, &from, VEC, id).put_u64_at(
                         t,
                         &map_row(id),
                         MAP,
                         LIST,
+                        at,
                         u64::from(new),
                     );
                     moved += 1;
@@ -2495,12 +2522,16 @@ impl Index {
                     let Some(stored) = read_stored(tx, t, &row, id)? else {
                         continue;
                     };
+                    let Some(at) = read_map_ts(tx, t, id)? else {
+                        continue;
+                    };
                     stored.input().put(tx, t, &list_row(*dest), id);
-                    tx.delete_column(t, &row, VEC, id).put_u64(
+                    tx.delete_column(t, &row, VEC, id).put_u64_at(
                         t,
                         &map_row(id),
                         MAP,
                         LIST,
+                        at,
                         u64::from(*dest),
                     );
                     *gained.entry(*dest).or_default() += 1;
@@ -2575,7 +2606,11 @@ impl Index {
                     let to = list_row(dst);
                     for (id, stored) in &moving {
                         stored.input().put(tx, t, &to, id);
-                        tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(dst));
+                        // Every vector moves, so a vector without its mapping (none in a
+                        // well-formed index) keeps none.
+                        if let Some(at) = read_map_ts(tx, t, id)? {
+                            tx.put_u64_at(t, &map_row(id), MAP, LIST, at, u64::from(dst));
+                        }
                     }
                     let layout = read_u64(tx, t, GLOBAL, META, LAYOUT)?.unwrap_or(0);
                     tx.delete_family(t, &from, VEC)
@@ -3164,5 +3199,217 @@ mod tests {
                 .checked(&wide)
                 .is_err()
         );
+    }
+}
+
+/// D336 Amendment 3, V1 (option A): a move keeps `M{id}:map:l`'s timestamp, a client write
+/// advances it, and a vector moved back into a list it left is still there ([`read_map_ts`]).
+#[cfg(test)]
+mod move_stamps {
+    use std::collections::BTreeMap;
+
+    use pigeonhole::Options;
+    use pigeonhole::doc_support::{TempDir, temp_dir};
+
+    use super::*;
+
+    /// Dropped in field order: the index and its rebalancer before the database.
+    struct Fixture {
+        ix: Index,
+        _rebalancer: Rebalancer,
+        db: Pigeonhole,
+        _dir: TempDir,
+    }
+
+    /// A 2-dim `f32` index whose rebalancer never runs, so only the test moves vectors.
+    fn fixture(target: u32, reassign: u32) -> Fixture {
+        let dir = temp_dir();
+        let db = Pigeonhole::open(dir.join("v.phdb"), Options::default()).unwrap();
+        let spec = VectorSpec::new(2, Element::F32, pigeonhole::Metric::L2).unwrap();
+        let opts = IndexOptions::new()
+            .target_list_len(target)
+            .reassign_neighbours(reassign)
+            .rebalance(Rebalance::Background);
+        let (ix, rebalancer) = Index::create_with_rebalancer(&db, "v", spec, opts).unwrap();
+        Fixture {
+            ix,
+            _rebalancer: rebalancer,
+            db,
+            _dir: dir,
+        }
+    }
+
+    /// Each id's list and its mapping's timestamp.
+    fn stamps(ix: &Index) -> BTreeMap<Vec<u8>, (u32, u64)> {
+        let s = ix.inner.db.snapshot().unwrap();
+        let mut out = BTreeMap::new();
+        for row in ix
+            .inner
+            .table
+            .scan_prefix(b"M")
+            .family(MAP)
+            .snapshot(&s)
+            .iter()
+            .unwrap()
+        {
+            let row = row.unwrap();
+            let c = row.get(MAP, LIST).unwrap();
+            let list = u32::try_from(c.as_u64().unwrap()).unwrap();
+            out.insert(row.key()[1..].to_vec(), (list, c.timestamp()));
+        }
+        out
+    }
+
+    /// So a commit after it takes a clock timestamp above every one before it.
+    fn tick() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    /// Every id of `before` keeps its mapping's timestamp; at least one changed list.
+    fn kept(before: &BTreeMap<Vec<u8>, (u32, u64)>, ix: &Index, what: &str) {
+        let after = stamps(ix);
+        let mut moved = 0;
+        for (id, (list, ts)) in before {
+            let (l, t) = after[id];
+            assert_eq!(t, *ts, "{what}: {id:?}'s mapping timestamp");
+            moved += usize::from(l != *list);
+        }
+        assert!(moved > 0, "{what} moved nothing");
+        ix.verify()
+            .unwrap_or_else(|e| panic!("{what}: verify: {e}"));
+    }
+
+    fn insert(ix: &Index, prefix: &str, x0: f32) {
+        for i in 0..10u8 {
+            let id = format!("{prefix}{i}");
+            ix.insert_f32(id.as_bytes(), &[x0 + f32::from(i) * 0.1, 0.0])
+                .unwrap();
+        }
+    }
+
+    fn list_of(ix: &Index, id: &str) -> u32 {
+        stamps(ix)[id.as_bytes()].0
+    }
+
+    #[test]
+    fn each_move_keeps_an_ids_mapping_timestamp() {
+        // Lists split above 16 vectors and merge below 2.
+        let f = fixture(8, 1);
+        let ix = &f.ix;
+        insert(ix, "a", 0.0);
+        insert(ix, "b", 100.0);
+        // split: 20 vectors in list 0, read whole.
+        let before = stamps(ix);
+        tick();
+        ix.split(0).unwrap();
+        kept(&before, ix, "split");
+        assert_ne!(list_of(ix, "a0"), list_of(ix, "b0"));
+
+        // split_paged: 20 vectors in b's list, 16 to a page.
+        insert(ix, "c", 200.0);
+        let bl = list_of(ix, "b0");
+        assert_eq!(list_of(ix, "c0"), bl);
+        let layout = ix.reload().unwrap();
+        let current = layout.list(bl).unwrap().point.clone();
+        let (_, sample) = ix.page(bl, None, usize::MAX).unwrap();
+        let seen = sample.len() as u64;
+        let before = stamps(ix);
+        tick();
+        ix.split_paged(bl, &current, sample, seen).unwrap();
+        kept(&before, ix, "split_paged");
+        assert_ne!(list_of(ix, "b0"), list_of(ix, "c0"));
+
+        // reassign: b's list splits off a centroid at a9, so a's list (its neighbour)
+        // gives up the a vectors now nearer it.
+        let (al, bl, cl) = (list_of(ix, "a0"), list_of(ix, "b0"), list_of(ix, "c0"));
+        let layout = ix.reload().unwrap();
+        let plan = Plan {
+            stay: layout.list(bl).unwrap().point.clone(),
+            go: Point::F32(vec![0.9, 0.0]),
+            moving: Vec::new(),
+        };
+        let before = stamps(ix);
+        tick();
+        ix.reassign(&layout, bl, cl, &plan).unwrap();
+        kept(&before, ix, "reassign");
+        assert_eq!(list_of(ix, "a9"), cl);
+
+        // merge: a's list down to one vector.
+        for i in 1..10 {
+            ix.delete(format!("a{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(list_of(ix, "a0"), al);
+        let before = stamps(ix);
+        tick();
+        ix.merge(al).unwrap();
+        kept(&before, ix, "merge");
+    }
+
+    #[test]
+    fn a_client_upsert_moves_the_mapping_timestamp_forward() {
+        let f = fixture(8, 0);
+        let ix = &f.ix;
+        ix.insert_f32(b"x", &[1.0, 0.0]).unwrap();
+        ix.insert_f32(b"y", &[2.0, 0.0]).unwrap();
+        // An upsert within x's list (the only one), alone and in a caller's transaction.
+        let s0 = stamps(ix);
+        tick();
+        ix.insert_f32(b"x", &[1.5, 0.0]).unwrap();
+        let s1 = stamps(ix);
+        assert_eq!(s1[&b"x"[..]].0, s0[&b"x"[..]].0, "x stays in its list");
+        assert!(s1[&b"x"[..]].1 > s0[&b"x"[..]].1, "insert_f32");
+        assert_eq!(s1[&b"y"[..]], s0[&b"y"[..]], "y untouched");
+        tick();
+        let (placed, _) =
+            f.db.transact(&RetryPolicy::default(), |tx| {
+                let mut placed = Placed::new();
+                ix.insert_f32_in(tx, &mut placed, b"x", &[1.25, 0.0])?;
+                Ok::<_, Error>(placed)
+            })
+            .unwrap();
+        ix.after_commit(placed).unwrap();
+        let s2 = stamps(ix);
+        assert!(s2[&b"x"[..]].1 > s1[&b"x"[..]].1, "insert_f32_in");
+
+        // A bulk load's repeat of an id after its first batch was written: the mapping
+        // takes the repeat's timestamp, as its vector does.
+        let g = fixture(1000, 0);
+        let mut vectors = vec![(b"x".to_vec(), [0.0f32, 0.0])];
+        for i in 0..BULK_BATCH as u32 - 1 {
+            vectors.push((format!("p{i:04}").into_bytes(), [1.0, i as f32]));
+        }
+        vectors.push((b"x".to_vec(), [0.5, 0.0]));
+        g.ix.bulk_load_f32(vectors.len() as u64, vectors).unwrap();
+        let (l, ts) = stamps(&g.ix)[&b"x"[..]];
+        let v =
+            g.ix.inner
+                .table
+                .get(&list_row(l), VEC, b"x")
+                .unwrap()
+                .unwrap();
+        assert_eq!(v.as_vector().unwrap().to_f32_vec().unwrap(), vec![0.5, 0.0]);
+        assert_eq!(ts, v.timestamp(), "bulk load");
+    }
+
+    /// A move's delete marker in the list it leaves hides every version at or below its
+    /// timestamp (FORMAT.md §2), so a vector moved back must not take its old timestamp.
+    #[test]
+    fn an_id_moved_back_into_a_list_it_left_keeps_its_vector() {
+        let f = fixture(8, 0);
+        let ix = &f.ix;
+        insert(ix, "a", 0.0);
+        insert(ix, "b", 100.0);
+        ix.split(0).unwrap();
+        let (al, bl) = (list_of(ix, "a0"), list_of(ix, "b0"));
+        assert_ne!(al, bl);
+        tick();
+        assert!(ix.move_out(al, &[(b"a0", bl)], &[bl]).is_ok());
+        assert_eq!(list_of(ix, "a0"), bl);
+        tick();
+        assert!(ix.move_out(bl, &[(b"a0", al)], &[al]).is_ok());
+        assert_eq!(list_of(ix, "a0"), al);
+        let back = ix.inner.table.get(&list_row(al), VEC, b"a0").unwrap();
+        assert!(back.is_some(), "a0 is hidden in the list it came back to");
+        ix.verify().unwrap();
     }
 }
