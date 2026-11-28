@@ -177,6 +177,29 @@ pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
             .any(|(d, a)| d == dir && a == address)
 }
 
+/// A hold seam (tests, #2271): the node in each listed directory runs none of its own
+/// rounds in the background while it's listed. Its start sync
+/// ([`Node::sync_on_start`](super::Node::sync_on_start)) and each of its lease renewals
+/// ([`Node::renew_leases`](super::Node::renew_leases)) wait before they begin, so the node
+/// learns no peer's newer map by itself, and a test can show its map is behind right up to
+/// the call that must find that out (an unfence's own round isn't held). A round already
+/// begun isn't stopped. What its peers send it still arrives.
+#[cfg(test)]
+pub(crate) static HOLD_ROUNDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Waits while [`HOLD_ROUNDS`] lists `dir`.
+#[cfg(test)]
+pub(crate) async fn hold_rounds(dir: &Path) {
+    while HOLD_ROUNDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A hold seam (tests): the node in each listed directory holds every `Forward` it serves,
 /// once past the caller check, until its directory leaves the list, as a forward does
 /// behind a slow branch (#2258). Each held call is in [`HELD_FORWARDS`] while it waits.

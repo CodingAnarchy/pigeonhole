@@ -1278,9 +1278,13 @@ impl Node {
         };
         let me = Arc::downgrade(self);
         let period = self.grants.lease() / 3;
+        #[cfg(test)]
+        let dir = self.dir.clone();
         rt.spawn(async move {
             let mut wait = RETRY_FIRST;
             loop {
+                #[cfg(test)]
+                super::hold_rounds(&dir).await;
                 let Some(node) = me.upgrade() else { return };
                 let started = tokio::time::Instant::now();
                 let asked = node.fences.asked.load(std::sync::atomic::Ordering::Acquire);
