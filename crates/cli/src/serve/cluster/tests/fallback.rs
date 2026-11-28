@@ -147,13 +147,16 @@ impl Restartable {
 }
 
 /// Sets partition `p`'s `replica_acks` and `replica_ack_policy` through node `a`, retrying
-/// a map that moved meanwhile.
+/// a map that moved meanwhile. It returns once every node in `ports` holds that map: the
+/// writer, `ports[0]`, answers once it's set, and an owner still on the older map would
+/// answer a write by its old `replica_acks` (#2256's Windows run).
 async fn set_policy(
-    a: u16,
+    ports: &[u16],
     p: &str,
     k: u32,
     policy: ReplicaAckPolicy,
 ) -> Result<(), tonic::Status> {
+    let a = ports[0];
     let mut last = None;
     for _ in 0..100 {
         let mut m = client(a)
@@ -178,7 +181,23 @@ async fn set_policy(
             })
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                for &port in ports {
+                    eventually_why(FOLLOW, "every node to hold the new map", async || {
+                        let held = client(port)
+                            .await
+                            .get_map(GetMapRequest {})
+                            .await
+                            .map(|r| r.into_inner().map_version);
+                        match held {
+                            Ok(v) if v > expected => Ok(()),
+                            other => Err(format!("node at port {port}: {other:?}")),
+                        }
+                    })
+                    .await;
+                }
+                return Ok(());
+            }
             Err(e) if e.code() == tonic::Code::InvalidArgument => return Err(e),
             Err(e) => last = Some(e),
         }
@@ -247,7 +266,7 @@ fn an_async_partition_answers_uncovered_only_once_a_majority_recorded_its_fallba
         .await
     };
     rt.block_on(async {
-        set_policy(ports[0], "p3", 1, ReplicaAckPolicy::Async)
+        set_policy(&ports, "p3", 1, ReplicaAckPolicy::Async)
             .await
             .unwrap();
         assert_eq!(write("k2").await.unwrap().replica_acks, 1);
@@ -359,7 +378,7 @@ fn a_refuse_partition_refuses_and_records_no_fallback() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (dirs, ports, _stops) = following(&rt);
     rt.block_on(async {
-        set_policy(ports[0], "p3", 1, ReplicaAckPolicy::Refuse)
+        set_policy(&ports, "p3", 1, ReplicaAckPolicy::Refuse)
             .await
             .unwrap();
         hold(&dirs[2], true);
@@ -411,7 +430,7 @@ fn an_owner_restarted_in_its_fallback_resumes_it_and_ends_it_once_covered() {
         .await
     };
     let from = client.block_on(async {
-        set_policy(ports[0], "p3", 1, ReplicaAckPolicy::Async)
+        set_policy(&ports, "p3", 1, ReplicaAckPolicy::Async)
             .await
             .unwrap();
         hold(&c_dir, true);
