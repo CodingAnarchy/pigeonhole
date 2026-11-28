@@ -90,8 +90,9 @@ fn wait_open(s: &Server, n: usize) {
     wait_for(&format!("{n} open connections"), || conns.open() == n);
 }
 
-/// At the cap, a new connection is closed as soon as it's accepted and counted as refused; a
-/// slot freed by a close serves the next one. Both protocols share the count.
+/// At the cap, a new connection is counted as refused and holds no slot: one that sends
+/// nothing is closed within its refusal's hold (#2262); a slot freed by a close serves the
+/// next one. Both protocols share the count.
 #[test]
 fn a_connection_past_the_cap_is_closed_and_counted() {
     let s = capped(2, Duration::from_secs(5));
@@ -135,6 +136,180 @@ fn a_connection_past_the_cap_is_closed_and_counted() {
     }));
     assert!(got.is_ok(), "{got:?}");
     assert_eq!(conns.open(), 2, "the gRPC channel holds the other slot");
+}
+
+/// #2262: a gRPC client past the cap is refused with `Unavailable`, at once, on every call.
+/// Before, the connection was closed with no protocol answer: tonic's channel failed its
+/// calls with `Unknown` or `Cancelled`, and now and then parked one while it reconnected,
+/// until another request on the same channel woke it.
+#[test]
+fn a_grpc_client_past_the_cap_is_refused_at_once_with_unavailable() {
+    let s = capped(1, Duration::from_secs(5));
+    let mut held = connect(&s);
+    health(&mut held);
+    wait_open(&s, 1);
+    let url = s.url.clone();
+    let (answers, parked) = s.block_on(async move {
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .unwrap()
+            .connect_lazy();
+        let mut c = DataClient::new(channel);
+        let mut answers = std::collections::BTreeMap::<String, u32>::new();
+        let mut parked = 0u32;
+        // Calls one after another for 2 s, each bounded: a parked call shows as a timeout.
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < until && parked < 3 {
+            let get = c.get(proto::GetRequest {
+                table: "t".into(),
+                row: b"r".to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            });
+            match tokio::time::timeout(Duration::from_millis(500), get).await {
+                Ok(Ok(_)) => *answers.entry("served".to_owned()).or_default() += 1,
+                Ok(Err(st)) => *answers.entry(format!("{:?}", st.code())).or_default() += 1,
+                Err(_) => parked += 1,
+            }
+        }
+        (answers, parked)
+    });
+    assert_eq!(
+        parked,
+        0,
+        "calls parked past 500 ms; answers {answers:?}; {}",
+        counts(&s)
+    );
+    // A refused connection takes calls for most of its hold, then closes (GOAWAY). A call
+    // sent as it closes can fail otherwise (`Cancelled` or `Unknown`): at most one per
+    // refused connection. Before the fix every refused call failed so, and the client
+    // connected again for each.
+    let refused = s.shared.router.service.connections.refused();
+    let other: u64 = answers
+        .iter()
+        .filter(|(code, _)| *code != "Unavailable")
+        .map(|(_, n)| u64::from(*n))
+        .sum();
+    assert!(
+        answers.get("Unavailable").copied().unwrap_or(0) > 0 && other <= refused,
+        "{answers:?}; {}",
+        counts(&s)
+    );
+    // And it connects again about once a hold (1 s here), not for every call.
+    assert!(refused < 50, "{answers:?}; {}", counts(&s));
+    drop(held);
+}
+
+/// #2262: the refusal says why (`--max-connections`), and a channel refused at the cap is
+/// served once a slot is free: its next call connects again.
+#[test]
+fn a_refused_grpc_channel_says_why_and_is_served_once_a_slot_frees() {
+    let s = capped(1, Duration::from_secs(5));
+    let mut holder = connect(&s);
+    health(&mut holder);
+    wait_open(&s, 1);
+    let url = s.url.clone();
+    let mut client = s.block_on(async move {
+        DataClient::new(
+            tonic::transport::Channel::from_shared(url)
+                .unwrap()
+                .connect_lazy(),
+        )
+    });
+    let get = proto::GetRequest {
+        table: "t".into(),
+        row: b"r".to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    };
+    for i in 0..2 {
+        let started = std::time::Instant::now();
+        let got = s.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), client.get(get.clone())).await
+        });
+        let Ok(got) = got else {
+            panic!("call {i} past the cap parked for 3 s: {}", counts(&s));
+        };
+        let e = got.expect_err("a call past the cap was served");
+        assert_eq!(e.code(), tonic::Code::Unavailable, "call {i}: {e:?}");
+        assert!(e.message().contains("--max-connections"), "call {i}: {e:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "call {i} took {:?}",
+            started.elapsed()
+        );
+    }
+    assert_eq!(
+        s.shared.router.service.connections.open(),
+        1,
+        "{}",
+        counts(&s)
+    );
+    drop(holder);
+    wait_open(&s, 0);
+    // The channel connects again for its next call, and is served: once its refused
+    // connection closes, at the end of its hold. A call sent just as it closes may fail
+    // otherwise than `Unavailable`, once (`Cancelled` or `Unknown`).
+    let mut served = false;
+    let mut at_the_close = 0;
+    for _ in 0..50 {
+        let got = s.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), client.get(get.clone())).await
+        });
+        match got {
+            Ok(Ok(_)) => {
+                served = true;
+                break;
+            }
+            Ok(Err(e)) if e.code() == tonic::Code::Unavailable => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(Err(e))
+                if at_the_close == 0
+                    && matches!(e.code(), tonic::Code::Cancelled | tonic::Code::Unknown) =>
+            {
+                at_the_close += 1;
+            }
+            other => panic!("once a slot was free: {other:?}, {}", counts(&s)),
+        }
+    }
+    assert!(served, "the channel was never served: {}", counts(&s));
+}
+
+/// #2262: an HTTP/1.1 request past the cap gets a 503 (`Overloaded`) with `Connection:
+/// close`, and the connection closes after it.
+#[test]
+fn an_http1_request_past_the_cap_gets_503_and_the_connection_closes() {
+    let s = capped(1, Duration::from_secs(5));
+    let mut holder = connect(&s);
+    health(&mut holder);
+    wait_open(&s, 1);
+    let mut c = connect(&s);
+    c.write_all(b"GET /v1/health HTTP/1.1\r\nHost: test\r\n\r\n")
+        .unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => panic!("{e}: read {:?}", String::from_utf8_lossy(&got)),
+        }
+    }
+    let text = String::from_utf8_lossy(&got).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 503"), "{text}");
+    assert!(text.contains("connection: close"), "{text}");
+    assert!(text.contains("overloaded"), "{text}");
+    assert!(text.contains("--max-connections"), "{text}");
+    assert_eq!(
+        s.shared.router.service.connections.refused(),
+        1,
+        "{}",
+        counts(&s)
+    );
 }
 
 /// cli692's D1 on the design: a connection that sends nothing is dropped after
