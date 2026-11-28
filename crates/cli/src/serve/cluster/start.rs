@@ -1,7 +1,7 @@
 use super::*;
 
-/// `Cluster` calls a node runs at once in each of its control and data lanes
-/// ([`routes`](super::api::routes)): map reads and installs, pushes and pulls are few.
+/// `Cluster` control calls a node runs at once ([`routes`](super::api::routes)): map reads
+/// and installs, pushes and pulls are few.
 pub(super) const CLUSTER_CALLS: usize = 16;
 
 /// `Lease` and `Release` calls a node runs at once (#2258): a round's asks, one from each

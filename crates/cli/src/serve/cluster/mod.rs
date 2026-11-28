@@ -55,6 +55,7 @@ pub(crate) mod writer;
 mod api;
 mod features;
 mod install;
+pub(crate) mod lanes;
 mod peers;
 #[cfg(test)]
 mod seams;
@@ -324,6 +325,8 @@ pub(crate) struct Node {
     /// Each range move at HANDING_OVER in the map: when this node first saw it there, and
     /// whether the writer's abort of it runs (#2160, [`Node::abort_orphaned_hand_overs`]).
     hand_overs_seen: Mutex<std::collections::HashMap<String, (tokio::time::Instant, bool)>>,
+    /// The forwarded calls' lanes (#2258): clients', nodes' and read parts' places.
+    lanes: lanes::Lanes,
 }
 
 impl Node {
@@ -347,6 +350,7 @@ impl Node {
             watching_device: std::sync::atomic::AtomicBool::new(false),
             pruning: std::sync::atomic::AtomicBool::new(false),
             hand_overs_seen: Mutex::new(std::collections::HashMap::new()),
+            lanes: lanes::Lanes::default(),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),

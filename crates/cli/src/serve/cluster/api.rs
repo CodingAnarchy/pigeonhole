@@ -330,20 +330,32 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::ForwardRequest>,
     ) -> Result<tonic::Response<proto::ForwardResponse>, Status> {
         let peer = self.caller(&req, &[Scope::Cluster], "forward a call")?;
-        #[cfg(test)]
-        seams::hold_forward(&self.0.dir).await;
         let Some(shared) = &self.1 else {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
         self.0.catch_up(&peer, req.metadata()).await?;
         // The sender's deadline for the call (it sends what's left of its client's), for a
         // replica copy's read-your-writes wait (D328).
+        let sent = crate::serve::grpc::grpc_timeout(req.metadata().as_ref());
         let deadline = crate::serve::replica::ReadDeadline::new(
             std::time::Instant::now(),
             shared.limits.request_timeout,
-            crate::serve::grpc::grpc_timeout(req.metadata().as_ref()),
+            sent,
         );
         let msg = req.into_inner();
+        // Its place in its lane (#2258): a client's call past the limit is refused at once,
+        // a node's own arm waits for one up to its deadline.
+        let _place = self
+            .0
+            .lanes
+            .enter(
+                lanes::Lane::of(&msg),
+                shared.limits.max_concurrent,
+                sent.unwrap_or(shared.limits.request_timeout),
+            )
+            .await?;
+        #[cfg(test)]
+        seams::hold_forward(&self.0.dir).await;
         // A spanning transaction's branch call (D329): served on the partition it names.
         if spanning::is_branch(&msg) {
             // The nodes' own arms carry no client to check (#2165): on a cluster with tokens,
@@ -538,6 +550,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         };
         self.0.catch_up(&peer, req.metadata()).await?;
         let msg = req.into_inner();
+        // A client's scan, in the clients' lane until its pages start (#2258).
+        let _place = self
+            .0
+            .lanes
+            .enter(
+                lanes::Lane::Clients,
+                shared.limits.max_concurrent,
+                shared.limits.request_timeout,
+            )
+            .await?;
         let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
         let scan = msg
             .scan
@@ -612,13 +634,13 @@ async fn http_status(State(node): State<Arc<Node>>, headers: HeaderMap) -> Respo
 /// - `Lease` and `Release` (and so the votes, which `Lease` carries): a lane of their own,
 ///   since an answer that's late fences an owner.
 /// - `Forward` and `ForwardScan`, the data calls (a spanning transaction's branch calls
-///   among them): a lane of their own. An owner that sheds one answers `Overloaded`, which
-///   the forwarding node passes back.
+///   among them): outside every route limit, each taking a place in [`lanes`] by who sent it.
+///   An owner that refuses one answers `Overloaded`, which the forwarding node passes back.
 /// - Every other call (map reads, pushes and installs, status, fences): the control lane.
 ///   So a forward's own map pull (`catch_up`, from the node that sent it) never waits
 ///   behind forwards: two nodes forwarding to each other can't hold each other's pulls.
 ///
-/// Each lane's limit is shared by its routes. Before #2258 one limit took every call, and
+/// Each route lane's limit is shared by its routes. Before #2258 one limit took every call, and
 /// a few dozen forwards in flight left a lease round's calls queued until they timed out.
 /// The `Cluster` paths routed apart from the control lane (#2258).
 const LEASE: &str = "/pigeonhole.v1.Cluster/Lease";
@@ -670,7 +692,6 @@ pub(crate) fn routes(
         .max_decoding_message_size(max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE));
     let control = tower::limit::GlobalConcurrencyLimitLayer::new(CLUSTER_CALLS);
     let leases = tower::limit::GlobalConcurrencyLimitLayer::new(LEASE_CALLS);
-    let data = tower::limit::GlobalConcurrencyLimitLayer::new(CLUSTER_CALLS);
     let mut app = axum::Router::new()
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))
         .route("/v1/cluster/status", get(http_status))
@@ -682,8 +703,8 @@ pub(crate) fn routes(
         )
         .route_service(LEASE, leases.layer(grpc.clone()))
         .route_service(RELEASE, leases.layer(grpc.clone()))
-        .route_service(FORWARD, data.layer(grpc.clone()))
-        .route_service(FORWARD_SCAN, data.layer(grpc));
+        .route_service(FORWARD, grpc.clone())
+        .route_service(FORWARD_SCAN, grpc);
     // A forwarded read's charge (#1567) moves into its reply's body, as the data routes'
     // `prepay` does, so it's held until the reply is written (cli692's F1 on ticket 2).
     if let Some(idle) = idle {

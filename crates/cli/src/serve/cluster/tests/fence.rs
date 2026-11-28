@@ -1450,6 +1450,90 @@ fn a_lease_request_answers_while_the_nodes_control_lane_is_full() {
 }
 
 #[test]
+fn a_forward_past_max_concurrent_is_refused_at_once_and_a_nodes_arm_still_takes_a_place() {
+    // #2258's follow-up: b holds `--max-concurrent` of other nodes' client forwards; one more
+    // answers `Overloaded` at once rather than queueing into its deadline. A node's own arm
+    // (the balancer's tablets ask) isn't in that lane: it still takes a place.
+    let t = Rig::start();
+    let b = t.ports[1];
+    let dir = t.dirs[1].clone();
+    let max = crate::serve::server_tests::limits().max_concurrent;
+    struct LetGo(PathBuf);
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            super::super::HOLD_FORWARDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|d| *d != self.0);
+        }
+    }
+    let held_on = |dir: &PathBuf| {
+        super::super::HELD_FORWARDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| *d == dir)
+            .count()
+    };
+    super::super::HOLD_FORWARDS
+        .lock()
+        .unwrap()
+        .push(dir.clone());
+    let let_go = LetGo(dir.clone());
+    t.rt.block_on(async {
+        let c = client(b).await;
+        let forward = |op| {
+            let mut c = c.clone();
+            tokio::spawn(async move {
+                c.forward(crate::serve::proto::ForwardRequest {
+                    partition: "p2".into(),
+                    op,
+                    ..Default::default()
+                })
+                .await
+            })
+        };
+        let mut calls: Vec<_> = (0..max).map(|_| forward(None)).collect();
+        eventually("b's clients' lane to be full", async || {
+            held_on(&dir) == max
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let e = tokio::time::timeout(Duration::from_secs(2), forward(None))
+            .await
+            .expect("a forward past the limit answers within 2 s")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+        assert!(e.message().contains("forwarded calls"), "{e:?}");
+        // The balancer's ask is a node's arm: held too, so it took a place in its own lane.
+        calls.push(forward(Some(
+            crate::serve::proto::forward_request::Op::Tablets(
+                crate::serve::proto::TabletsRequest {
+                    partition: "p2".into(),
+                },
+            ),
+        )));
+        eventually("the node's arm to take a place", async || {
+            held_on(&dir) == max + 1
+        })
+        .await;
+        drop(let_go);
+        for c in calls {
+            let _ = tokio::time::timeout(Duration::from_secs(5), c)
+                .await
+                .expect("a forward let go answers within 5 s")
+                .unwrap();
+        }
+    });
+}
+
+#[test]
 fn in_a_rolling_upgrade_a_node_beside_builds_without_leases_serves_and_still_lapses_when_cut_off() {
     // #2047: b and c act as 1.2 (no `Cluster.Lease`: `Unimplemented`), and a restarts as
     // the first node upgraded. Each of them holds the round's map, so a counts it as
