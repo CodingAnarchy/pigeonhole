@@ -355,6 +355,12 @@ where
     builder.http2().max_concurrent_streams(MAX_STREAMS);
     let conn = builder.serve_connection(TokioIo::new(io), service);
     tokio::pin!(conn);
+    // GOAWAY only near the hold's end, not after the first answer (the coordinator's ruling
+    // on #2270): tonic sends a channel's next call before it has read the GOAWAY, so that call
+    // fails `Cancelled`, not `UNAVAILABLE`, and the channel connects again for every call (one
+    // client: some 18,000 connections and 108 to 436 `Cancelled` in 2 s; taking calls until
+    // near the hold's end: 6 or 7 connections and at most 2). A call sent just as the GOAWAY
+    // goes out can still race it, once per refused connection.
     let grace = hold / 10;
     tokio::select! {
         r = &mut conn => return Ended::Served(r),
