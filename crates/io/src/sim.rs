@@ -323,7 +323,15 @@ struct SimState {
     hold_vfs: bool,
     /// Whether deferred file syncs are held back ([`SimVfs::hold_file_syncs`]).
     hold_file_syncs: bool,
+    /// The pause [`SimVfs::pause_next_allocate`] armed, until an allocate takes it.
+    allocate_pause: Option<AllocatePause>,
 }
+
+/// Which allocate [`SimVfs::pause_next_allocate`] pauses, and what runs in the pause.
+type AllocatePause = (
+    Box<dyn Fn(u64, u64) -> bool + Send>,
+    Box<dyn FnOnce() + Send>,
+);
 
 /// A deferred operation: `job` runs it on its file and resolves its completion.
 struct InFlight {
@@ -633,6 +641,7 @@ impl SimVfs {
                 crashes: 0,
                 hold_vfs: false,
                 hold_file_syncs: false,
+                allocate_pause: None,
             }),
             io_submitted: Condvar::new(),
         })
@@ -855,6 +864,32 @@ impl SimVfs {
     pub fn hold_file_syncs(&self, on: bool) {
         self.state().hold_file_syncs = on;
         self.io_submitted.notify_all();
+    }
+
+    /// Pauses the next `File::allocate` whose `(offset, len)` satisfies `matches` and runs
+    /// `run` in the pause, on the allocating thread, once: after the allocate has its range
+    /// and before it changes the file's length, outside the simulator's lock (so `run` may use
+    /// the filesystem, the same file included). Real backends read the length and then set
+    /// it there, so `run` stands for whatever another thread does to the file in that window:
+    /// a test's deterministic interleaving of two growths of one file (#2279). `matches` runs
+    /// under the simulator's lock, so it must not use the filesystem.
+    pub fn pause_next_allocate(
+        &self,
+        matches: impl Fn(u64, u64) -> bool + Send + 'static,
+        run: impl FnOnce() + Send + 'static,
+    ) {
+        self.state().allocate_pause = Some((Box::new(matches), Box::new(run)));
+    }
+
+    /// Takes the armed pause if it matches an allocate of `(offset, len)`.
+    fn take_allocate_pause(&self, offset: u64, len: u64) -> Option<Box<dyn FnOnce() + Send>> {
+        let mut st = self.state();
+        let hit = st
+            .allocate_pause
+            .as_ref()
+            .is_some_and(|(matches, _)| matches(offset, len));
+        hit.then(|| st.allocate_pause.take().map(|(_, run)| run))
+            .flatten()
     }
 
     /// Shared-memory regions that exist (created and not removed), in every directory: a
@@ -1214,15 +1249,20 @@ impl SimFile {
         self.check_writable("set_len: file not opened for writing")?;
         let len = file_end(len, 0, "set_len: beyond the simulated file size limit")?;
         self.with(|st| {
-            let node = st.node(self.node);
-            node.data.resize(len, 0);
-            node.pending.push(Pending::SetLen(len));
-            st.mutated(|| SimOp::SetLen {
-                node: self.node,
-                len: len as u64,
-            });
+            self.resize_locked(st, len);
             Ok(())
         })
+    }
+
+    /// Sets the length to `len`, as an unsynced length change, under the simulator's lock.
+    fn resize_locked(&self, st: &mut SimState, len: usize) {
+        let node = st.node(self.node);
+        node.data.resize(len, 0);
+        node.pending.push(Pending::SetLen(len));
+        st.mutated(|| SimOp::SetLen {
+            node: self.node,
+            len: len as u64,
+        });
     }
 
     /// Makes the pending writes durable, and the length too when `metadata` is set.
@@ -1447,12 +1487,21 @@ impl File for SimFile {
         let end = offset
             .checked_add(len)
             .ok_or(Error::new(ErrorKind::Other, "allocate: range overflows"))?;
-        let cur = self.len()?;
-        if end > cur {
-            self.change_len(end)
-        } else {
-            self.check_writable("allocate: file not opened for writing")
+        // The window real backends have between reading the length and setting it.
+        if let Some(run) = self.vfs.take_allocate_pause(offset, len) {
+            run();
         }
+        // The length is read and grown in one step under the simulator's lock, so a growth
+        // never sets it below what another one set meanwhile (#2279).
+        self.with(|st| {
+            if end <= st.node(self.node).data.len() as u64 {
+                return self.check_writable("allocate: file not opened for writing");
+            }
+            self.check_writable("set_len: file not opened for writing")?;
+            let end = file_end(end, 0, "set_len: beyond the simulated file size limit")?;
+            self.resize_locked(st, end);
+            Ok(())
+        })
     }
 
     fn lock(&self, byte: u64, mode: LockMode) -> Result<()> {

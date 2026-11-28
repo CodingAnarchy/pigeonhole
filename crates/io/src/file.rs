@@ -173,6 +173,14 @@ pub trait File: Send + Sync + Debug {
     fn set_len(&self, len: u64) -> Result<()>;
 
     /// Preallocates `[offset, offset + len)` so later writes there need no metadata update.
+    ///
+    /// Grows the file to cover the range if it is shorter, and never shrinks it: allocations
+    /// through one handle may run on several threads at once, and each leaves the length at
+    /// least where the others set it (#2279). Where the platform can only read the length
+    /// and then set it (macOS, Windows, Linux without `fallocate`), the handle orders those
+    /// steps with its other length changes; another handle on the same file is not ordered
+    /// with it. A write past the end that did not allocate its range first may still be cut
+    /// by an allocate running at the same time, so allocate a range before writing into it.
     fn allocate(&self, offset: u64, len: u64) -> Result<()>;
 
     /// Gives the filesystem back the blocks under `[offset, offset + len)`, keeping the

@@ -807,3 +807,32 @@ fn another_threads_blocked_wait_never_runs_the_device() {
     rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     waiter.join().unwrap();
 }
+
+/// #2279: an allocate whose growth is computed from the length it read must not set the
+/// length below a larger growth that ran in its window. Here allocate A (to 3 MiB) pauses
+/// between computing its range and changing the length; in the pause, allocate B (to 4 MiB)
+/// grows the file and data is written past A's end. Before the fix, A then set the length
+/// back to 3 MiB and the data was gone.
+#[test]
+fn an_allocate_never_shrinks_the_file_below_a_growth_in_its_window() {
+    const MIB: u64 = 1 << 20;
+    let vfs = SimVfs::new(2279);
+    let file = create_durable(&vfs, "f");
+    file.allocate(0, 2 * MIB).unwrap();
+    let other = Arc::clone(&file);
+    vfs.pause_next_allocate(
+        |offset, len| offset + len == 3 * MIB,
+        move || {
+            other.allocate(3 * MIB, MIB).unwrap();
+            other.write_at(b"in slot 3", 3 * MIB).unwrap();
+        },
+    );
+    file.allocate(2 * MIB, MIB).unwrap();
+    assert_eq!(file.len().unwrap(), 4 * MIB, "allocate shrank the file");
+    let mut buf = [0u8; 9];
+    file.read_at(&mut buf, 3 * MIB).unwrap();
+    assert_eq!(&buf, b"in slot 3");
+    // A smaller range inside the file changes nothing.
+    file.allocate(0, MIB).unwrap();
+    assert_eq!(file.len().unwrap(), 4 * MIB);
+}
