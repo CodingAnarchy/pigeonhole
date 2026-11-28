@@ -311,8 +311,19 @@ fn a_retention_hold_keeps_the_history_until_dropped_or_its_cap() {
         "released, retention passed it"
     );
 
+    // The reader at that token was passed too: it expires, where it used to wait at its
+    // segment's end for a successor retention had recycled (#2279).
+    let expired = loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Commit(_) => continue,
+            Next::Expired(e) => break e,
+            n => panic!("the passed reader didn't expire: {n:?}"),
+        }
+    };
+    assert!(expired.reason.contains("retention passed"), "{expired:?}");
+
     // A small cap: the hold lapses once the retained history passes it.
-    drain(&mut r);
+    let r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
     let hold = db.hold_feed_retention(1 << 20).unwrap();
     let token = r.token();
     let deadline = Instant::now() + WAIT;

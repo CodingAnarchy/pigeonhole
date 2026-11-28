@@ -2071,7 +2071,23 @@ impl FeedReader {
                 pack(batch, tables, prefix)
             }
         };
-        let (start, end, session, record) = match self.streams[s].cursor.step()? {
+        let step = match self.streams[s].cursor.step() {
+            // #2279: a successor missing below the floor was recycled by retention, which
+            // passed the feed (its own segment not yet reused). The floor never goes down, so
+            // loaded after the cursor read the headers it covers what they showed.
+            // (`floor` without `self.floor`: the step borrows the cursor.)
+            Err(pigeonhole_wal::Error::ChainBroken { epoch })
+                if epoch < self.shm.feed_marks(s as u32).floor =>
+            {
+                self.expired = Some(expiry(
+                    "retention passed the feed: the segment after the one it was reading was \
+                     recycled",
+                ));
+                return Ok(None);
+            }
+            step => step?,
+        };
+        let (start, end, session, record) = match step {
             Step::Record {
                 start,
                 end,
