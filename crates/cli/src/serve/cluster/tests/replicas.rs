@@ -1021,6 +1021,7 @@ fn a_planned_promotion_from_a_fenced_owner_counts_the_loss_exactly() {
 /// whose owner still serves it.
 #[test]
 fn a_promotion_needs_a_replica_and_an_owner_that_stopped_serving() {
+    use crate::serve::proto::PartitionRequest;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_dirs, ports, _stops, _dbs) = following(&rt);
     rt.block_on(async {
@@ -1039,6 +1040,8 @@ fn a_promotion_needs_a_replica_and_an_owner_that_stopped_serving() {
             "{}",
             e.message()
         );
+        // `--old-unreachable` with the owner serving is refused for that, whoever the
+        // target is.
         let e = within(super::super::promote::promote(
             &args_at(ports[0]),
             "p3",
@@ -1048,12 +1051,34 @@ fn a_promotion_needs_a_replica_and_an_owner_that_stopped_serving() {
         ))
         .await
         .err()
-        .expect("b holds no replica of p3");
+        .expect("the owner answers and serves p3");
         assert!(
-            e.message().contains("answers and serves") || e.message().contains("no copy"),
+            e.message().contains("answers and serves"),
             "{}",
             e.message()
         );
+        // The owner fenced, so only the target stands in the way (#2271: the refusal above
+        // comes before the copy is looked for, and either message was accepted, so the
+        // rule for a node with no copy never ran).
+        client(ports[2])
+            .await
+            .fence(PartitionRequest {
+                partition: "p3".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "b",
+            false,
+            None,
+        ))
+        .await
+        .err()
+        .expect("b holds no replica of p3");
+        assert!(e.message().contains("no copy"), "{}", e.message());
     });
 }
 
