@@ -534,6 +534,13 @@ replicate-apply 6415 0.3
 # when the checkpoints landed late (#2007, #2029, #2033); from head 5ac5c919f on image
 # 20261111.196.1 (run 44185022456): 11279643. Times 1.003.
 memory-recall 11313482 0.3
+# D336 Amendment 3, V1 (#2280): the vector index's in-list upsert (vecshapes.rs), per upsert:
+# an L put and, since #2277, the M rewrite at a fresh timestamp. On ubuntu-26.04, main 020239a1a
+# (with #2277), four runs of the job, base and head of identical code each (perf2 on #2280):
+# run 46117335157 on head eaf29f5e2, 81640 and 81640; run 46119516909 on head 0440ebe6d, three
+# attempts, 81619 and 81619, 81619 and 81619, 81620 and 81634. Spread 81619-81640 (0.03%). The
+# highest times 1.003.
+vector-upsert 81885 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
 # and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these

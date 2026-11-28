@@ -33,6 +33,8 @@ on:
       - 'crates/bench/examples/feedshapes.rs'
       - 'crates/bench/examples/memshapes.rs'
       - 'crates/memory/**'
+      - 'crates/vector/**'
+      - 'crates/bench/examples/vecshapes.rs'
       - 'crates/embed/**'
       - 'crates/bench/examples/serveshapes.rs'
       - 'crates/cli/src/serve/**'
@@ -202,12 +204,15 @@ jobs:
             # applied in the measured part. `replicate-apply` last: its setup (a primary and
             # its feed) is the fullest. Agent memory's fused recall (#1828,
             # crates/bench/examples/memshapes.rs): memories written in setup, recalled in the
+            # measured part. The vector index's in-list upsert (D336 Amendment 3, V1,
+            # crates/bench/examples/vecshapes.rs): vectors written in setup, upserted in the
             # measured part.
-            examples: feedshapes memshapes
+            examples: feedshapes memshapes vecshapes
             hotrow: '-'
             shapes: >-
               feedshapes:feed-drain,feed-drain-all,replicate-apply
               memshapes:memory-recall
+              vecshapes:vector-upsert
           - name: phdb serve instructions per call (callgrind)
             # `phdb serve`'s gRPC calls through its router in process (#1828,
             # crates/bench/examples/serveshapes.rs): the token check, prepay, decode,
