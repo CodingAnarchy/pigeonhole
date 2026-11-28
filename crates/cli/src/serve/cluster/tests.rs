@@ -144,6 +144,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         partitions: [("p1", "a"), ("p2", "b"), ("p3", "c")]
             .iter()
             .map(|(id, node)| Partition {
+                replica_ack_policy: 0,
                 replica_acks: 0,
                 moves_history: Default::default(),
                 pinned: Default::default(),
@@ -1734,6 +1735,7 @@ fn data_node_served(
     }
     // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
     node.load_fences().unwrap();
+    node.load_degraded().unwrap();
     let metrics = Arc::new(Metrics::default());
     let service = Service::routing_only(limits, 2, Arc::clone(&metrics), None);
     let backup_dir = dir.join(format!("backups-{id}"));
@@ -1763,18 +1765,21 @@ fn data_node_served(
         if !restart {
             gate.renew(node.grants.clock().now() + HOUR_NS);
         }
-        parts.push((
-            p.to_owned(),
-            service.for_partition(
-                db.clone(),
-                p,
-                gate,
-                crate::serve::service::PartitionConfig {
-                    engine_memory: Some(memory),
-                    ..crate::serve::service::PartitionConfig::new(Arc::clone(&backups))
-                },
-            ),
-        ));
+        let part = service.for_partition(
+            db.clone(),
+            p,
+            gate,
+            crate::serve::service::PartitionConfig {
+                engine_memory: Some(memory),
+                ..crate::serve::service::PartitionConfig::new(Arc::clone(&backups))
+            },
+        );
+        // D335: its replica acks from the map, as `run` arms them (PR 2b: the kick, and a
+        // fallback this node recorded resumed).
+        if let (Some(pp), Ok(map)) = (part.part_opt(), node.get_map()) {
+            node.arm_acks(&pp.acks, &map, p, db.visible_seqno());
+        }
+        parts.push((p.to_owned(), part));
         dbs.push(db);
     }
     let shared = Arc::new(Shared {
@@ -4837,6 +4842,7 @@ fn split_nodes(
             .collect(),
         partitions: (0..n)
             .map(|i| Partition {
+                replica_ack_policy: 0,
                 replica_acks: 0,
                 moves_history: Default::default(),
                 pinned: Default::default(),
@@ -5643,6 +5649,7 @@ mod admin;
 mod backup;
 mod charge;
 mod close;
+mod fallback;
 mod feed;
 mod fence;
 mod idle;

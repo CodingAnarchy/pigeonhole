@@ -165,6 +165,15 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
                 p.replicas.len()
             ));
         }
+        // D335 PR 2b: a policy this build knows (an unknown one is refused, never read as
+        // REFUSE or ASYNC by guess).
+        if super::proto::ReplicaAckPolicy::try_from(p.replica_ack_policy).is_err() {
+            return Err(format!(
+                "partition {:?}'s replica_ack_policy {} isn't one this node knows (REFUSE or \
+                 ASYNC)",
+                p.id, p.replica_ack_policy
+            ));
+        }
     }
     let mut tables = HashSet::new();
     // A co-location group's single partition, and the table that set it.
@@ -1862,6 +1871,7 @@ mod tests {
             address: format!("127.0.0.1:{port}"),
         };
         let part = |id: &str, node: &str| Partition {
+            replica_ack_policy: 0,
             replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
@@ -2585,6 +2595,7 @@ mod tests {
             address: "127.0.0.1:7003".into(),
         });
         ok.partitions.push(Partition {
+            replica_ack_policy: 0,
             replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),
@@ -2695,6 +2706,7 @@ mod tests {
         assert_eq!(history(&promoted, "p1"), (4, 4));
         // A new partition's history starts at its epoch.
         moved.partitions.push(Partition {
+            replica_ack_policy: 0,
             replica_acks: 0,
             moves_history: Default::default(),
             pinned: Default::default(),

@@ -102,7 +102,7 @@ The network API (`pigeonhole.v1`), additive:
   - **Healthy:** a counted replica, unless the lowest uncovered write began waiting at least 2 s ago (twice the follow's heartbeat) for a position past the replica's last acknowledgement, and the replica acknowledged nothing new in that time.
   - Every write that waited stays uncovered until the frontier passes it, a timed-out one included, so a replica that stopped acknowledging reads unhealthy though no write waits any more (simp724's N1).
   - An idle partition's replicas stay healthy on their stream alone.
-  - `ASYNC` (acknowledging uncovered while short) is D335 PR 2b.
+  - `ASYNC` (acknowledging uncovered while short) is D335 PR 2b, below.
 - **Who counts:**
   - Only the map's replicas of the partition.
   - A node the map no longer lists stops counting at that install (feed1248's A1), by the count's filter. Its stream's entry is kept: nothing ends the stream at the install, and a node removed and added back by two quick installs may keep the same live stream, whose acknowledgements stay true of its copy.
@@ -133,4 +133,94 @@ The network API (`pigeonhole.v1`), additive:
   - `cluster/install.rs`, `open.rs` and `start.rs`, the configuration at install and open;
   - `cluster/map.rs`'s validation and `features.rs`'s `REPLICA_ACK_WAIT_FEATURE`;
   - `config.rs`'s flag.
+- No crate outside `pigeonhole-cli` changes.
+
+## PR 2b: the ASYNC fallback
+
+### Change
+
+The network API (`pigeonhole.v1`), additive, all in `cluster.proto`:
+
+- **`enum ReplicaAckPolicy`:**
+  - `REPLICA_ACK_POLICY_UNSPECIFIED = 0`, read as `REFUSE`;
+  - `REPLICA_ACK_POLICY_REFUSE = 1`;
+  - `REPLICA_ACK_POLICY_ASYNC = 2`.
+  
+  `Partition.replica_ack_policy = 13`: what the owner does with fewer than k healthy replicas.
+- **`LeasePart.degraded_from = 6` (`Position`) and `LeasePart.degraded_clear = 7` (`bool`):**
+  - From an owner: record where its fallback began, or that it ended.
+  - In a grantor's `granted` entry: echoed only once the grantor has synced that record.
+- **`NodeStatus.degraded = 19`** (repeated `DegradedRecord { partition = 1; epoch = 2; state = 3; degraded_from = 4; }`): a grantor's durable records.
+  - `enum DegradedState { DEGRADED_STATE_UNKNOWN = 0; DEGRADED_STATE_CLEAR = 1; DEGRADED_STATE_FLAGGED = 2; }`.
+  - A partition the node has no record of is absent, which means unknown.
+- **`LocalPartition.degraded_from = 41`** (`Position`): on the owner, while it's in the fallback.
+- **`BranchPrepare.replication = 3`** (`ReplicationMode`): the spanning commit opted down.
+- **The map feature string `replica_ack_policy`:** the node keeps `Partition.replica_ack_policy`, and records and echoes the lease's fallback marks.
+- **`/metrics`, per partition on its owner, `{partition}`:**
+  - `pigeonhole_cluster_replica_ack_degraded` (gauge: 1 while in the fallback);
+  - `pigeonhole_cluster_replica_ack_degraded_total` (counter: entries into it).
+- **The node file `cluster-degraded.json`:** a grantor's records, JSON, written whole and synced. A file that doesn't parse fails the node's start.
+
+### Semantics
+
+- **The map:**
+  - A policy this build doesn't know is refused (`InvalidArgument`).
+  - A map sets a policy (any value) only once every node reports `replica_ack_policy`: the first such map, a first map included.
+  - The policy is inert at k = 0.
+- **Entering (ASYNC):**
+  - A write admitted while the partition is short is taken, not refused.
+  - The owner enters the fallback from the position just past its acked frontier (`(seqno, n + 1)`, or `(0, 0)` with no frontier). Every write not covered then is at or past it.
+  - It starts a lease round at once, rather than at the next third of a lease.
+- **Recording:**
+  - Every round while in the fallback carries `degraded_from`.
+  - A grantor records it per partition and epoch, syncs it before answering, and echoes it in its grant.
+  - When a majority of the round's map's nodes echo exactly that start (counted as the lease counts, the owner's own grant included), the start is recorded for that map's node set.
+  - A pre-1.3 node's phantom grant never echoes. Neither does a grant whose record write failed.
+- **Answering uncovered:**
+  - While recorded for the map's current node set, the partition still short, and the fallback not leaving, a write at or past the start is answered without its acknowledgements. `CommitInfo.replica_acks` gives the count it had, usually 0.
+  - Writes already waiting are answered when the record lands. That includes a write admitted under `REFUSE` before the policy changed, when its position is at or past the start (simp724's Q1).
+  - Before the record lands, a write waits as in 2a and answers `OutcomeUnknown` at the timeout. Uncovered answers stop while the partition is healthy, so the last uncovered position stops moving and the frontier can catch up.
+- **The node set (simp724's P2):**
+  - An install whose node set differs from the one the start was recorded for drops the record.
+  - Nothing more is answered uncovered until a round's majority of the new set echoes it, since a majority of the old set may share no node with one of the new.
+- **A lower echo:**
+  - A grantor holding an earlier start (an owner that lost its own) echoes that one.
+  - The owner moves its start down to it, which only covers more, and counts it again.
+  - A grantor never raises a recorded start without a clear between.
+- **Leaving:**
+  - Once k replicas are healthy and the frontier has passed every write answered uncovered, each round carries `degraded_clear`, and writes wait for their acknowledgements as usual.
+  - Once a majority echoes the clear, the fallback is over.
+  - Short again first: the clear is given up, and the start and its record are kept.
+- **A grantor's records (simp724's M1, Q2):**
+  - **First grant:** a grantor records `CLEAR` when it first grants a `replica_acks` partition at an epoch, so a partition with no record is only ever unknown.
+  - **Order:** records compare by epoch first, then state. A lower epoch's round never changes one, so an old owner's late round can't lower what a promoted owner's rounds recorded.
+  - **At grant time:** the request's map is the grantor's own, so a record of another history (a newer one: P was re-created at lower epochs; an older one: a past history) is replaced.
+  - **At an install:** the records of partitions the map no longer has are dropped, and so are those of an older history than the map's. One of a newer history is kept, as this node's map may lag.
+  - **Retention:** records survive the grant's expiry and restarts.
+  - **Echoed unasked:** a `FLAGGED` record is echoed in every grant of the partition at that epoch, unless the round asks to clear. An owner not in the fallback that sees one resumes it (as at a reopen, below) and clears it. That covers an owner that restarted without its own record, and a grantor that missed the clearing round (one in its start grace, say), so no grantor keeps a stale flag.
+- **Reopen (simp724's P1):**
+  - An owner that opens a partition whose own grantor record is `FLAGGED` at the current epoch and history resumes the fallback from that start.
+  - It takes every write up to the partition's visible seqno at open as possibly answered uncovered, so it leaves only once the replicas hold them all.
+  - The start is recorded again by the next round, which starts at once.
+  - A replica acknowledges its stored token's position (durable) as soon as a `FollowAcked` stream opens, not only after its next apply. So a reopened partition that stays idle still ends its fallback once its replicas reattach, without waiting for a write (simp724).
+- **Spanning transactions:**
+  - The commit-time refusal is 2a's, whatever the policy.
+  - A writing `BranchPrepare` carries the commit's opt-down (`replication`).
+  - A branch's owner also refuses a writing prepare that didn't opt down when its own map sets `replica_acks` (`FailedPrecondition`). This covers a map that reached the branch's owner a push before the driver (simp724's note 1).
+  - The driver then aborts the other branches and answers `Conflict`, retry-safe.
+  - **Mixed versions:** an older driver leaves `replication` `DEFAULT`, so its opted-down prepares on such a partition are refused, failing closed.
+- **Unchanged:** `REFUSE` (unset or explicit) is 2a's. Opted-down writes never wait and never enter the fallback.
+
+### Callers
+
+- `pigeonhole-cli` (`serve`):
+  - `acks.rs`, the fallback state;
+  - `cluster/degraded.rs`, the grantor's records;
+  - `cluster/fence.rs`, the marks, echo counting, the kick and the phantom grant;
+  - `cluster/api.rs`, the `Lease` handler's records;
+  - `cluster/install.rs`, the policy gate, pruning, and `arm_acks` with P1's resume;
+  - `cluster/open.rs` and `start.rs`;
+  - `cluster/status.rs`;
+  - `cluster/spanning.rs` and `service/spanning.rs`, the prepare's opt-down and the owner's refusal;
+  - `cluster/map.rs` and `features.rs`.
 - No crate outside `pigeonhole-cli` changes.

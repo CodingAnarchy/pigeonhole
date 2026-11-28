@@ -7777,6 +7777,11 @@ pub struct Partition {
     /// With too few healthy replicas the owner refuses writes (`Unavailable`).
     #[prost(uint32, tag = "12")]
     pub replica_acks: u32,
+    /// D335 PR 2b: what P's owner does with fewer than `replica_acks` healthy replicas. Unset
+    /// is `REFUSE`. Inert with `replica_acks` 0. `ASYNC` is set only once every node keeps it
+    /// (`map_features`: `replica_ack_policy`).
+    #[prost(enumeration = "ReplicaAckPolicy", tag = "13")]
+    pub replica_ack_policy: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -8007,6 +8012,24 @@ pub struct NodeStatus {
     /// between its two surveys of the old owner's grants by it. 0: unknown (an older node).
     #[prost(uint64, tag = "18")]
     pub lease_ms: u64,
+    /// D335 PR 2b: this node's durable record, as a lease grantor, of each `replica_acks`
+    /// partition's fallback (`cluster-degraded.json`). A partition it has no record of is
+    /// absent: unknown.
+    #[prost(message, repeated, tag = "19")]
+    pub degraded: ::prost::alloc::vec::Vec<DegradedRecord>,
+}
+/// D335 PR 2b: a grantor's durable record of a partition's fallback at an epoch.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DegradedRecord {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(enumeration = "DegradedState", tag = "3")]
+    pub state: i32,
+    /// `FLAGGED`: the first position the owner may answer without replica acks.
+    #[prost(message, optional, tag = "4")]
+    pub degraded_from: ::core::option::Option<Position>,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8157,7 +8180,10 @@ pub struct LocalPartition {
     /// source (PR 3); absent otherwise.
     #[prost(message, optional, tag = "40")]
     pub tail_kept: ::core::option::Option<TailKept>,
-    /// 41 is D335 PR 2b's.
+    /// D335 PR 2b, on the partition's owner: the first position it may answer without replica
+    /// acks (`ASYNC`, too few healthy replicas). Absent while it answers covered.
+    #[prost(message, optional, tag = "41")]
+    pub degraded_from: ::core::option::Option<Position>,
     /// D336 PR 3: P's owner's replay of an old owner's tail (`phdb cluster replay-tail`), the
     /// last one since the node started; absent when none ran.
     #[prost(message, optional, tag = "42")]
@@ -8611,6 +8637,11 @@ pub struct BranchPrepare {
     pub xid: ::prost::alloc::string::String,
     #[prost(bool, tag = "2")]
     pub read_only: bool,
+    /// D335 PR 2b: the commit opted down (`ASYNC`, by field or header). A writing prepare on a
+    /// partition whose map sets `replica_acks` is refused unless it did (D335 PR 4 lifts
+    /// that). An older driver leaves it `DEFAULT`: such a prepare is refused, failing closed.
+    #[prost(enumeration = "ReplicationMode", tag = "3")]
+    pub replication: i32,
 }
 /// Decides a prepared branch (D329): commit or abort, synced before the answer. With `hold`
 /// (non-zero), the release of a read-only branch's hold instead, which answers only if the
@@ -8911,6 +8942,14 @@ pub struct LeasePart {
     pub in_doubt_xids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(uint64, tag = "5")]
     pub in_doubt_count: u64,
+    /// D335 PR 2b, from an owner: record that P's fallback starts at this position (`ASYNC`).
+    /// In a grantor's answer: echoed only once the grantor has synced that record.
+    #[prost(message, optional, tag = "6")]
+    pub degraded_from: ::core::option::Option<Position>,
+    /// D335 PR 2b, from an owner: record that P's fallback has ended. In a grantor's answer:
+    /// echoed only once synced.
+    #[prost(bool, tag = "7")]
+    pub degraded_clear: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseResponse {
@@ -9369,6 +9408,42 @@ impl FailoverState {
         }
     }
 }
+/// D335 PR 2b (ICR 0146): a partition's owner with fewer than `replica_acks` healthy
+/// replicas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReplicaAckPolicy {
+    /// `REFUSE`.
+    Unspecified = 0,
+    /// New writes are refused (`Unavailable`, retry-safe) until enough replicas are healthy.
+    Refuse = 1,
+    /// Writes are answered without replica acks (`CommitInfo.replica_acks` short of the map's),
+    /// once a majority of the lease's grantors durably record the position the fallback starts
+    /// at (`LeasePart.degraded_from`).
+    Async = 2,
+}
+impl ReplicaAckPolicy {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REPLICA_ACK_POLICY_UNSPECIFIED",
+            Self::Refuse => "REPLICA_ACK_POLICY_REFUSE",
+            Self::Async => "REPLICA_ACK_POLICY_ASYNC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REPLICA_ACK_POLICY_UNSPECIFIED" => Some(Self::Unspecified),
+            "REPLICA_ACK_POLICY_REFUSE" => Some(Self::Refuse),
+            "REPLICA_ACK_POLICY_ASYNC" => Some(Self::Async),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum FailoverMode {
@@ -9397,6 +9472,39 @@ impl FailoverMode {
             "FAILOVER_MODE_INHERIT" => Some(Self::Inherit),
             "FAILOVER_MODE_OFF" => Some(Self::Off),
             "FAILOVER_MODE_ON" => Some(Self::On),
+            _ => None,
+        }
+    }
+}
+/// D335 PR 2b: what a grantor durably knows of a partition's fallback at an epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DegradedState {
+    /// No durable knowledge: an older node, or none at this epoch.
+    Unknown = 0,
+    /// The grantor recorded this epoch, with no fallback in effect.
+    Clear = 1,
+    /// The owner may answer writes from `degraded_from` without replica acks.
+    Flagged = 2,
+}
+impl DegradedState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "DEGRADED_STATE_UNKNOWN",
+            Self::Clear => "DEGRADED_STATE_CLEAR",
+            Self::Flagged => "DEGRADED_STATE_FLAGGED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DEGRADED_STATE_UNKNOWN" => Some(Self::Unknown),
+            "DEGRADED_STATE_CLEAR" => Some(Self::Clear),
+            "DEGRADED_STATE_FLAGGED" => Some(Self::Flagged),
             _ => None,
         }
     }

@@ -506,10 +506,14 @@ impl Service {
         r: proto::TxnCommitRequest,
         caller: &Caller,
         budget: OwnedSemaphorePermit,
-        driver: super::super::cluster::spanning::Driver,
+        mut driver: super::super::cluster::spanning::Driver,
         forwarded: bool,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
         use super::super::cluster::spanning::SpanView;
+        // D335 PR 2b: an opted-down commit's writing prepares say so.
+        if caller.replication_async || r.replication == proto::ReplicationMode::Async as i32 {
+            driver.replication = proto::ReplicationMode::Async as i32;
+        }
         let gate = Arc::clone(
             self.gate
                 .as_ref()

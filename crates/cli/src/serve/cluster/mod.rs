@@ -57,6 +57,7 @@ pub(crate) mod upload;
 pub(crate) mod writer;
 
 mod api;
+pub(crate) mod degraded;
 mod features;
 mod install;
 mod peers;
@@ -292,6 +293,9 @@ pub(crate) struct Node {
     pub(crate) feed_hubs: hub::Hubs,
     /// The leases this node grants, and its lease clock (D326).
     grants: lease::Grants,
+    /// Its durable records, as a grantor, of `replica_acks` partitions' fallbacks (D335 PR
+    /// 2b): read at start ([`Node::load_degraded`]).
+    pub(crate) degraded: degraded::Records,
     /// When this writer first saw a majority of both the nodes before and the nodes after
     /// a node change hold it, by the change's map version, on its lease clock: a further
     /// change waits a lease past that (audit120's L1 on #1899's F4). In memory: a writer
@@ -335,6 +339,13 @@ pub(crate) struct Node {
 }
 
 impl Node {
+    /// Reads the node's [`degraded::DEGRADED_FILE`] (D335 PR 2b), at its start.
+    pub(crate) fn load_degraded(&self) -> Result<(), String> {
+        self.degraded
+            .load()
+            .map_err(|e| format!("{}: {e}", self.dir.display()))
+    }
+
     fn new(
         dir: &Path,
         id: &str,
@@ -358,6 +369,7 @@ impl Node {
             tail_sources: Arc::default(),
             replays: tail_replay::Replays::default(),
             grants,
+            degraded: degraded::Records::new(dir),
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),
             candidate: std::sync::atomic::AtomicU64::new(0),

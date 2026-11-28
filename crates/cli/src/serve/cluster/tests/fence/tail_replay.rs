@@ -430,6 +430,7 @@ fn share_tail(in_doubt: bool, stop: StopAt) {
                 Op::BranchPrepare(BranchPrepare {
                     xid: xid.clone(),
                     read_only: false,
+                    ..Default::default()
                 }),
             ] {
                 client(b).await.forward(fwd(op)).await.unwrap();
