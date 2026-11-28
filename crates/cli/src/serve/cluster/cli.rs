@@ -917,12 +917,8 @@ pub(super) async fn relocate_as(
              away from a stopped node is a promotion, which starts a new feed history",
         ));
     }
-    let (mut c, token) = connect(args, &args.node).await?;
-    let mut m = c
-        .get_map(request(GetMapRequest {}, token.as_deref())?)
-        .await
-        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
-        .into_inner();
+    // The writer's map, which this relocation's change is set against (#2249).
+    let mut m = writer_map(args).await?;
     let Some(p) = m.partitions.iter().find(|p| p.id == partition).cloned() else {
         return Err(Failure::usage(&format!(
             "the map (version {}) has no partition {partition:?}",
@@ -995,11 +991,7 @@ pub(super) async fn relocate_as(
     // stamp installs the owner's: it leaves P's replicas, and closes its copy, first (S4).
     // The installed set replaces the copy's file, which goes aside.
     if super::promote::leave_replicas(args, &m, partition, to).await? {
-        m = c
-            .get_map(request(GetMapRequest {}, token.as_deref())?)
-            .await
-            .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
-            .into_inner();
+        m = writer_map(args).await?;
     }
     // A restore's old node may have lost P (not listed: `Unspecified`).
     if let Some(state) = old_state
@@ -1359,6 +1351,44 @@ pub(crate) fn url_of(args: &NodeArgs, address: &str) -> String {
     format!("{scheme}://{address}")
 }
 
+/// The cluster map as its writer has it, through `args`' node (#2249): the node's map names
+/// the writer, whose map is then read. A change is set at the writer, compare-and-set
+/// against its version, so a change built on a node's map one push behind the writer's
+/// (a push still on its way, or re-sent after a slow first attempt) was refused as stale:
+/// a `phdb cluster move` through such a node failed. The node's own map when it's the
+/// writer, names none, or the writer can't be reached (the set there fails anyway).
+pub(crate) async fn writer_map(args: &NodeArgs) -> Result<ClusterMap, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    let m = c
+        .get_map(request(GetMapRequest {}, token.as_deref())?)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    let w = super::schema::writer(&m);
+    let Some(at) = m
+        .nodes
+        .iter()
+        .find(|n| n.id == w)
+        .map(|n| url_of(args, &n.address))
+    else {
+        return Ok(m);
+    };
+    if at == args.node {
+        return Ok(m);
+    }
+    let read = async {
+        let (mut c, token) = connect(args, &at).await.ok()?;
+        c.get_map(request(GetMapRequest {}, token.as_deref()).ok()?)
+            .await
+            .ok()
+            .map(tonic::Response::into_inner)
+    };
+    Ok(match read.await {
+        Some(at_writer) if map::newer(&at_writer, &m) => at_writer,
+        _ => m,
+    })
+}
+
 pub(crate) async fn set_map(
     args: &NodeArgs,
     mut m: ClusterMap,
@@ -1502,8 +1532,11 @@ pub(crate) async fn set_map(
         .into_inner()
     } else {
         // Compare-and-set against the current version (0 before a first map), at the map's
-        // writer (D317 amendment 1).
-        let expected = current.as_ref().map_or(0, |c| c.map_version);
+        // writer (D317 amendment 1). The node's, unless `m` is the writer's next version
+        // (#2249): a change built on the writer's map ([`writer_map`]) through a node one
+        // push behind it. Any other map keeps the node's version, as before, and a map
+        // built on an older one is refused there anyway, as not newer.
+        let mut expected = current.as_ref().map_or(0, |c| c.map_version);
         if let Some(cur) = &current {
             let w = super::schema::writer(cur);
             let address = cur
@@ -1515,6 +1548,15 @@ pub(crate) async fn set_map(
             at = url_of(args, &address);
             if at != args.node {
                 c = connect(args, &at).await?.0;
+                if let Ok(r) = c
+                    .get_map(request(GetMapRequest {}, token.as_deref())?)
+                    .await
+                {
+                    let at_writer = r.into_inner().map_version;
+                    if at_writer.checked_add(1) == Some(m.map_version) {
+                        expected = at_writer;
+                    }
+                }
             }
         }
         c.set_map(request(

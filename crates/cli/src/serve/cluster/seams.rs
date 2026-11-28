@@ -152,16 +152,63 @@ pub(crate) fn old_nearest(path: &Path, how: OldNearest) -> bool {
         .any(|(d, h)| *h == how && path.starts_with(d))
 }
 
+/// Whether [`CUT_OFF`] cuts the node in `dir` and the peer at `address` apart, both ways: a
+/// call's receiver asks it of its sender (#2259), where [`CUT_BETWEEN`]'s one-way entries,
+/// keyed by the dialing side's directory, don't apply.
 #[cfg(test)]
-pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
+pub(super) fn cut_apart(dir: &Path, address: &str) -> bool {
     CUT_OFF
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .any(|c| c.dir == dir || (c.address == address && c.cluster.iter().any(|d| d == dir)))
+}
+
+/// Whether the node in `dir` can't reach the peer at `address`. Checked before a dial, again
+/// once it connected, and when a fetched map arrives; a pushed map's receiver checks
+/// [`cut_apart`]. So a call that began before a cut delivers nothing after it (#2259).
+#[cfg(test)]
+pub(super) fn cut_off(dir: &Path, address: &str) -> bool {
+    cut_apart(dir, address)
         || CUT_BETWEEN
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|(d, a)| d == dir && a == address)
+}
+
+/// A hold seam (tests): the node in each listed directory holds every `Forward` it serves,
+/// once past the caller check, until its directory leaves the list, as a forward does
+/// behind a slow branch (#2258). Each held call is in [`HELD_FORWARDS`] while it waits.
+#[cfg(test)]
+pub(crate) static HOLD_FORWARDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The node directory of each `Forward` that [`HOLD_FORWARDS`] holds now.
+#[cfg(test)]
+pub(crate) static HELD_FORWARDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Waits while [`HOLD_FORWARDS`] lists `dir`.
+#[cfg(test)]
+pub(crate) async fn hold_forward(dir: &Path) {
+    let held = || {
+        HOLD_FORWARDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|d| d == dir)
+    };
+    if !held() {
+        return;
+    }
+    HELD_FORWARDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(dir.to_owned());
+    while held() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut h = HELD_FORWARDS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(i) = h.iter().position(|d| d == dir) {
+        h.remove(i);
+    }
 }

@@ -30,7 +30,8 @@
 # replica-ack wait histogram counted writes.
 # CPUs (SCALE=full): n1 0-3,16-19; n2 4-7,20-23; n3 8-11,24-27; client 12-15,28-31. Each node
 # serves with --shards 8 (its partition and its replica copy share them), --change-feed
-# 1 GiB, a backup dir (replicas bootstrap from it) and SESSIONS below.
+# 1 GiB, a backup dir (replicas bootstrap from it), and the session flags below only with
+# OLD_SESSION_CAPS=1.
 # SCALE=small: no pinning, --shards 2, --change-feed 64 MiB, 20 s measured, 5 s warm-up.
 # FUNCTIONAL per run: each node's cmdline names the arm's phdb; every node up until the client
 # ends (h: n2 resumes); 3 partitions serving and 3 replicas following before the load; the
@@ -67,7 +68,7 @@ fi
 for sha in $A $B; do
   [ ${#sha} -eq 40 ] || { echo "FAILED: $sha isn't a full 40-char SHA"; exit 1; }
 done
-echo "=== 2221 span start $(date -u +%H:%M:%SZ) a ${A:0:12} b ${B:0:12} scale $SCALE reps $REPS shapes $SHAPES"
+echo "=== 2221 span start $(date -u +%H:%M:%SZ) a ${A:0:12} b ${B:0:12} scale $SCALE reps $REPS shapes $SHAPES session caps $([ -n "${OLD_SESSION_CAPS:-}" ] && echo "raised (OLD_SESSION_CAPS)" || echo default)"
 
 # Each arm: its own clone and target, built once.
 build() { local arm=$1 sha=$2 sd=$S/src-2221-$1 td=$S/target-2221-$1
@@ -88,11 +89,13 @@ build a $A
 LOAD=$S/target-2221-a/release/examples/serve_span_load
 [ -n "$B" ] && echo "    client source diff a..b: $(git -C $S/src-2221-a diff --stat $A $B -- crates/cli/examples/serve_span_load.rs | tail -1)"
 
-# Sessions: a committed transaction's tombstone stays for one idle lease (--txn-idle-ms,
-# 30 s by default) and counts against the per-token cap (64), and with no tokens every
-# caller is one principal. So at thousands of transactions a second, Begin is refused
-# (Overloaded) without these. 2 s still outlasts any call gap in the load.
-SESSIONS=(--max-sessions 65536 --max-sessions-per-token 65536 --txn-idle-ms 2000)
+# Sessions: the servers' defaults. Since #2257 (#2253), a committed transaction's record holds
+# no session slot. A SHA before #2257 needs OLD_SESSION_CAPS=1: there a committed
+# transaction's tombstone counts against the per-token cap (64) for an idle lease (30 s), and
+# with no tokens every caller is one principal, so at thousands of transactions a second
+# Begin is refused (Overloaded) without the raised caps.
+SESSIONS=()
+[ -n "${OLD_SESSION_CAPS:-}" ] && SESSIONS=(--max-sessions 65536 --max-sessions-per-token 65536 --txn-idle-ms 2000)
 PORTS=(7471 7472 7473)
 url() { echo "http://127.0.0.1:${PORTS[$1]}"; }
 write_map() { python3 - "$1" "$2" <<'PY'

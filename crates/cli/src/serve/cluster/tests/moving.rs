@@ -234,6 +234,108 @@ fn an_aborted_moves_copy_is_never_taken_by_a_later_one() {
     });
 }
 
+/// #2249: a move through a node one map behind the writer (its install of the writer's
+/// last push held) reads its base map from the writer, so its record changes and its map
+/// are set there. Before, it built each change on the node's older map, and the writer
+/// refused it as not newer: `map_version N isn't newer than this node's N` (#2238's
+/// Windows run, where a push to the node was slow).
+#[test]
+fn a_move_through_a_node_one_map_behind_the_writer_sets_its_changes_at_the_writer() {
+    let t = Cluster::start();
+    let b = t.ports[1];
+    let b_dir = t.dirs[1].clone();
+    t.rt.block_on(async {
+        let map_at = |port: u16| async move {
+            client(port)
+                .await
+                .get_map(crate::serve::proto::GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .map_version
+        };
+        let behind = map_at(b).await;
+        super::super::HOLD_INSTALL
+            .lock()
+            .unwrap()
+            .push(b_dir.clone());
+        // A change at the writer, a: its push to b is held, so b stays one map behind.
+        let mut m = client(t.ports[0])
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.nodes[2].weight = 2;
+        super::super::cli::set_map(&t.args, m, false, Vec::new())
+            .await
+            .unwrap();
+        eventually("b's install of the push to hold", async || {
+            super::super::INSTALL_HELD.lock().unwrap().contains(&b_dir)
+        })
+        .await;
+        assert_eq!(map_at(b).await, behind, "b is one map behind");
+        // b is held until the writer's map gives p1 to c: every change up to the move's
+        // commit point is set while b is behind. Then it's let go, since c serves p1 only
+        // once its peers hold that map (D317 rule 3).
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let release = async {
+            eventually_within(
+                Duration::from_secs(60),
+                "the writer's map to give p1 to c, or the move to end",
+                async || {
+                    done.load(std::sync::atomic::Ordering::Acquire)
+                        || client(t.ports[0])
+                            .await
+                            .get_map(crate::serve::proto::GetMapRequest {})
+                            .await
+                            .is_ok_and(|m| {
+                                m.into_inner()
+                                    .partitions
+                                    .iter()
+                                    .any(|p| p.id == "p1" && p.node == "c")
+                            })
+                },
+            )
+            .await;
+            let still = map_at(b).await;
+            super::super::HOLD_INSTALL
+                .lock()
+                .unwrap()
+                .retain(|d| *d != b_dir);
+            super::super::INSTALL_HELD
+                .lock()
+                .unwrap()
+                .retain(|d| *d != b_dir);
+            still
+        };
+        let moving = async {
+            let r = within(super::super::moving::run(&t.args, "p1", "c", false, None)).await;
+            done.store(true, std::sync::atomic::Ordering::Release);
+            r
+        };
+        let (moved, still) = tokio::join!(moving, release);
+        if let Err(e) = moved {
+            panic!("the move through b: {}", e.message());
+        }
+        assert_eq!(still, behind, "b was behind up to the move's commit point");
+        let m = client(t.ports[0])
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(p1.node, "c", "the writer's map gives p1 to c");
+        assert!(m.moves.is_empty(), "the record went: {:?}", m.moves);
+        eventually("c to serve p1, through b once it caught up", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+    });
+}
+
 #[test]
 fn an_abort_past_the_moves_commit_point_is_refused() {
     let t = Cluster::start();
