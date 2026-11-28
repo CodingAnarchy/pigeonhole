@@ -532,6 +532,17 @@ fn commit_part(
         after: end.after,
         token: Some(end.token.clone()),
     };
+    #[cfg(test)]
+    if tests::FAIL_PART.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left == 1
+    }) {
+        return Err(Error::new(
+            ErrorCode::Io,
+            "injected: a part's commit failed",
+        ));
+    }
     // A part holds one spanning commit's share or none (the split above), so its last
     // event's xid is the whole part's (D329 2b).
     engine.apply_replicated_with(batch, &state.encode(), max_ts, end.xid())?;
@@ -728,7 +739,9 @@ impl Pigeonhole {
     /// takes writes, and its own feed goes on; an apply after it is refused. Stop following
     /// the old primary first, and stop the old primary's writers: nothing fences it. If it fails after
     /// dropping the state (its bit's commit failed), the database is already no replica: reopen
-    /// it to finish. Not part of the stable API.
+    /// it to finish. It waits for an apply in flight to finish first (#2264: both hold the
+    /// replica state's lock), so call it off an async runtime's workers. Not part of the
+    /// stable API.
     #[doc(hidden)]
     pub fn promote(&self) -> Result<Option<FeedToken>> {
         // Under the state cache's lock, which it leaves empty (#2264): no apply runs beside
@@ -1344,6 +1357,8 @@ mod tests {
     thread_local! {
         /// State cell reads on this thread ([`state_of`]).
         pub(super) static CELL_READS: Counter<u64> = const { Counter::new(0) };
+        /// Fails this thread's `n`th part commit from now ([`commit_part`]); 0: none.
+        pub(super) static FAIL_PART: Counter<u32> = const { Counter::new(0) };
     }
 
     fn reads() -> u64 {
@@ -1485,6 +1500,53 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
         assert_eq!(reads(), before + 1, "after a promote, the cell is read");
         drop((feed, fresh));
+        replica.close().unwrap();
+        primary.close().unwrap();
+    }
+
+    /// #2264 (feed1248): a run split into parts that fails after its first part committed
+    /// leaves no state in memory. The next apply reads the cell, which ends at the first
+    /// part, and the rest of the run applies from there. The state from before the run
+    /// would refuse the rest as a gap and take the whole run again, applying the first
+    /// part twice.
+    #[test]
+    fn a_run_failing_after_its_first_part_resumes_from_the_cell() {
+        let vfs = pigeonhole_io::sim::SimVfs::new(22642);
+        let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+        let mut feed = primary.feed().open().unwrap();
+        let replica = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+        put(&primary, 0..1);
+        apply(&replica, &ready(&mut feed)).unwrap();
+
+        // Four commits of one cell at one timestamp: one replicated commit can't hold two,
+        // so the run splits into a part per commit.
+        let t = primary.table("t").unwrap().open().unwrap();
+        for v in [b"a", b"b", b"c", b"d"] {
+            t.mutate(b"same").put_at("f", b"q", 7, v).commit().unwrap();
+        }
+        let run = ready(&mut feed);
+        assert_eq!(run.len(), 4);
+        let token = run.last().unwrap().token();
+        FAIL_PART.with(|n| n.set(2));
+        let e = replica.apply_replicated(&run, token).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Io, "{e}");
+        assert_eq!(
+            replica.replicated_token().unwrap().as_ref(),
+            Some(run[0].token()),
+            "the first part committed"
+        );
+        let r = replica.table("t").unwrap().open().unwrap();
+        let got = r.get(b"same", "f", b"q").unwrap().unwrap();
+        assert_eq!(got.value(), &b"a"[..], "the later parts never landed");
+        let before = reads();
+        let e = replica.apply_replicated(&run, token).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "an overlap: {e}");
+        assert_eq!(reads(), before + 1, "after the failure, the cell is read");
+        replica.apply_replicated(&run[1..], token).unwrap();
+        let got = r.get(b"same", "f", b"q").unwrap().unwrap();
+        assert_eq!((got.value(), got.timestamp()), (&b"d"[..], 7));
+        assert_eq!(replica.replicated_token().unwrap().as_ref(), Some(token));
+        drop((r, t, feed));
         replica.close().unwrap();
         primary.close().unwrap();
     }
