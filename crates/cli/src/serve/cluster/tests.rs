@@ -43,6 +43,12 @@ pub(super) fn node(dir: &Path, id: &str) -> Arc<Node> {
 /// [`node`] with the token file `tokens` (empty: none); with tokens, it forwards with
 /// [`NODE_TOKEN`], which `tokens` lists with cluster scope.
 fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
+    node_leased(dir, id, tokens, TEST_LEASE)
+}
+
+/// [`node_with`] at `lease` (`--cluster-lease-ms`), failing over after twice it. Every node
+/// of a cluster takes the same lease.
+fn node_leased(dir: &Path, id: &str, tokens: &str, lease: Duration) -> Arc<Node> {
     let mut state = MapState::default();
     if let Some(m) = read_map(dir).unwrap() {
         let json = super::map::canonical_json(&m);
@@ -58,8 +64,8 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             scheme: "http",
             ca: None,
             push_timeout: Duration::from_millis(500),
-            lease: TEST_LEASE,
-            failover_after: TEST_LEASE * 2,
+            lease,
+            failover_after: lease * 2,
             failover_max_lag: None,
             replica_ack_timeout: TEST_REPLICA_ACK_TIMEOUT,
             balance_window: Duration::from_secs(300),
@@ -1002,10 +1008,15 @@ fn an_election_counts_a_majority_of_the_newest_maps_nodes_too() {
         listeners[1].local_addr().unwrap().port(),
     ];
     let dirs = [test_dir(), test_dir(), test_dir()];
+    // A longer vote than `TEST_LEASE` (#2249): the election reads the granting nodes'
+    // maps, then asks d and reads its map, one after another, each within the push timeout
+    // (500 ms), all before its vote (one lease) runs out. 1.5 s didn't hold on a slow
+    // Windows runner ("the vote's lease ran out before the map was written").
+    let lease = Duration::from_secs(5);
     let (b, c, d) = (
-        node(&dirs[0], "b"),
-        node(&dirs[1], "c"),
-        node(&dirs[2], "d"),
+        node_leased(&dirs[0], "b", "", lease),
+        node_leased(&dirs[1], "c", "", lease),
+        node_leased(&dirs[2], "d", "", lease),
     );
     let old = the_map(1, &ports);
     let mut newer = the_map(2, &ports);
@@ -1028,7 +1039,7 @@ fn an_election_counts_a_majority_of_the_newest_maps_nodes_too() {
     let quiet = |nodes: &[&Arc<Node>]| {
         for n in nodes {
             std::thread::sleep(n.grants.grace_remaining());
-            while n.grants.writer_lapsed() < TEST_LEASE * 2 {
+            while n.grants.writer_lapsed() < lease * 2 {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -2712,8 +2723,16 @@ fn a_cut_off_entry_cuts_only_its_own_clusters_dials() {
         !super::cut_off(&other, at),
         "another cluster's dial of the same address"
     );
+    // On receive (#2259): the cut node and its peer are apart whichever of them sent.
+    assert!(super::cut_apart(&mine, "127.0.0.1:2") && super::cut_apart(&peer, at));
+    assert!(!super::cut_apart(&other, at));
     super::cut_node(&mine, at, &[mine.clone(), peer.clone()], false);
     assert!(!super::cut_off(&peer, at), "joined again");
+    // A one-way cut is the dialing side's alone: it refuses nothing on receive.
+    let one_way = (mine.clone(), at.to_owned());
+    super::CUT_BETWEEN.lock().unwrap().push(one_way.clone());
+    assert!(super::cut_off(&mine, at) && !super::cut_apart(&mine, at));
+    super::CUT_BETWEEN.lock().unwrap().retain(|c| *c != one_way);
 }
 
 impl Drop for Three {

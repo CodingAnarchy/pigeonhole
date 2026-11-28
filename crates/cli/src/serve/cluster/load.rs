@@ -48,12 +48,17 @@ pub(crate) const READ_EVERY: u32 = 64;
 pub(crate) const READ_SLOTS: usize = 256;
 /// A load interval: how often the averages take a new reading.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(30);
-/// The device rate, in bytes a second, under which a partition's `load_device` is 0 (#2174).
-/// The share is over the node's own highest second, so a node that only ever trickles (its
-/// map, lease and decision writes, and Status reads: a few KiB/s) has a ceiling near its
-/// partitions' own rates, and a lone such partition read as near 1.0: too hot, never cold.
-/// 1 MiB/s is a small part of any device's rate, so nothing under it is a real load.
-pub(crate) const DEVICE_FLOOR: f64 = (1 << 20) as f64;
+/// The least ceiling a partition's `load_device` is taken over, in bytes a second (#2208):
+/// the share is `rate / max(ceiling, CEILING_FLOOR)`. The ceiling is the node's own highest
+/// second, so a node that only ever trickles (its map, lease and decision writes, and
+/// Status reads: a few KiB/s) had a ceiling near its partitions' own rates, and a lone such
+/// partition read as near 1.0: too hot, never cold (#2174). Over at least 32 MiB/s a
+/// trickle reads near 0 (1 MiB/s is 0.03), the share rises smoothly from 0 with no step,
+/// and `partition_max_load` (0.5) takes 16 MiB/s sustained. A device that has run faster
+/// than this keeps its own ceiling, as before. One that can't run 32 MiB/s never reads its
+/// whole share (one capped at 10 MiB/s reads at most 0.31), so on it only `load_cpu` can
+/// make a partition too hot (cli692's D1 on #2248): the price of reading no trickle as hot.
+pub(crate) const CEILING_FLOOR: f64 = (32u64 << 20) as f64;
 /// The longest `--balance-window`, in seconds (a day): it bounds the ceiling's seconds kept.
 pub(crate) const MAX_WINDOW_SECS: u64 = 86_400;
 
@@ -403,12 +408,8 @@ impl PartitionLoad {
         }
         Load {
             cpu: w.cpu,
-            // Under the floor, none (#2174): however close the rate runs to the ceiling.
-            device: if ceiling > 0.0 && w.device_rate >= DEVICE_FLOOR {
-                (w.device_rate / ceiling).min(1.0)
-            } else {
-                0.0
-            },
+            // Over the ceiling, but never one under the floor (#2208).
+            device: (w.device_rate / ceiling.max(CEILING_FLOOR)).min(1.0),
             write_rate: Some(w.write_rate),
         }
     }
@@ -662,7 +663,7 @@ mod tests {
         let r = Reading {
             busy_nanos: 2_000_000_000,
             sync_nanos: 1_000_000_000,
-            device_bytes: 120 << 20,
+            device_bytes: 1920 << 20,
             written_bytes: 15 << 20,
         };
         let t1 = t0 + INTERVAL;
@@ -670,11 +671,10 @@ mod tests {
         assert!(!l.due(t1 - Duration::from_secs(1), INTERVAL));
         assert_eq!(fold(t1 - Duration::from_secs(1), r, 0.0), Load::default());
         assert!(l.due(t1, INTERVAL));
-        let ceiling = 16.0 * (1 << 20) as f64;
+        let ceiling = 256.0 * (1 << 20) as f64;
         let got = fold(t1, r, ceiling);
         assert!((got.cpu - 3.0 / 30.0 / 4.0).abs() < 1e-9, "{got:?}");
-        // 4 MiB/s over a 16 MiB/s ceiling (over `DEVICE_FLOOR` through the idle intervals
-        // below: 4 MiB/s × 0.8⁴ is 1.6 MiB/s).
+        // 64 MiB/s over a 256 MiB/s ceiling (over `CEILING_FLOOR`).
         assert!((got.device - 0.25).abs() < 1e-9, "{got:?}");
         // D331 PR 5: half of it written, in bytes a second (no ceiling).
         assert_eq!(got.write_rate, Some(512.0 * 1024.0), "{got:?}");
@@ -693,29 +693,63 @@ mod tests {
         );
     }
 
-    /// #2174: a partition alone on its node, with a steady trickle under the floor, has a
-    /// device share of 0, though its rate is the node's whole ceiling; the same shape over
-    /// the floor is its whole share, as before.
-    #[test]
-    fn a_device_rate_under_the_floor_is_no_load_however_near_the_ceiling() {
-        let at = |rate: f64| {
-            let l = PartitionLoad::default();
-            let t0 = Instant::now();
-            l.fold(t0, Reading::default(), 4, 0.0, INTERVAL, A);
-            let r = Reading {
-                device_bytes: (rate * INTERVAL.as_secs_f64()) as u64,
-                ..Reading::default()
-            };
-            // Its own steady rate is the node's highest second.
-            l.fold(t0 + INTERVAL, r, 4, rate, INTERVAL, A)
+    /// A partition's device share after one interval at a steady `rate`, on a node whose
+    /// ceiling is `ceiling` (bytes a second).
+    fn share_at(rate: f64, ceiling: f64) -> Load {
+        let l = PartitionLoad::default();
+        let t0 = Instant::now();
+        l.fold(t0, Reading::default(), 4, 0.0, INTERVAL, A);
+        let r = Reading {
+            device_bytes: (rate * INTERVAL.as_secs_f64()) as u64,
+            ..Reading::default()
         };
-        let under = at(DEVICE_FLOOR - 4096.0);
-        assert_eq!(under.device, 0.0, "{under:?}");
-        assert_eq!(under.load(), 0.0, "{under:?}");
-        let trickle = at(8.0 * 1024.0);
-        assert_eq!(trickle.device, 0.0, "{trickle:?}");
-        let over = at(DEVICE_FLOOR + 4096.0);
-        assert!((over.device - 1.0).abs() < 1e-9, "{over:?}");
+        l.fold(t0 + INTERVAL, r, 4, ceiling, INTERVAL, A)
+    }
+
+    /// #2208 (#2174's cliff): a partition alone on its node whose steady trickle is the
+    /// node's whole ceiling reads near 0, over `CEILING_FLOOR`, not near 1.0; and the share
+    /// rises smoothly through 1 MiB/s, where 1.3.1's rate floor stepped from 0 to the whole
+    /// ceiling.
+    #[test]
+    fn a_trickle_at_its_own_ceiling_reads_near_zero_and_the_share_has_no_step() {
+        // Its own steady rate is the node's highest second.
+        let own = |rate: f64| share_at(rate, rate).device;
+        let trickle = own(8.0 * 1024.0);
+        assert!(trickle > 0.0 && trickle < 0.001, "{trickle}");
+        let mib = (1u64 << 20) as f64;
+        let (under, over) = (own(mib - 4096.0), own(mib + 4096.0));
+        assert!(
+            (under - (mib - 4096.0) / CEILING_FLOOR).abs() < 1e-12,
+            "{under}"
+        );
+        assert!(over - under < 0.001, "no step: {under} then {over}");
+        assert!(over < 0.04, "1 MiB/s is a small share: {over}");
+        // `partition_max_load` (0.5) is 16 MiB/s sustained at the floor.
+        assert!((own(16.0 * mib) - 0.5).abs() < 1e-12);
+        // At the floor and over it, the whole share, as before.
+        assert!((own(CEILING_FLOOR) - 1.0).abs() < 1e-12);
+        assert!((own(4.0 * CEILING_FLOOR) - 1.0).abs() < 1e-12);
+    }
+
+    /// #2208: a node whose device has run faster than `CEILING_FLOOR` keeps its own
+    /// ceiling: its partitions' shares are exactly `rate / ceiling`, as before the floor.
+    #[test]
+    fn a_fast_devices_shares_are_over_its_own_ceiling_as_before() {
+        let mib = (1u64 << 20) as f64;
+        for (rate, ceiling) in [
+            (256.0 * mib, 1024.0 * mib),
+            (1.0 * mib, 2048.0 * mib),
+            (512.0 * mib, 512.0 * mib),
+            (40.0 * mib, 33.0 * mib),
+        ] {
+            let got = share_at(rate, ceiling);
+            assert_eq!(
+                got.device,
+                (rate / ceiling).min(1.0),
+                "{rate} over {ceiling}"
+            );
+            assert_eq!(got.load(), got.device);
+        }
     }
 
     #[test]

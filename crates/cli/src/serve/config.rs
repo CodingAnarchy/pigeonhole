@@ -82,8 +82,9 @@ pub(crate) struct ServeArgs {
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_concurrent: usize,
-    /// Open connections at once, HTTP/1.1 and HTTP/2 alike; one past this is closed as soon
-    /// as it's accepted. Default: half the open-file limit (`ulimit -n`), at most 4096.
+    /// Open connections at once, HTTP/1.1 and HTTP/2 alike; one past this is refused: its
+    /// requests are answered `Overloaded` (gRPC: `UNAVAILABLE`; HTTP: 503), then it's
+    /// closed. Default: half the open-file limit (`ulimit -n`), at most 4096.
     #[arg(long, value_name = "N")]
     pub max_connections: Option<usize>,
     /// Scans streaming at once; more are refused at once (`Overloaded`). A scan's stream
@@ -171,8 +172,9 @@ pub(crate) struct ServeArgs {
     /// compaction's version GC and blob GC.
     #[arg(long, value_name = "MS", default_value_t = 600_000)]
     pub snapshot_lifetime_ms: u64,
-    /// Sessions (transactions, pinned snapshots, and the tombstones of committed
-    /// transactions) held at once.
+    /// Sessions (open transactions, pinned snapshots and remote MCP sessions) held at once.
+    /// A committed transaction's record counts against the node's own bound instead
+    /// (131,072 records), so this doesn't cap a commit rate.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_sessions: usize,
     /// Sessions one token may hold at once.

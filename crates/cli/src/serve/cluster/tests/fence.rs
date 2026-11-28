@@ -641,15 +641,22 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
     t.stop(2);
     t.restart(0);
     t.restart(1);
-    // c only once b has settled: a restarted node asks its peers for their maps until its
-    // partitions are confirmed, and takes a newer one from any that answers. With c back
-    // before b's p2 was confirmed (by a's version 1), b's next round took version 2 from c,
-    // and "b missed the move too" no longer held (#1821's Linux run).
+    // a and b can't reach c once it's back (the one-way seam), so neither learns version 2
+    // from it: every lease round asks each peer for its map and takes a newer one, and a
+    // node serving a partition runs one every third of its lease. Waiting for b's p2 to be
+    // confirmed before c's restart (#1821's fix) left the next renewal to race the
+    // assertion below, which b's round won on Windows (#2259). c's map lists only itself, so
+    // it dials nobody.
     let b = t.ports[1];
-    t.rt.block_on(eventually(
-        "b's p2 to be confirmed by a, which ends b's asking",
-        async || state(b, "p2").await == LocalPartitionState::Serving,
-    ));
+    let away = |dir: &PathBuf| (dir.clone(), format!("127.0.0.1:{c}"));
+    let (a_c, b_c) = (away(&t.dirs[0]), away(&t.dirs[1]));
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap()
+        .extend([a_c.clone(), b_c.clone()]);
+    t.rt.block_on(eventually("b's p2 to be confirmed by a", async || {
+        state(b, "p2").await == LocalPartitionState::Serving
+    }));
     t.restart(2);
     t.rt.block_on(async {
         eventually("c to answer with its map", async || {
@@ -660,12 +667,26 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
                 .is_ok_and(|m| m.into_inner().map_version == 2)
         })
         .await;
-        assert_eq!(version(t.ports[1]).await, 1, "b missed the move too");
+        // Past a renewal of each, with c answering: neither took its map.
+        tokio::time::sleep(TEST_LEASE).await;
+        assert_eq!(version(b).await, 1, "b missed the move too");
+        assert_eq!(version(a).await, 1, "a missed the move");
         assert_eq!(reason(a, "p1").await, FenceReason::Operator);
+        // a reaches c again, for its unfence's round; b still doesn't, so its answer to
+        // that round is version 1, which names a. (A renewal of a's may take version 2
+        // first: the unfence is then refused on a's own map.)
+        super::super::CUT_BETWEEN
+            .lock()
+            .unwrap()
+            .retain(|x| *x != a_c);
         let e = unfence(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert_ne!(state(a, "p1").await, LocalPartitionState::Serving);
     });
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap()
+        .retain(|x| *x != b_c);
 }
 
 #[test]
@@ -1248,6 +1269,183 @@ fn a_node_cut_off_from_the_majority_stops_serving_within_its_lease() {
         .await;
         try_put(a, "alice", "4").await.unwrap();
         try_get(a, "alice").await.unwrap();
+    });
+}
+
+#[test]
+fn leases_renew_while_every_node_holds_more_forwards_than_a_lane_runs_at_once() {
+    // #2258: every node holds forwards, more than `CLUSTER_CALLS` each, as a spanning load's
+    // branch calls do. The lease rounds' calls are in lanes of their own, so p1's lease on a
+    // renews through b and c, and its writes go on. Before, one limit of 16 took every
+    // `Cluster` call: a round's `GetMap` and `Lease` queued behind the forwards until they
+    // timed out, and p1 lapsed within a lease.
+    let mut t = Rig::start();
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        eventually("p1 to serve on a after its restart", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+    });
+    let per_node = super::super::start::CLUSTER_CALLS + 8;
+    // Lets the forwards go however the test ends, so a failure panics rather than hangs.
+    struct LetGo(Vec<PathBuf>);
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            super::super::HOLD_FORWARDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|d| !self.0.contains(d));
+        }
+    }
+    super::super::HOLD_FORWARDS
+        .lock()
+        .unwrap()
+        .extend(t.dirs.iter().cloned());
+    let let_go = LetGo(t.dirs.to_vec());
+    let held_on = |dir: &PathBuf| {
+        super::super::HELD_FORWARDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| *d == dir)
+            .count()
+    };
+    let calls: Vec<_> = t.rt.block_on(async {
+        let mut calls = Vec::new();
+        for (port, p) in t.ports.iter().zip(["p1", "p2", "p3"]) {
+            let c = client(*port).await;
+            for _ in 0..per_node {
+                let mut c = c.clone();
+                calls.push(tokio::spawn(async move {
+                    c.forward(crate::serve::proto::ForwardRequest {
+                        partition: p.into(),
+                        ..Default::default()
+                    })
+                    .await
+                }));
+            }
+        }
+        eventually("every node's forward lane to be full", async || {
+            t.dirs
+                .iter()
+                .all(|d| held_on(d) >= super::super::start::CLUSTER_CALLS)
+        })
+        .await;
+        calls
+    });
+    let since = std::time::Instant::now();
+    t.rt.block_on(async {
+        // A node's own `Cluster` calls are in its control lane too: bounded, since with one
+        // limit for every call they'd queue behind the forwards for as long as those last.
+        let bounded = async |what: &str| {
+            tokio::time::timeout(Duration::from_secs(2), local(a, "p1"))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: p1's status on a didn't answer in 2 s"))
+        };
+        // Three leases: p1's would have lapsed twice over without a renewal.
+        while since.elapsed() < 3 * TEST_LEASE {
+            let lp = bounded("held").await;
+            assert_eq!(
+                lp.state(),
+                LocalPartitionState::Serving,
+                "after {:?}: {lp:?}",
+                since.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let lp = bounded("after three leases").await;
+        assert!(!lp.awaiting_peers && lp.lease_remaining_ms > 0, "{lp:?}");
+        tokio::time::timeout(Duration::from_secs(2), try_put(a, "alice", "1"))
+            .await
+            .expect("a write to p1 answers in 2 s")
+            .unwrap();
+        // Still held: the lane stayed full throughout.
+        assert!(
+            t.dirs
+                .iter()
+                .all(|d| held_on(d) >= super::super::start::CLUSTER_CALLS)
+        );
+    });
+    drop(let_go);
+    t.rt.block_on(async {
+        for c in calls {
+            // Let go, each answers (whatever it answers: the request names no call).
+            let _ = tokio::time::timeout(Duration::from_secs(5), c)
+                .await
+                .expect("a forward let go answers in 5 s")
+                .unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_lease_request_answers_while_the_nodes_control_lane_is_full() {
+    // ai1249 on #2263: `Lease` and `Release` have a lane of their own. With b's control lane
+    // held full (more `Status` calls than it runs at once, each held), a map read from b
+    // queues, and a lease request to b still answers at once.
+    let t = Rig::start();
+    let b = t.ports[1];
+    struct LetGo(PathBuf);
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            super::super::HOLD_STATUS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|d| *d != self.0);
+        }
+    }
+    t.rt.block_on(async {
+        let map = map_of(b).await;
+        super::super::HOLD_STATUS
+            .lock()
+            .unwrap()
+            .push(t.dirs[1].clone());
+        let let_go = LetGo(t.dirs[1].clone());
+        let c = client(b).await;
+        let held: Vec<_> = (0..super::super::start::CLUSTER_CALLS + 4)
+            .map(|_| {
+                let mut c = c.clone();
+                tokio::spawn(async move {
+                    c.status(crate::serve::proto::StatusRequest::default())
+                        .await
+                })
+            })
+            .collect();
+        eventually("b's control lane to be full", async || {
+            let mut c = c.clone();
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                c.get_map(crate::serve::proto::GetMapRequest {}),
+            )
+            .await
+            .is_err()
+        })
+        .await;
+        let answer = tokio::time::timeout(
+            Duration::from_secs(2),
+            c.clone().lease(crate::serve::proto::LeaseRequest {
+                cluster_id: map.cluster_id.clone(),
+                node_id: "a".into(),
+                map_version: map.map_version,
+                writer_term: map.writer_term,
+                round: 1,
+                lease_ms: u64::try_from(TEST_LEASE.as_millis()).unwrap(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("a lease request to b answers within 2 s while its control lane is full");
+        answer.unwrap();
+        drop(let_go);
+        for h in held {
+            let _ = tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .expect("a status call let go answers within 5 s")
+                .unwrap();
+        }
     });
 }
 
