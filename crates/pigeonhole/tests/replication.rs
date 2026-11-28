@@ -2008,6 +2008,91 @@ fn a_range_drop_event_tells_which_ranges_it_removes() {
     db.close().unwrap();
 }
 
+/// #2279's reader side: a stream whose segment after the token's position is gone (its slot
+/// zeroed, as a racing allocate's truncation left it), with later segments still on disk.
+/// The feed fails, naming the broken chain, instead of waiting at the segment's end with no
+/// error. Before the fix it was `Pending` for good, every later commit included.
+#[test]
+fn a_feed_over_a_segment_chain_broken_after_its_token_fails_instead_of_waiting() {
+    use pigeonhole_io::{OpenOptions, Vfs};
+    let vfs = SimVfs::new(2279);
+    let path = "/d/data.phdb";
+    let db = Pigeonhole::open(
+        path,
+        Options::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .shards(1)
+            .wal_segment_size(1 << 20)
+            .change_feed(FeedRetention::bytes(64 << 20)),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let put = |i: u32| {
+        t.mutate(format!("c{i}").as_bytes())
+            .put("f", b"q", &[1u8; 700 << 10])
+            .commit()
+            .unwrap();
+    };
+    // c0 in epoch 1; c1, c2 and c3 don't fit one segment each with the one before.
+    put(0);
+    let snap = db.snapshot().unwrap();
+    let token = t.feed().from_snapshot(&snap).open().unwrap().token();
+    drop(snap);
+    for i in 1..4 {
+        put(i);
+    }
+    // Epoch 2's slot, in whichever stream holds the table's records, zeroed.
+    let seg = 1u64 << 20;
+    let mut zeroed = 0;
+    for s in 0..16u32 {
+        let p =
+            pigeonhole_wal::stream_path(std::path::Path::new(path), pigeonhole_format::StreamId(s));
+        let Ok(f) = vfs.open(&p, OpenOptions::read()) else {
+            continue;
+        };
+        let len = f.len().unwrap();
+        let mut epochs = Vec::new();
+        for slot in 0..len / seg {
+            let mut h = vec![0u8; pigeonhole_format::wal::FRAME_SIZE];
+            f.read_at(&mut h, slot * seg).unwrap();
+            if let Ok(h) = pigeonhole_format::wal::SegmentHeader::decode(&h) {
+                epochs.push((h.epoch, slot));
+            }
+        }
+        if epochs.len() >= 3
+            && let Some(&(_, slot)) = epochs.iter().find(|(e, _)| *e == 2)
+        {
+            drop(f);
+            let f = vfs.open(&p, OpenOptions::read_write_create()).unwrap();
+            f.write_at(&vec![0u8; seg as usize], slot * seg).unwrap();
+            zeroed += 1;
+        }
+    }
+    assert_eq!(zeroed, 1, "one stream's epoch 2");
+    let mut feed = t.feed().resume(&token).open().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match feed.next_event(Duration::from_millis(200)) {
+            Err(e) => {
+                assert_eq!(e.code(), ErrorCode::Corruption, "{e}");
+                assert!(e.to_string().contains("chain broken at epoch 1"), "{e}");
+                break;
+            }
+            Ok(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "the feed waited at the broken chain without an error"
+            ),
+        }
+    }
+    drop((feed, t));
+    db.close().unwrap();
+}
+
 /// D331 (#2107's catch-up, found by its tests): a token taken just after a retention hold
 /// resumes after the writes, flushes and compactions that follow, whatever the shard count.
 /// Each stream keeps a share of the change feed's retention, so with many shards a stream

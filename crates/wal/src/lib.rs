@@ -110,6 +110,13 @@ pub enum Error {
         /// What was wrong.
         what: &'static str,
     },
+    /// The segment after `epoch` is gone though a later one is on disk (#2279): its slot
+    /// was truncated or overwritten, so the records between are lost. A reader reports it
+    /// rather than waiting at `epoch`'s end for a successor that can't come.
+    ChainBroken {
+        /// The last segment of the chain that can be read.
+        epoch: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -119,6 +126,11 @@ impl fmt::Display for Error {
             Error::Format(e) => write!(f, "wal: {e}"),
             Error::ForeignSegment => f.write_str("wal segment belongs to another database"),
             Error::RecordTooLarge => f.write_str("wal record larger than a segment can hold"),
+            Error::ChainBroken { epoch } => write!(
+                f,
+                "wal segment chain broken at epoch {epoch}: a later segment is on disk, and \
+                 none follows it"
+            ),
             Error::Poisoned => {
                 f.write_str("wal stream poisoned by an earlier write or sync failure")
             }
@@ -135,7 +147,8 @@ impl std::error::Error for Error {
             Error::ForeignSegment
             | Error::RecordTooLarge
             | Error::Poisoned
-            | Error::InvalidArgument { .. } => None,
+            | Error::InvalidArgument { .. }
+            | Error::ChainBroken { .. } => None,
         }
     }
 }

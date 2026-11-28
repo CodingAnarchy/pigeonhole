@@ -155,6 +155,9 @@ pub struct FeedCursor {
     tail_window: bool,
     /// A stop short of its successor's recorded end, deferred once (#1370): `(epoch, stop)`.
     deferred: Option<(u32, u64)>,
+    /// A segment with no successor on disk though a later epoch's header is there, seen once
+    /// (#2279): the epoch. The next look at it, if still so, is a broken chain.
+    unchained: Option<u32>,
     /// Whether a feed-silent batch's mark is taken (D331, [`FeedCursor::accept_silent`]).
     silent_ok: bool,
 }
@@ -213,6 +216,7 @@ impl FeedCursor {
             fresh_end: 0,
             tail_window: false,
             deferred: None,
+            unchained: None,
             silent_ok: false,
         };
         this.cur = this.place(at);
@@ -269,6 +273,13 @@ impl FeedCursor {
             .collect();
         out.sort_unstable();
         out
+    }
+
+    /// Whether the cursor's last stop needs a second look before it's trusted (#2279): a
+    /// segment with no successor though a later one is on disk. A reader that would
+    /// otherwise not read this stream again until new records arrive reads it again soon.
+    pub fn rechecking(&self) -> bool {
+        self.unchained.is_some()
     }
 
     /// The epoch of the segment the cursor is in (0 once it is gone).
@@ -416,7 +427,24 @@ impl FeedCursor {
             .enumerate()
             .filter_map(|(i, h)| h.filter(|h| h.prev_epoch == epoch).map(|h| (i, h)));
         let (slot, h) = match (successors.next(), successors.next()) {
-            (None, _) => return Ok(Chained::No),
+            (None, _) => {
+                // #2279: no successor, though a later segment's header is on disk. Headers
+                // land in epoch order (a later segment starts only after this one's
+                // successor was made, and a sync writes held headers in order), so the
+                // segment that followed this one is gone: a truncated or overwritten slot.
+                // Seen once, it's a stop for now, as #1370's short stop is, since a sync's
+                // two header writes may complete out of order; the next look, after the
+                // headers are read again, is corruption, never a silent end.
+                let later = grid.headers.iter().flatten().any(|h| h.epoch > epoch);
+                if !later {
+                    self.unchained = None;
+                } else if self.unchained == Some(epoch) {
+                    return Err(crate::Error::ChainBroken { epoch });
+                } else {
+                    self.unchained = Some(epoch);
+                }
+                return Ok(Chained::No);
+            }
             (Some(s), None) => s,
             (Some(_), Some(_)) => {
                 return Err(crate::stream::corrupt(
@@ -442,6 +470,7 @@ impl FeedCursor {
             ));
         }
         self.deferred = None;
+        self.unchained = None;
         self.cur = Some(Cursor {
             slot,
             epoch: h.epoch,
@@ -633,6 +662,71 @@ mod read_tests {
                 Step::End => return got,
                 other => panic!("{other:?}"),
             }
+        }
+    }
+
+    /// #2279: a segment between the floor and the head whose successor's slot was zeroed (a
+    /// truncation by a racing allocate), with later segments still on disk. The cursor reads
+    /// the segment, stops at its end once (a sync's header writes may land out of order),
+    /// asks to be read again soon, and on the next look reports the chain broken there,
+    /// never a silent end. An intact chain, and the head, are never reported.
+    #[test]
+    fn a_cursor_reports_a_chain_broken_after_its_segment_instead_of_waiting_there() {
+        let vfs: VfsRef = SimVfs::new(2279);
+        let mut wal = stream(&vfs, 4);
+        // 40 KiB records to a 128 KiB segment: several epochs.
+        for seqno in 1..=10 {
+            append(&mut wal, seqno, 40 << 10);
+        }
+        let seg = 4 * FRAME;
+        drop(wal);
+        let epochs = |vfs: &VfsRef| {
+            let c = FeedCursor::open(vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+            c.segments().iter().map(|s| s.0).collect::<Vec<_>>()
+        };
+        let all = epochs(&vfs);
+        assert!(
+            all.len() >= 3 && all.iter().copied().eq(1..=all.len() as u32),
+            "{all:?}"
+        );
+        let without_2: Vec<u32> = all.iter().copied().filter(|&e| e != 2).collect();
+        // An intact chain reads through, and its head is never a broken chain.
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        assert_eq!(drain(&mut c), (1..=10).collect::<Vec<_>>());
+        assert!(!c.rechecking());
+        assert!(matches!(c.step().unwrap(), Step::End));
+        // Zero the slot epoch 2 is in, as the truncation left it.
+        let file = vfs
+            .open(
+                &stream_path(db(), StreamId(0)),
+                OpenOptions::read_write_create(),
+            )
+            .unwrap();
+        let zeros = vec![0u8; seg as usize];
+        let mut found = false;
+        for slot in 0..8u64 {
+            let mut was = vec![0u8; seg as usize];
+            if file.read_at(&mut was, slot * seg).is_err() {
+                break;
+            }
+            file.write_at(&zeros, slot * seg).unwrap();
+            if epochs(&vfs) == without_2 {
+                found = true;
+                break;
+            }
+            file.write_at(&was, slot * seg).unwrap();
+        }
+        assert!(found, "epoch 2's slot");
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        let first = drain(&mut c);
+        assert!(
+            !first.is_empty() && first.iter().all(|&s| s <= 3),
+            "{first:?}"
+        );
+        assert!(c.rechecking(), "the stop asks for a second look");
+        match c.step() {
+            Err(crate::Error::ChainBroken { epoch: 1 }) => {}
+            other => panic!("{other:?}"),
         }
     }
 

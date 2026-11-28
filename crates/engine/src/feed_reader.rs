@@ -1671,7 +1671,11 @@ impl FeedReader {
                 self.streams.iter_mut().for_each(|st| st.index.clear());
             }
             self.frontier = self.frontier.max(frontier);
-            self.read_through = Some(frontier);
+            // A stream whose cursor stopped at a segment with no successor though a later
+            // one is on disk looks again on the next poll, not only after a commit (#2279): a
+            // chain broken there is an error, and an idle feed would otherwise never look.
+            self.read_through =
+                (!self.streams.iter().any(|st| st.cursor.rechecking())).then_some(frontier);
             // A feed of every table (D315): the catalog changes up to the frontier, after it was
             // loaded. In the writer's process, once the session's sidecar appends stopped no
             // later change can reach the feed: it expires (simp724 on #1493).
@@ -2067,7 +2071,23 @@ impl FeedReader {
                 pack(batch, tables, prefix)
             }
         };
-        let (start, end, session, record) = match self.streams[s].cursor.step()? {
+        let step = match self.streams[s].cursor.step() {
+            // #2279: a successor missing below the floor was recycled by retention, which
+            // passed the feed (its own segment not yet reused). The floor never goes down, so
+            // loaded after the cursor read the headers it covers what they showed.
+            // (`floor` without `self.floor`: the step borrows the cursor.)
+            Err(pigeonhole_wal::Error::ChainBroken { epoch })
+                if epoch < self.shm.feed_marks(s as u32).floor =>
+            {
+                self.expired = Some(expiry(
+                    "retention passed the feed: the segment after the one it was reading was \
+                     recycled",
+                ));
+                return Ok(None);
+            }
+            step => step?,
+        };
+        let (start, end, session, record) = match step {
             Step::Record {
                 start,
                 end,
