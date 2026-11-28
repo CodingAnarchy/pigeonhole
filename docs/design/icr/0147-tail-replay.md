@@ -45,10 +45,12 @@ D336 (#2148) replays an old owner's unreplicated tail into the partition's new o
   - the transaction reads the source row raw (`Transaction::read_row_logged`) to decide whether anything newer is there.
 
 **A vector id's "nothing newer" (D336 Amendment 3, V1, option A; the vector crate, ai1249):**
-1. `M{id}:map:l` carries the id's last client write's timestamp. The index's moves (`split`, `split_paged`, `reassign`, `merge`) rewrite it at its stored timestamp, read in their transaction, never above it. A reassign to the list a vector is already in never happens: phase 2 moves only out of a neighbour, into one of the split's two lists.
+1. `M{id}:map:l` carries the id's last client write's timestamp. The index's moves (`split`, `split_paged`, `reassign`, `merge`) rewrite it at its stored timestamp, read in their transaction, never above it. The one exception is a vector with no mapping, which only a broken index has (`verify` reports it): a move gives it one at the move's own timestamp. So in that case alone, `M{id}`'s newest timestamp is a move's, and the replay would wrongly supersede a tail write older than the move. A reassign to the list a vector is already in never happens: phase 2 moves only out of a neighbour, into one of the split's two lists.
 2. A client insert or upsert writes it at the commit's fresh timestamp, in the same commit as its `L…:vec:{id}` write. That includes an upsert within the id's own list, and a bulk load's repeat of an id.
 3. `L…:vec:{id}` cells take the move's fresh timestamp. A move leaves a delete marker in the old list, and a marker hides every version at or below its timestamp whatever the commit order (FORMAT.md §2), so a vector moved back into that list at its old timestamp would stay hidden.
 4. D336's replay checks "nothing newer" for a vector id by reading `M{id}` raw: its newest version, the row tombstone and the `map:l` column delete. Anything strictly above the tail change's timestamp supersedes it.
+
+The index's own reads (searches, `verify`, the moves' reads) are at seqno snapshots, never bounded by timestamp, so a mapping a move rewrote at an older timestamp is seen by every read after the move's commit (simp724).
 
 ## Semantics
 

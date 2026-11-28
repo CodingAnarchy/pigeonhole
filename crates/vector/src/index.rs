@@ -572,6 +572,17 @@ fn read_map_ts(tx: &mut Transaction, t: &Table, id: &[u8]) -> std::result::Resul
     Ok(tx.get(t, &map_row(id), MAP, LIST)?.map(|c| c.timestamp()))
 }
 
+/// A move's write of `id`'s mapping to `list`, at `at` ([`read_map_ts`]). A vector with no
+/// mapping (none in a well-formed index; [`Index::verify`] reports one) still moves, and gets
+/// one at the move's own timestamp, as every move wrote it before D336 V1: a move heals it,
+/// in split, reassign and merge alike (feed1248's nit on #2277).
+fn put_moved_map(tx: &mut Transaction, t: &Table, id: &[u8], at: Option<u64>, list: u32) {
+    match at {
+        Some(at) => tx.put_u64_at(t, &map_row(id), MAP, LIST, at, u64::from(list)),
+        None => tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(list)),
+    };
+}
+
 /// Writes `id`'s vector into list `l`, moving it out of `old` (the list `id` is in) when
 /// that's another list. The caller has read `l`'s version in `tx`. With `check_old` (`old`
 /// came from `M{id}` at `tx`'s snapshot) this reads `old`'s version, and a mapping to a
@@ -2394,18 +2405,10 @@ impl Index {
                     let Some(stored) = read_stored(tx, t, &from, id)? else {
                         continue;
                     };
-                    let Some(at) = read_map_ts(tx, t, id)? else {
-                        continue;
-                    };
+                    let at = read_map_ts(tx, t, id)?;
                     stored.input().put(tx, t, &to, id);
-                    tx.delete_column(t, &from, VEC, id).put_u64_at(
-                        t,
-                        &map_row(id),
-                        MAP,
-                        LIST,
-                        at,
-                        u64::from(new),
-                    );
+                    tx.delete_column(t, &from, VEC, id);
+                    put_moved_map(tx, t, id, at, new);
                     moved += 1;
                 }
                 if moved == 0 {
@@ -2522,18 +2525,10 @@ impl Index {
                     let Some(stored) = read_stored(tx, t, &row, id)? else {
                         continue;
                     };
-                    let Some(at) = read_map_ts(tx, t, id)? else {
-                        continue;
-                    };
+                    let at = read_map_ts(tx, t, id)?;
                     stored.input().put(tx, t, &list_row(*dest), id);
-                    tx.delete_column(t, &row, VEC, id).put_u64_at(
-                        t,
-                        &map_row(id),
-                        MAP,
-                        LIST,
-                        at,
-                        u64::from(*dest),
-                    );
+                    tx.delete_column(t, &row, VEC, id);
+                    put_moved_map(tx, t, id, at, *dest);
                     *gained.entry(*dest).or_default() += 1;
                 }
                 let lost: i64 = gained.values().sum();
@@ -2606,11 +2601,8 @@ impl Index {
                     let to = list_row(dst);
                     for (id, stored) in &moving {
                         stored.input().put(tx, t, &to, id);
-                        // Every vector moves, so a vector without its mapping (none in a
-                        // well-formed index) keeps none.
-                        if let Some(at) = read_map_ts(tx, t, id)? {
-                            tx.put_u64_at(t, &map_row(id), MAP, LIST, at, u64::from(dst));
-                        }
+                        let at = read_map_ts(tx, t, id)?;
+                        put_moved_map(tx, t, id, at, dst);
                     }
                     let layout = read_u64(tx, t, GLOBAL, META, LAYOUT)?.unwrap_or(0);
                     tx.delete_family(t, &from, VEC)
@@ -3389,6 +3381,38 @@ mod move_stamps {
                 .unwrap();
         assert_eq!(v.as_vector().unwrap().to_f32_vec().unwrap(), vec![0.5, 0.0]);
         assert_eq!(ts, v.timestamp(), "bulk load");
+    }
+
+    /// A vector with no mapping (a broken index, as `verify` reports it) gets one when a move
+    /// takes it, at the move's timestamp, in a reassign's move and a merge alike
+    /// ([`put_moved_map`]).
+    #[test]
+    fn a_vector_without_a_mapping_gets_one_when_moved() {
+        let f = fixture(8, 0);
+        let ix = &f.ix;
+        insert(ix, "a", 0.0);
+        insert(ix, "b", 100.0);
+        ix.split(0).unwrap();
+        let (al, bl) = (list_of(ix, "a0"), list_of(ix, "b0"));
+        let unmap = |id: &[u8]| {
+            f.db.transact(&RetryPolicy::default(), |tx| {
+                tx.delete_column(&ix.inner.table, &map_row(id), MAP, LIST);
+                Ok::<_, pigeonhole::Error>(())
+            })
+            .unwrap();
+        };
+        unmap(b"a0");
+        unmap(b"a1");
+        assert!(ix.verify().is_err(), "a0 and a1 have no mapping");
+        assert!(ix.move_out(al, &[(b"a0", bl)], &[bl]).is_ok());
+        assert_eq!(list_of(ix, "a0"), bl, "the reassign's move");
+        // a's list down to a1 alone, which a merge then moves.
+        for i in 2..10 {
+            assert!(ix.delete(format!("a{i}").as_bytes()).unwrap());
+        }
+        ix.merge(al).unwrap();
+        assert_eq!(list_of(ix, "a1"), bl, "the merge");
+        ix.verify().unwrap();
     }
 
     /// A move's delete marker in the list it leaves hides every version at or below its
