@@ -59,6 +59,7 @@ pub(crate) mod writer;
 mod api;
 mod features;
 mod install;
+pub(crate) mod lanes;
 mod peers;
 #[cfg(test)]
 mod seams;
@@ -328,6 +329,8 @@ pub(crate) struct Node {
     /// Each range move at HANDING_OVER in the map: when this node first saw it there, and
     /// whether the writer's abort of it runs (#2160, [`Node::abort_orphaned_hand_overs`]).
     hand_overs_seen: Mutex<std::collections::HashMap<String, (tokio::time::Instant, bool)>>,
+    /// The forwarded calls' lanes (#2258): clients', nodes' and read parts' places.
+    lanes: lanes::Lanes,
     /// The old owners' files open here as tail sources (D336 PR 3a, `Cluster.ReadTail`).
     pub(crate) tail_sources: Arc<tail_source::TailSources>,
     /// The tail replays this node ran as a partition's owner (D336 PR 3a).
@@ -355,6 +358,7 @@ impl Node {
             watching_device: std::sync::atomic::AtomicBool::new(false),
             pruning: std::sync::atomic::AtomicBool::new(false),
             hand_overs_seen: Mutex::new(std::collections::HashMap::new()),
+            lanes: lanes::Lanes::default(),
             tail_sources: Arc::default(),
             replays: tail_replay::Replays::default(),
             grants,
