@@ -1188,7 +1188,7 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
     // Never released: only the follower's stop wakes it from the hold. The sender must live
     // to the test's end: a bare `_` would drop it at once, which wakes the hold too, with no
     // stop at all (cli692 on #2115).
-    let (_held_for_good, held) = tokio::sync::oneshot::channel::<()>();
+    let (mut held_for_good, held) = tokio::sync::oneshot::channel::<()>();
     super::super::range_follow::HOLD_COMMIT
         .lock()
         .unwrap()
@@ -1243,6 +1243,13 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         tokio::time::timeout(Duration::from_secs(30), drop_reached.notified())
             .await
             .expect("b's drop of the copy started, and is held");
+        // The stop woke the follower from its hold: the seam drops the receiver as it
+        // leaves (ai1249 on #2275). Without this a follower slow to wake would pass the
+        // checks below while still parked, whatever it did next. The sleep after it is only
+        // for the commit a broken follower would make once awake.
+        tokio::time::timeout(Duration::from_secs(30), held_for_good.closed())
+            .await
+            .expect("the stop woke the follower from its hold");
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
     let users = db_b.table("users").unwrap().open().unwrap();
@@ -1291,7 +1298,7 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
     let mut recorded_before = None;
     // Never released, as in a_follower_stopped_mid_copy_commits_nothing_more: only the
     // follower's stop wakes it.
-    let (_held_for_good, held) = tokio::sync::oneshot::channel::<()>();
+    let (mut held_for_good, held) = tokio::sync::oneshot::channel::<()>();
     super::super::range_follow::HOLD_COMMIT
         .lock()
         .unwrap()
@@ -1343,6 +1350,13 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
         tokio::time::timeout(Duration::from_secs(30), drop_reached.notified())
             .await
             .expect("b's drop of the copy started, and is held");
+        // The stop woke the follower from its hold: the seam drops the receiver as it
+        // leaves (ai1249 on #2275). Without this a follower slow to wake would pass the
+        // checks below while still parked, whatever it did next. The sleep after it is only
+        // for the commit a broken follower would make once awake.
+        tokio::time::timeout(Duration::from_secs(30), held_for_good.closed())
+            .await
+            .expect("the stop woke the follower from its hold");
         tokio::time::sleep(Duration::from_millis(500)).await;
         let t = move_status(b, "p2", id).await.unwrap();
         assert!(!t.serving, "the target serves none of it");

@@ -68,6 +68,8 @@ impl Node {
     /// `PushMap`'s checks), then pushes the result to the peers. A node that was down while
     /// the map moved on catches up here; peers that are behind catch up from the push.
     pub(super) async fn sync_on_start(self: &Arc<Self>) {
+        #[cfg(test)]
+        hold_rounds(&self.dir).await;
         let Ok(map) = self.get_map() else {
             return;
         };

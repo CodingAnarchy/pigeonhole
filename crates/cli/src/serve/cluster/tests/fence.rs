@@ -433,6 +433,28 @@ struct Rig {
 
 const NODES: [(&str, &str); 3] = [("a", "p1"), ("b", "p2"), ("c", "p3")];
 
+/// A node's own rounds held ([`HOLD_ROUNDS`](super::super::HOLD_ROUNDS)) until this drops.
+struct HeldRounds(PathBuf);
+
+impl HeldRounds {
+    fn of(dir: &Path) -> Self {
+        super::super::HOLD_ROUNDS
+            .lock()
+            .unwrap()
+            .push(dir.to_owned());
+        Self(dir.to_owned())
+    }
+}
+
+impl Drop for HeldRounds {
+    fn drop(&mut self) {
+        let mut held = super::super::HOLD_ROUNDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|d| *d != self.0);
+    }
+}
+
 impl Rig {
     fn start() -> Self {
         Self::start_with("")
@@ -588,10 +610,14 @@ fn a_node_whose_map_is_behind_cant_unfence_a_partition_its_peers_moved() {
             .await
             .unwrap();
     });
-    // a comes back while its peers are away, so it learns nothing at its start, and they
-    // come back with a map that no longer lists a, so nothing pushes it the news.
+    // a comes back with its own rounds held (#2271), so it learns nothing by itself: a
+    // restarted node asks its peers for their maps at its start and then at every lease
+    // round, and takes a newer one, and with b and c back at once it had version 2 before
+    // the unfence, which was then refused on a's own map. Its peers come back with a map
+    // that no longer lists a, so nothing pushes it the news either.
     t.stop(1);
     t.stop(2);
+    let _held = HeldRounds::of(&t.dirs[0]);
     t.restart(0);
     t.restart(1);
     t.restart(2);
@@ -606,8 +632,11 @@ fn a_node_whose_map_is_behind_cant_unfence_a_partition_its_peers_moved() {
         .await;
         assert_eq!(state(a, "p1").await, LocalPartitionState::Fenced);
         assert_eq!(reason(a, "p1").await, FenceReason::Operator);
+        // Still behind: only the unfence's own round can find version 2.
+        assert_eq!(version(a).await, 1, "a missed the move");
         let e = unfence(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("version 2"), "its peers' map: {e}");
         assert_ne!(state(a, "p1").await, LocalPartitionState::Serving);
         let e = try_put(a, "alice", "1").await.unwrap_err();
         assert_ne!(code(&e), "", "a write a refused: {e}");
@@ -686,15 +715,21 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
         assert_eq!(version(b).await, 1, "b missed the move too");
         assert_eq!(version(a).await, 1, "a missed the move");
         assert_eq!(reason(a, "p1").await, FenceReason::Operator);
-        // a reaches c again, for its unfence's round; b still doesn't, so its answer to
-        // that round is version 1, which names a. (A renewal of a's may take version 2
-        // first: the unfence is then refused on a's own map.)
+        // a's own rounds are held from here (#2271), and one begun before that ends within
+        // a push timeout, still cut from c. Then a reaches c again, for its unfence's
+        // round alone: with a's renewals free, one of them could take version 2 between
+        // the check below and the unfence, which was then refused on a's own map. b still
+        // doesn't reach c, so its answer to that round is version 1, which names a.
+        let _held = HeldRounds::of(&t.dirs[0]);
+        tokio::time::sleep(Duration::from_millis(700)).await;
         super::super::CUT_BETWEEN
             .lock()
             .unwrap()
             .retain(|x| *x != a_c);
+        assert_eq!(version(a).await, 1, "a missed the move");
         let e = unfence(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("version 2"), "c's map: {e}");
         assert_ne!(state(a, "p1").await, LocalPartitionState::Serving);
     });
     super::super::CUT_BETWEEN
