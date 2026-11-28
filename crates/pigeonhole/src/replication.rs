@@ -1507,7 +1507,8 @@ mod tests {
     /// #2264 (feed1248): a run split into parts that fails after its first part committed
     /// leaves no state in memory. The next apply reads the cell, which ends at the first
     /// part, and the rest of the run applies from there. The state from before the run
-    /// would refuse that as an overlap and let the whole run apply twice.
+    /// would refuse the rest as a gap and take the whole run again, applying the first
+    /// part twice.
     #[test]
     fn a_run_failing_after_its_first_part_resumes_from_the_cell() {
         let vfs = pigeonhole_io::sim::SimVfs::new(22642);
@@ -1534,12 +1535,14 @@ mod tests {
             Some(run[0].token()),
             "the first part committed"
         );
+        let r = replica.table("t").unwrap().open().unwrap();
+        let got = r.get(b"same", "f", b"q").unwrap().unwrap();
+        assert_eq!(got.value(), &b"a"[..], "the later parts never landed");
         let before = reads();
         let e = replica.apply_replicated(&run, token).unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument, "an overlap: {e}");
         assert_eq!(reads(), before + 1, "after the failure, the cell is read");
         replica.apply_replicated(&run[1..], token).unwrap();
-        let r = replica.table("t").unwrap().open().unwrap();
         let got = r.get(b"same", "f", b"q").unwrap().unwrap();
         assert_eq!((got.value(), got.timestamp()), (&b"d"[..], 7));
         assert_eq!(replica.replicated_token().unwrap().as_ref(), Some(token));
